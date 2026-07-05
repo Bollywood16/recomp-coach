@@ -25,6 +25,7 @@
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
 <script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
 <script type="text/babel" data-type="module">
@@ -72,7 +73,7 @@ const D = {
   calf:    { id: "calf", name: "Standing Calf Raise", cat: "calf", start: 90, inc: 10 },
   cablecrunch: { id: "cablecrunch", name: "Cable Crunch", cat: "core", start: 40, inc: 5 },
   ohp:     { id: "ohp", name: "Overhead Press (barbell)", cat: "vpress", start: 55, inc: 5 },
-  pullup:  { id: "pullup", name: "Pull-Up (assisted ok)", cat: "vpull", start: 0, inc: 5 },
+  pullup:  { id: "pullup", name: "Pull-Up (assisted ok)", cat: "vpull", start: 0, inc: 5, assistable: true },
   incdb:   { id: "incdb", name: "Incline DB Press", cat: "hpress", start: 30, inc: 5, perHand: true },
   cablerow:{ id: "cablerow", name: "Seated Cable Row", cat: "hpull", start: 90, inc: 5 },
   latraise:{ id: "latraise", name: "Lateral Raise", cat: "delts", start: 10, inc: 2.5, perHand: true },
@@ -201,6 +202,61 @@ const _dedupe = (arr) => { const seen = {}; return arr.filter((e) => (seen[e.id]
 const ALL_KNOWN = _dedupe([...PROGRAM_EXERCISES, ...LIBRARY]);  // bonus added after BONUS_EX defined
 const EX_BY_ID = Object.fromEntries(ALL_KNOWN.map((e) => [e.id, e]));
 const STORAGE_KEY = "recompcoach:v2";
+
+/* ===== Cloud sync (Supabase) =====
+   Optional. When configured + signed in, the whole data blob is mirrored to a
+   single per-user row. Logs (sessions, weigh-ins) merge as a union so no device
+   ever loses an entry; settings take the most recently updated copy. The app is
+   fully functional with sync switched off — everything still saves locally. */
+const SB_CFG_KEY = "recompcoach:sbcfg";
+function getSbConfig() { try { return JSON.parse(localStorage.getItem(SB_CFG_KEY) || "null"); } catch (e) { return null; } }
+function setSbConfig(cfg) { localStorage.setItem(SB_CFG_KEY, JSON.stringify(cfg)); }
+function clearSbConfig() { localStorage.removeItem(SB_CFG_KEY); }
+let _sbClient = null;
+function getSbClient() {
+  if (_sbClient) return _sbClient;
+  const cfg = getSbConfig();
+  if (!cfg || !cfg.url || !cfg.key || !window.supabase) return null;
+  try { _sbClient = window.supabase.createClient(cfg.url, cfg.key); } catch (e) { return null; }
+  return _sbClient;
+}
+function resetSbClient() { _sbClient = null; }
+
+/* Union logs by identity, keep newest settings by _updatedAt. */
+function mergeData(local, cloud) {
+  if (!cloud) return local;
+  if (!local) return cloud;
+  const sById = {};
+  [...(cloud.sessions || []), ...(local.sessions || [])].forEach((s) => { sById[s.id] = s; });
+  const sessions = Object.values(sById).sort((a, b) => a.id - b.id);
+  const wByDate = {};
+  [...(cloud.weights || []), ...(local.weights || [])].forEach((w) => { wByDate[w.date] = w; });
+  const weights = Object.values(wByDate).sort((a, b) => (a.date < b.date ? -1 : 1));
+  const localNewer = (local._updatedAt || "") >= (cloud._updatedAt || "");
+  const settingsSrc = localNewer ? local : cloud;
+  return {
+    ...cloud, ...local,
+    sessions, weights,
+    swaps: settingsSrc.swaps || {},
+    nutrition: settingsSrc.nutrition || local.nutrition,
+    focus: settingsSrc.focus || local.focus,
+    plan: settingsSrc.plan || local.plan,
+    phase: settingsSrc.phase || local.phase,
+    _updatedAt: new Date().toISOString(),
+  };
+}
+
+async function cloudPull(client, uid) {
+  const { data, error } = await client.from("app_data").select("payload").eq("user_id", uid).maybeSingle();
+  if (error) throw error;
+  return data ? data.payload : null;
+}
+async function cloudPush(client, uid, payload) {
+  const body = { user_id: uid, payload: { ...payload, _updatedAt: new Date().toISOString() }, updated_at: new Date().toISOString() };
+  const { error } = await client.from("app_data").upsert(body);
+  if (error) throw error;
+}
+let _pushTimer = null;
 const OLD_KEY = "recompcoach:v1";
 
 const CAT_NAMES = {
@@ -458,6 +514,10 @@ function weekStart(dateISO) {
 const shortDate = (iso) =>
   new Date(iso + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 const todayISO = () => new Date().toISOString().slice(0, 10);
+const currentBodyweight = (data) => {
+  const w = [...(data.weights || [])].sort((a, b) => (a.date < b.date ? -1 : 1)).slice(-1)[0];
+  return (w && w.lbs) || (data.nutrition && Number(data.nutrition ? 146 : 146)) || 146;
+};
 
 function bestSet(sets) {
   let best = null;
@@ -654,6 +714,8 @@ function App() {
   const [tab, setTab] = useState("today");
   const [data, setData] = useState({ ...DEFAULT_DATA, focus: DEFAULT_FOCUS, plan: DEFAULT_PLAN, phase: {} });
   const [loaded, setLoaded] = useState(false);
+  const [sbUser, setSbUser] = useState(null);
+  const [syncStatus, setSyncStatus] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -683,18 +745,66 @@ function App() {
   }, []);
 
   const persist = async (next) => {
-    setData(next);
+    const stamped = { ...next, _updatedAt: new Date().toISOString() };
+    setData(stamped);
     try {
-      await window.storage.set(STORAGE_KEY, JSON.stringify(next));
+      await window.storage.set(STORAGE_KEY, JSON.stringify(stamped));
     } catch (e) {
       console.error("Save failed", e);
     }
+    const client = getSbClient();
+    if (client && sbUser) {
+      if (_pushTimer) clearTimeout(_pushTimer);
+      _pushTimer = setTimeout(async () => {
+        try {
+          setSyncStatus("Syncing…");
+          await cloudPush(client, sbUser.id, stamped);
+          setSyncStatus("Synced");
+          setTimeout(() => setSyncStatus(""), 1500);
+        } catch (e) {
+          setSyncStatus("Sync failed — saved locally");
+        }
+      }, 1200);
+    }
   };
+
+  // Pull + merge cloud data on login; expose a manual sign-in handler to SyncCard.
+  const onSignedIn = async (user) => {
+    setSbUser(user);
+    const client = getSbClient();
+    if (!client || !user) return;
+    try {
+      setSyncStatus("Syncing…");
+      const cloud = await cloudPull(client, user.id);
+      const merged = mergeData(data, cloud);
+      setData(merged);
+      await window.storage.set(STORAGE_KEY, JSON.stringify(merged));
+      await cloudPush(client, user.id, merged); // push the merge back up
+      setSyncStatus("Synced");
+      setTimeout(() => setSyncStatus(""), 1500);
+    } catch (e) {
+      setSyncStatus("Sync failed — saved locally");
+    }
+  };
+  const onSignedOut = () => { setSbUser(null); setSyncStatus(""); };
+
+  // Restore an existing Supabase session on load (keeps you logged in).
+  useEffect(() => {
+    const client = getSbClient();
+    if (!client) return;
+    client.auth.getSession().then(({ data: d }) => {
+      if (d && d.session && d.session.user) onSignedIn(d.session.user);
+    });
+    const { data: sub } = client.auth.onAuthStateChange((_e, session) => {
+      if (session && session.user) setSbUser(session.user); else setSbUser(null);
+    });
+    return () => { if (sub && sub.subscription) sub.subscription.unsubscribe(); };
+  }, [loaded]); // eslint-disable-line
 
   return (
     <div style={S.app}>
       {tab === "today" && <WorkoutFlow data={data} persist={persist} />}
-      {tab === "log" && <Log data={data} persist={persist} loaded={loaded} />}
+      {tab === "log" && <Log data={data} persist={persist} loaded={loaded} sbUser={sbUser} syncStatus={syncStatus} onSignedIn={onSignedIn} onSignedOut={onSignedOut} />}
       {tab === "progress" && <Progress data={data} />}
       {tab === "insights" && <Insights data={data} />}
       {tab === "fuel" && <Fuel data={data} persist={persist} />}
@@ -957,6 +1067,8 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const [swapMode, setSwapMode] = useState(false);
   const [timer, setTimer] = useState(null);
   const [flash, setFlash] = useState(false);
+  const [assist, setAssist] = useState(true); // for assistable lifts: enter machine assist
+  const bw = currentBodyweight(data);
 
   useEffect(() => {
     if (timer === null || timer <= 0) return;
@@ -973,8 +1085,18 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   }, [open]); // eslint-disable-line
 
   const saveSession = () => {
+    const assistMode = ex.assistable && assist;
     const clean = (sets || [])
-      .map((s) => ({ w: Number(s.w) || 0, r: Number(s.r) || 0 }))
+      .map((s) => {
+        const raw = Number(s.w) || 0;
+        const r = Number(s.r) || 0;
+        if (assistMode) {
+          // Entered value is machine assistance; store what was actually lifted.
+          const eff = Math.max(1, Math.round(bw - raw));
+          return { w: eff, r, assist: raw, bw };
+        }
+        return { w: raw, r };
+      })
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
     const session = { id: Date.now(), date: todayISO(), exerciseId: ex.id, sets: clean };
@@ -1034,11 +1156,27 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
         <div style={{ marginTop: 14, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
           <div style={{ color: C.sub, fontSize: 13, lineHeight: 1.45, marginBottom: 12 }}>{rec.note}</div>
 
+          {ex.assistable && (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button style={{ ...S.chip(assist), flex: 1 }} onClick={() => setAssist(true)}>Machine assist</button>
+                <button style={{ ...S.chip(!assist), flex: 1 }} onClick={() => setAssist(false)}>Bodyweight / +weight</button>
+              </div>
+              {assist && (
+                <div style={{ fontSize: 12.5, color: C.sub, marginTop: 8, lineHeight: 1.45 }}>
+                  Enter the <b>assistance</b> the machine gives. It's logged as effective weight
+                  (your bodyweight {Math.round(bw)} lb − assist), so the number climbs as you get stronger.
+                </div>
+              )}
+            </div>
+          )}
+
           {(sets || []).map((s, i) => (
             <div key={i} style={{ ...S.row, marginBottom: 8 }}>
               <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
               <input
-                style={S.input} type="number" inputMode="decimal" placeholder="lbs"
+                style={S.input} type="number" inputMode="decimal"
+                placeholder={ex.assistable && assist ? "assist lbs" : "lbs"}
                 value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
               />
               <input
@@ -1047,6 +1185,12 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
               />
             </div>
           ))}
+          {ex.assistable && assist && (sets || []).some((s) => Number(s.w) > 0) && (
+            <div style={{ fontSize: 12, color: C.blue, marginBottom: 4 }}>
+              Will log: {(sets || []).filter((s) => Number(s.w) > 0 || Number(s.r) > 0).map((s, i) =>
+                `${Math.max(1, Math.round(bw - (Number(s.w) || 0)))}×${Number(s.r) || 0}`).join("  ")} (effective lb)
+            </div>
+          )}
 
           <div style={{ ...S.row, marginTop: 4, flexWrap: "wrap", gap: 8 }}>
             <button style={S.smallPill()} onClick={() => setSets([...(sets || []), { w: rec.weight === 0 ? "" : String(rec.weight), r: "" }])}>
@@ -1124,7 +1268,190 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
 
 /* ============================ LOG ============================ */
 
-function Log({ data, persist, loaded }) {
+/* ============================ SYNC (Supabase cloud) ============================ */
+
+function SyncCard({ data, sbUser, syncStatus, onSignedIn, onSignedOut }) {
+  const cfg = getSbConfig();
+  const [url, setUrl] = useState(cfg ? cfg.url : "");
+  const [key, setKey] = useState(cfg ? cfg.key : "");
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [showSetup, setShowSetup] = useState(!cfg);
+
+  const saveConfig = () => {
+    if (!url.trim() || !key.trim()) { setErr("Paste both the Project URL and the anon key."); return; }
+    setSbConfig({ url: url.trim(), key: key.trim() });
+    resetSbClient();
+    setErr("");
+    setShowSetup(false);
+  };
+
+  const authAction = async (mode) => {
+    setErr(""); setBusy(true);
+    const client = getSbClient();
+    if (!client) { setErr("Save your Supabase settings first."); setBusy(false); return; }
+    try {
+      const fn = mode === "signup" ? "signUp" : "signInWithPassword";
+      const { data: res, error } = await client.auth[fn]({ email: email.trim(), password: pw });
+      if (error) throw error;
+      const user = res && res.user;
+      if (!user) throw new Error("No session returned. If you just signed up, disable email confirmation in Supabase (Authentication → Providers → Email).");
+      await onSignedIn(user);
+      setPw("");
+    } catch (e) {
+      setErr(e.message || "Auth failed.");
+    }
+    setBusy(false);
+  };
+
+  const signOut = async () => {
+    const client = getSbClient();
+    if (client) { try { await client.auth.signOut(); } catch (e) {} }
+    onSignedOut();
+  };
+
+  const configured = !!getSbConfig();
+
+  return (
+    <div style={{ ...S.card, background: "#F0F7FF" }}>
+      <div style={{ ...S.row, justifyContent: "space-between" }}>
+        <span style={{ fontWeight: 700, fontSize: 15 }}>Cloud sync</span>
+        {sbUser
+          ? <span style={S.tag("#E8F8EE", C.green)}>Signed in</span>
+          : configured ? <span style={S.tag("#FFF1E5", C.orange)}>Not signed in</span>
+          : <span style={S.tag("#F0F0F3", C.sub)}>Not set up</span>}
+      </div>
+
+      {sbUser ? (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.5 }}>
+            Syncing as <b>{sbUser.email}</b>. Your logs back up automatically and load on any device you sign
+            in from. {syncStatus && <span style={{ color: C.blue }}>· {syncStatus}</span>}
+          </div>
+          <button style={{ ...S.pillBtn("#E9E9EB", C.text), marginTop: 12 }} onClick={signOut}>Sign out</button>
+        </div>
+      ) : (
+        <div style={{ marginTop: 8 }}>
+          {!showSetup && configured ? null : (
+            <>
+              <div style={{ fontSize: 12.5, color: C.sub, lineHeight: 1.5, marginBottom: 10 }}>
+                One-time setup: create a free Supabase project, then paste its <b>Project URL</b> and <b>anon
+                public key</b> (Settings → API). Steps are in the chat.
+              </div>
+              <input style={{ ...S.input, marginBottom: 8 }} placeholder="Project URL (https://xxxx.supabase.co)"
+                value={url} onChange={(e) => setUrl(e.target.value)} />
+              <input style={{ ...S.input, marginBottom: 8 }} placeholder="anon public key (eyJ...)"
+                value={key} onChange={(e) => setKey(e.target.value)} />
+              <button style={{ ...S.pillBtn(), width: "100%" }} onClick={saveConfig}>Save settings</button>
+            </>
+          )}
+
+          {configured && (
+            <div style={{ marginTop: showSetup ? 14 : 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Sign in to sync</div>
+              <input style={{ ...S.input, marginBottom: 8 }} type="email" autoCapitalize="none" placeholder="email"
+                value={email} onChange={(e) => setEmail(e.target.value)} />
+              <input style={{ ...S.input, marginBottom: 8 }} type="password" placeholder="password"
+                value={pw} onChange={(e) => setPw(e.target.value)} />
+              <div style={S.row}>
+                <button style={{ ...S.pillBtn(), flex: 1 }} disabled={busy} onClick={() => authAction("login")}>Log in</button>
+                <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} disabled={busy} onClick={() => authAction("signup")}>Sign up</button>
+              </div>
+              <button style={{ ...S.smallPill("transparent", C.sub), marginTop: 8 }} onClick={() => { clearSbConfig(); resetSbClient(); setShowSetup(true); }}>
+                Change Supabase settings
+              </button>
+              <div style={{ fontSize: 12, color: C.sub, marginTop: 8, lineHeight: 1.45 }}>
+                First sign-in pushes your existing {data.sessions.length} sessions to the cloud — nothing is lost.
+              </div>
+            </div>
+          )}
+          {err && <div style={{ marginTop: 10, fontSize: 13, color: C.red, lineHeight: 1.4 }}>{err}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================ BACKUP (export / import) ============================ */
+
+function BackupCard({ data, persist }) {
+  const [msg, setMsg] = useState("");
+  const flash = (m) => { setMsg(m); setTimeout(() => setMsg(""), 3000); };
+
+  const exportData = () => {
+    try {
+      const payload = JSON.stringify({ app: "recomp-coach", version: 8, exportedAt: new Date().toISOString(), data }, null, 2);
+      const blob = new Blob([payload], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `recomp-coach-backup-${todayISO()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      flash("Backup file created — save it to Files or iCloud.");
+    } catch (e) {
+      flash("Export failed on this device.");
+    }
+  };
+
+  const importData = (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const incoming = parsed && parsed.data ? parsed.data : parsed;
+        if (!incoming || !Array.isArray(incoming.sessions)) throw new Error("bad file");
+        const merged = {
+          ...data, ...incoming,
+          sessions: incoming.sessions || data.sessions,
+          weights: incoming.weights || data.weights,
+          swaps: incoming.swaps || data.swaps || {},
+          nutrition: { ...(data.nutrition || {}), ...(incoming.nutrition || {}) },
+          focus: { ...(data.focus || {}), ...(incoming.focus || {}) },
+          plan: { ...(data.plan || {}), ...(incoming.plan || {}) },
+          phase: incoming.phase || data.phase || {},
+        };
+        persist(merged);
+        flash(`Restored ${merged.sessions.length} sessions and ${merged.weights.length} weigh-ins.`);
+      } catch (e) {
+        flash("Couldn't read that file — make sure it's a Recomp Coach backup.");
+      }
+    };
+    reader.readAsText(file);
+    ev.target.value = "";
+  };
+
+  return (
+    <div style={{ ...S.card, background: "#F7F7FA" }}>
+      <div style={{ fontWeight: 700, fontSize: 15 }}>Backup & restore</div>
+      <div style={{ fontSize: 12.5, color: C.sub, marginTop: 4, lineHeight: 1.45 }}>
+        Your logs live on this device only. <b>Export before any app update</b>, then Import after — that
+        keeps every session safe across upgrades and new phones.
+      </div>
+      <div style={{ ...S.row, marginTop: 12 }}>
+        <button style={{ ...S.pillBtn(), flex: 1 }} onClick={exportData}>Export backup</button>
+        <label style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1, textAlign: "center", cursor: "pointer" }}>
+          Import backup
+          <input type="file" accept="application/json,.json" onChange={importData} style={{ display: "none" }} />
+        </label>
+      </div>
+      <div style={{ fontSize: 12, color: C.sub, marginTop: 10, lineHeight: 1.4 }}>
+        {data.sessions.length} sessions · {data.weights.length} weigh-ins currently stored.
+      </div>
+      {msg && (
+        <div style={{ marginTop: 10, fontSize: 13, fontWeight: 600, color: C.green }}>{msg}</div>
+      )}
+    </div>
+  );
+}
+
+function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOut }) {
   const resolvedProgram = getProgram(data).map((d) => ({
     ...d,
     exercises: d.exercises.map((slot) => resolveSlot(slot, data.swaps, data.focus)),
@@ -1263,6 +1590,9 @@ function Log({ data, persist, loaded }) {
           </button>
         </div>
       ))}
+
+      <SyncCard data={data} sbUser={sbUser} syncStatus={syncStatus} onSignedIn={onSignedIn} onSignedOut={onSignedOut} />
+      <BackupCard data={data} persist={persist} />
     </div>
   );
 }

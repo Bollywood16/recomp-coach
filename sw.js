@@ -1,5 +1,5 @@
 /* Recomp Coach service worker — offline support */
-const CACHE = "recomp-coach-v7";
+const CACHE = "recomp-coach-v9";
 
 /* App shell + the CDN libraries the app needs to boot. Caching these means the
    app opens with no network after the first successful load. */
@@ -14,6 +14,7 @@ const ASSETS = [
   "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js",
   "https://unpkg.com/prop-types@15/prop-types.min.js",
   "https://unpkg.com/recharts@2.12.7/umd/Recharts.js",
+  "https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js",
   "https://unpkg.com/@babel/standalone/babel.min.js",
 ];
 
