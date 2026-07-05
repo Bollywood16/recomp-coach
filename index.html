@@ -55,55 +55,118 @@ window.storage = {
    Trap-bar deadlift removed: deep hip flexion is off the table with the
    labral tear. Its slot is now a back squat to safety pins set above parallel. */
 
-const PROGRAM = [
-  {
-    id: "upperA",
-    name: "Upper A",
-    exercises: [
-      { id: "bench", name: "Barbell Bench Press", cat: "hpress", sets: 3, repMin: 6, repMax: 10, start: 95, inc: 5 },
-      { id: "csrow", name: "Chest-Supported Row", cat: "hpull", sets: 3, repMin: 8, repMax: 12, start: 70, inc: 5 },
-      { id: "dbohp", name: "Seated DB Shoulder Press", cat: "vpress", sets: 3, repMin: 8, repMax: 12, start: 25, inc: 5, perHand: true },
-      { id: "latpd", name: "Lat Pulldown", cat: "vpull", sets: 3, repMin: 10, repMax: 15, start: 90, inc: 5 },
-      { id: "curl", name: "Incline DB Curl", cat: "biceps", sets: 2, repMin: 10, repMax: 15, start: 15, inc: 2.5, perHand: true },
-      { id: "pressdn", name: "Cable Triceps Pressdown", cat: "triceps", sets: 2, repMin: 10, repMax: 15, start: 40, inc: 5 },
-    ],
-  },
-  {
-    id: "lowerA",
-    name: "Lower A",
-    exercises: [
-      { id: "legpress", name: "Leg Press (pain-free depth)", cat: "squat", sets: 3, repMin: 8, repMax: 12, start: 140, inc: 10 },
-      { id: "pinsquat", name: "Back Squat to Safety Pins (above parallel)", cat: "squat", sets: 3, repMin: 6, repMax: 8, start: 95, inc: 10, basedOn: { ex: "legpress", ratio: 0.7 } },
-      { id: "legext", name: "Leg Extension", cat: "quad", sets: 3, repMin: 12, repMax: 15, start: 70, inc: 5 },
-      { id: "legcurl", name: "Seated Leg Curl (slow tempo)", cat: "ham", sets: 3, repMin: 12, repMax: 15, start: 60, inc: 5 },
-      { id: "calf", name: "Standing Calf Raise", cat: "calf", sets: 3, repMin: 12, repMax: 20, start: 90, inc: 10 },
-      { id: "cablecrunch", name: "Cable Crunch", cat: "core", sets: 3, repMin: 12, repMax: 15, start: 40, inc: 5 },
-    ],
-  },
-  {
-    id: "upperB",
-    name: "Upper B",
-    exercises: [
-      { id: "ohp", name: "Overhead Press (barbell)", cat: "vpress", sets: 3, repMin: 6, repMax: 10, start: 55, inc: 5 },
-      { id: "pullup", name: "Pull-Up (assisted ok)", cat: "vpull", sets: 3, repMin: 6, repMax: 10, start: 0, inc: 5 },
-      { id: "incdb", name: "Incline DB Press", cat: "hpress", sets: 3, repMin: 8, repMax: 12, start: 30, inc: 5, perHand: true },
-      { id: "cablerow", name: "Seated Cable Row", cat: "hpull", sets: 3, repMin: 10, repMax: 15, start: 90, inc: 5 },
-      { id: "latraise", name: "Lateral Raise", cat: "delts", sets: 3, repMin: 12, repMax: 20, start: 10, inc: 2.5, perHand: true },
-      { id: "hammer", name: "Hammer Curl", cat: "biceps", sets: 2, repMin: 10, repMax: 15, start: 15, inc: 2.5, perHand: true },
-    ],
-  },
-  {
-    id: "lowerB",
-    name: "Lower B",
-    exercises: [
-      { id: "goblet", name: "Goblet / Box Squat", cat: "squat", sets: 3, repMin: 8, repMax: 12, start: 40, inc: 5 },
-      { id: "rdl", name: "RDL (mid-shin range)", cat: "hinge", sets: 3, repMin: 8, repMax: 10, start: 75, inc: 5 },
-      { id: "bss", name: "Bulgarian Split Squat (shallow)", cat: "quad", sets: 2, repMin: 10, repMax: 12, start: 0, inc: 5, perHand: true },
-      { id: "hipthrust", name: "Hip Thrust", cat: "glute", sets: 3, repMin: 10, repMax: 12, start: 95, inc: 10 },
-      { id: "kneeraise", name: "Hanging Knee Raise", cat: "core", sets: 3, repMin: 10, repMax: 15, start: 0, inc: 0 },
-    ],
-  },
+/* ===== Canonical exercise definitions (id, name, cat, load params) =====
+   Days are built from these via slot(), so the same lift keeps one identity —
+   and one progression history — across every split template. */
+const D = {
+  bench:   { id: "bench", name: "Barbell Bench Press", cat: "hpress", start: 95, inc: 5 },
+  csrow:   { id: "csrow", name: "Chest-Supported Row", cat: "hpull", start: 70, inc: 5 },
+  dbohp:   { id: "dbohp", name: "Seated DB Shoulder Press", cat: "vpress", start: 25, inc: 5, perHand: true },
+  latpd:   { id: "latpd", name: "Lat Pulldown", cat: "vpull", start: 90, inc: 5 },
+  curl:    { id: "curl", name: "Incline DB Curl", cat: "biceps", start: 15, inc: 2.5, perHand: true },
+  pressdn: { id: "pressdn", name: "Cable Triceps Pressdown", cat: "triceps", start: 40, inc: 5 },
+  legpress:{ id: "legpress", name: "Leg Press (pain-free depth)", cat: "squat", start: 140, inc: 10 },
+  pinsquat:{ id: "pinsquat", name: "Back Squat to Safety Pins (above parallel)", cat: "squat", start: 95, inc: 10, basedOn: { ex: "legpress", ratio: 0.7 } },
+  legext:  { id: "legext", name: "Leg Extension", cat: "quad", start: 70, inc: 5 },
+  legcurl: { id: "legcurl", name: "Seated Leg Curl (slow tempo)", cat: "ham", start: 60, inc: 5 },
+  calf:    { id: "calf", name: "Standing Calf Raise", cat: "calf", start: 90, inc: 10 },
+  cablecrunch: { id: "cablecrunch", name: "Cable Crunch", cat: "core", start: 40, inc: 5 },
+  ohp:     { id: "ohp", name: "Overhead Press (barbell)", cat: "vpress", start: 55, inc: 5 },
+  pullup:  { id: "pullup", name: "Pull-Up (assisted ok)", cat: "vpull", start: 0, inc: 5 },
+  incdb:   { id: "incdb", name: "Incline DB Press", cat: "hpress", start: 30, inc: 5, perHand: true },
+  cablerow:{ id: "cablerow", name: "Seated Cable Row", cat: "hpull", start: 90, inc: 5 },
+  latraise:{ id: "latraise", name: "Lateral Raise", cat: "delts", start: 10, inc: 2.5, perHand: true },
+  hammer:  { id: "hammer", name: "Hammer Curl", cat: "biceps", start: 15, inc: 2.5, perHand: true },
+  goblet:  { id: "goblet", name: "Goblet / Box Squat", cat: "squat", start: 40, inc: 5 },
+  rdl:     { id: "rdl", name: "RDL (mid-shin range)", cat: "hinge", start: 75, inc: 5 },
+  bss:     { id: "bss", name: "Bulgarian Split Squat (shallow)", cat: "quad", start: 0, inc: 5, perHand: true },
+  hipthrust: { id: "hipthrust", name: "Hip Thrust", cat: "glute", start: 95, inc: 10 },
+  kneeraise: { id: "kneeraise", name: "Hanging Knee Raise", cat: "core", start: 0, inc: 0 },
+  reardelt:  { id: "reardelt", name: "Reverse Pec-Deck (rear delt)", cat: "delts", start: 40, inc: 5 },
+  machohp:   { id: "machohp", name: "Machine Shoulder Press", cat: "vpress", start: 60, inc: 5, basedOn: { ex: "ohp", ratio: 1.0 } },
+  cablelat:  { id: "cablelat", name: "Cable Lateral Raise", cat: "delts", start: 10, inc: 2.5 },
+  ezcurl:    { id: "ezcurl", name: "EZ-Bar Curl", cat: "biceps", start: 35, inc: 5 },
+  skull:     { id: "skull", name: "EZ-Bar Skullcrusher", cat: "triceps", start: 30, inc: 5, basedOn: { ex: "pressdn", ratio: 0.75 } },
+  ohte:      { id: "ohte", name: "Overhead Cable Triceps Ext.", cat: "triceps", start: 30, inc: 5, basedOn: { ex: "pressdn", ratio: 0.8 } },
+};
+const slot = (id, sets, repMin, repMax) => ({ ...D[id], sets, repMin, repMax });
+
+/* ===== Split templates =====
+   balanced   — 2 upper + 2 lower: everything 2x/week, the evidence-based default.
+   upperFocus — 3 upper + 1 lower: upper muscles ~2-3x/week, legs held at 1x
+                maintenance. The standard specialization structure.
+   superhero  — 3 upper-dominant days + 1 maintenance lower: the screen-physique
+                block (delts/arms/upper-chest priority — the "camera muscles" —
+                with legs retained at a holding dose, never zero). */
+const PROGRAMS = {
+  balanced: [
+    { id: "upperA", name: "Upper A", blurb: "Chest · back · shoulders · arms", exercises: [
+      slot("bench", 3, 6, 10), slot("csrow", 3, 8, 12), slot("dbohp", 3, 8, 12),
+      slot("latpd", 3, 10, 15), slot("curl", 2, 10, 15), slot("pressdn", 2, 10, 15) ] },
+    { id: "lowerA", name: "Lower A", blurb: "Quads · hamstrings · calves · abs", exercises: [
+      slot("legpress", 3, 8, 12), slot("pinsquat", 3, 6, 8), slot("legext", 3, 12, 15),
+      slot("legcurl", 3, 12, 15), slot("calf", 3, 12, 20), slot("cablecrunch", 3, 12, 15) ] },
+    { id: "upperB", name: "Upper B", blurb: "Shoulders · lats · chest · arms", exercises: [
+      slot("ohp", 3, 6, 10), slot("pullup", 3, 6, 10), slot("incdb", 3, 8, 12),
+      slot("cablerow", 3, 10, 15), slot("latraise", 3, 12, 20), slot("hammer", 2, 10, 15) ] },
+    { id: "lowerB", name: "Lower B", blurb: "Glutes · hinge · single-leg · core", exercises: [
+      slot("goblet", 3, 8, 12), slot("rdl", 3, 8, 10), slot("bss", 2, 10, 12),
+      slot("hipthrust", 3, 10, 12), slot("kneeraise", 3, 10, 15) ] },
+  ],
+  upperFocus: [
+    { id: "ufUpperA", name: "Upper A", blurb: "Chest-led · back · shoulders · arms", exercises: [
+      slot("bench", 3, 6, 10), slot("csrow", 3, 8, 12), slot("dbohp", 3, 8, 12),
+      slot("latpd", 3, 10, 15), slot("curl", 2, 10, 15), slot("pressdn", 2, 10, 15) ] },
+    { id: "ufLower", name: "Lower", blurb: "One consolidated hip-safe leg day", exercises: [
+      slot("legpress", 3, 8, 12), slot("pinsquat", 3, 6, 8), slot("legcurl", 3, 12, 15),
+      slot("hipthrust", 3, 10, 12), slot("calf", 3, 12, 20), slot("cablecrunch", 3, 12, 15) ] },
+    { id: "ufUpperB", name: "Upper B", blurb: "Shoulder-led · lats · chest · arms", exercises: [
+      slot("ohp", 3, 6, 10), slot("pullup", 3, 6, 10), slot("incdb", 3, 8, 12),
+      slot("cablerow", 3, 10, 15), slot("latraise", 3, 12, 20), slot("hammer", 2, 10, 15) ] },
+    { id: "ufArms", name: "Delts & Arms", blurb: "Dedicated shoulder + arm session", exercises: [
+      slot("machohp", 3, 8, 12), slot("cablelat", 3, 15, 20), slot("reardelt", 3, 12, 20),
+      slot("ezcurl", 3, 10, 15), slot("skull", 3, 10, 15), slot("ohte", 2, 10, 15) ] },
+  ],
+  superhero: [
+    { id: "shPush", name: "Push", blurb: "Chest · front/side delts · triceps", exercises: [
+      slot("bench", 4, 6, 10), slot("incdb", 3, 8, 12), slot("dbohp", 3, 8, 12),
+      slot("latraise", 3, 12, 20), slot("pressdn", 3, 10, 15) ] },
+    { id: "shPull", name: "Pull", blurb: "Back width & thickness · rear delts · biceps", exercises: [
+      slot("pullup", 3, 6, 10), slot("csrow", 3, 8, 12), slot("latpd", 3, 10, 15),
+      slot("reardelt", 3, 12, 20), slot("ezcurl", 3, 10, 15) ] },
+    { id: "shArms", name: "Delts & Arms", blurb: "The camera muscles: shoulders + arms", exercises: [
+      slot("ohp", 3, 6, 10), slot("cablelat", 3, 15, 20), slot("skull", 3, 10, 15),
+      slot("ohte", 2, 10, 15), slot("hammer", 3, 10, 15), slot("curl", 2, 10, 15) ] },
+    { id: "shLower", name: "Lower (maintenance)", blurb: "Holding dose — keeps legs, protects the hip", exercises: [
+      slot("legpress", 3, 8, 12), slot("legcurl", 3, 12, 15), slot("hipthrust", 3, 10, 12),
+      slot("calf", 2, 12, 20), slot("cablecrunch", 3, 12, 15) ] },
+  ],
+};
+const PROGRAM = PROGRAMS.balanced;
+
+const TEMPLATES = [
+  { key: "balanced", name: "Balanced 2+2", tagline: "2 upper · 2 lower — everything 2x/week",
+    desc: "The evidence-based default: meta-analyses show ~2x/week per muscle beats 1x at equal volume. Best for overall development." },
+  { key: "upperFocus", name: "Upper Focus 3+1", tagline: "3 upper · 1 lower — upper 2-3x, legs maintained",
+    desc: "The standard specialization structure: legs drop to a 1x/week holding dose (enough to retain muscle) and the freed session becomes a dedicated delts & arms day." },
+  { key: "superhero", name: "Superhero Block", tagline: "Push · Pull · Delts+Arms · maintenance Lower",
+    desc: "Modeled on how screen transformations are actually programmed: heavy priority on shoulders, arms, and upper chest — the muscles that fill a frame — with legs kept at maintenance, not skipped. Consistency and diet do most of the work." },
 ];
+
+/* Rules engine: recommend a split from the emphasis sliders. */
+function recommendTemplate(focus) {
+  const f = focus || DEFAULT_FOCUS;
+  const rank = (g) => LEVEL_RANK[f[g] ?? "normal"];
+  const emph = (g) => rank(g) >= 2;
+  const legsMaintained = f.legs === "maintain";
+  if (emph("shoulders") && emph("arms") && legsMaintained) {
+    return { key: "superhero", why: "Shoulders + arms emphasized with legs on maintain — this is the screen-physique configuration: three upper-dominant days, one maintenance lower day." };
+  }
+  if (["shoulders", "arms", "chest", "back"].some(emph)) {
+    return { key: "upperFocus", why: "You have an upper-body emphasis active. A 3-upper / 1-lower week raises those muscles to ~2-3x/week while one consolidated lower day holds your legs." };
+  }
+  return { key: "balanced", why: "No strong emphasis set — 2 upper + 2 lower trains everything twice weekly, which the frequency research favors as the default." };
+}
 
 /* Swap library: alternates the picker can pull in. Sets/reps inherit from the
    slot being replaced; basedOn lets the engine estimate a weight from a lift
@@ -133,8 +196,9 @@ const LIBRARY = [
   { id: "kasglute", name: "KAS Glute Bridge", cat: "glute", start: 95, inc: 10, basedOn: { ex: "hipthrust", ratio: 0.9 } },
 ];
 
-const PROGRAM_EXERCISES = PROGRAM.flatMap((d) => d.exercises);
-const ALL_KNOWN = [...PROGRAM_EXERCISES, ...LIBRARY];  // bonus added after BONUS_EX defined
+const PROGRAM_EXERCISES = Object.values(PROGRAMS).flatMap((p) => p.flatMap((d) => d.exercises));
+const _dedupe = (arr) => { const seen = {}; return arr.filter((e) => (seen[e.id] ? false : (seen[e.id] = true))); };
+const ALL_KNOWN = _dedupe([...PROGRAM_EXERCISES, ...LIBRARY]);  // bonus added after BONUS_EX defined
 const EX_BY_ID = Object.fromEntries(ALL_KNOWN.map((e) => [e.id, e]));
 const STORAGE_KEY = "recompcoach:v2";
 const OLD_KEY = "recompcoach:v1";
@@ -146,7 +210,7 @@ const CAT_NAMES = {
 };
 
 const DEFAULT_NUTRITION = { age: 35, sex: "male", heightIn: 67, deskJob: true, steps: 7000, workouts: 4 };
-const DEFAULT_DATA = { sessions: [], weights: [], swaps: {}, nutrition: DEFAULT_NUTRITION, focus: null };
+const DEFAULT_DATA = { sessions: [], weights: [], swaps: {}, nutrition: DEFAULT_NUTRITION, focus: null, plan: null, phase: null };
 
 
 /* ===== Emphasis model (research-driven set redistribution) =====
@@ -172,15 +236,25 @@ const EMPHASIS_LEVELS = [
   { key: "specialize", label: "Specialize", mult: 1.85 },
 ];
 const DEFAULT_FOCUS = { shoulders: "normal", arms: "normal", chest: "normal", back: "normal", legs: "normal", core: "normal" };
+const DEFAULT_PLAN = { template: "balanced", sessionMin: 60, templateSince: null };
+const getProgram = (data) => PROGRAMS[(data.plan && data.plan.template) || "balanced"] || PROGRAMS.balanced;
 
 /* Bonus exercises unlocked when a group is set to Specialize. Injected into the
    matching day so the extra volume lands where it trains that muscle. */
 const BONUS = [
-  { group: "shoulders", dayId: "upperB", ex: { id: "bonus_sidelat", name: "Cable Lateral Raise (high-rep)", cat: "delts", repMin: 15, repMax: 20, start: 10, inc: 2.5 } },
-  { group: "shoulders", dayId: "upperA", ex: { id: "bonus_reardelt", name: "Reverse Pec-Deck (rear delt)", cat: "delts", repMin: 12, repMax: 20, start: 40, inc: 5 } },
-  { group: "arms", dayId: "upperA", ex: { id: "bonus_ohtri", name: "Overhead Cable Triceps Ext.", cat: "triceps", repMin: 10, repMax: 15, start: 30, inc: 5 } },
-  { group: "arms", dayId: "upperB", ex: { id: "bonus_preacher", name: "Preacher / Cable Curl", cat: "biceps", repMin: 10, repMax: 15, start: 30, inc: 5 } },
+  // minLevel "emphasize": appears at Emphasize AND Specialize.
+  { group: "shoulders", dayId: "upperB", minLevel: "emphasize", ex: { id: "bonus_sidelat", name: "Cable Lateral Raise (high-rep)", cat: "delts", repMin: 15, repMax: 20, start: 10, inc: 2.5 } },
+  { group: "shoulders", dayId: "upperA", minLevel: "emphasize", ex: { id: "bonus_reardelt", name: "Reverse Pec-Deck (rear delt)", cat: "delts", repMin: 12, repMax: 20, start: 40, inc: 5 } },
+  { group: "arms", dayId: "upperA", minLevel: "emphasize", ex: { id: "bonus_ohtri", name: "Overhead Cable Triceps Ext.", cat: "triceps", repMin: 10, repMax: 15, start: 30, inc: 5 } },
+  { group: "arms", dayId: "upperB", minLevel: "emphasize", ex: { id: "bonus_preacher", name: "Preacher / Cable Curl", cat: "biceps", repMin: 10, repMax: 15, start: 30, inc: 5 } },
+  // minLevel "specialize": only when pushed all the way — a second finisher.
+  { group: "shoulders", dayId: "upperA", minLevel: "specialize", ex: { id: "bonus_dbpress", name: "DB Lateral Raise (drop set)", cat: "delts", repMin: 12, repMax: 20, start: 12, inc: 2.5, perHand: true } },
+  { group: "arms", dayId: "upperB", minLevel: "specialize", ex: { id: "bonus_dbhammer", name: "Cross-Body Hammer Curl", cat: "biceps", repMin: 10, repMax: 15, start: 20, inc: 5, perHand: true } },
+  { group: "chest", dayId: "upperA", minLevel: "specialize", ex: { id: "bonus_cablefly", name: "Cable Fly", cat: "hpress", repMin: 12, repMax: 20, start: 20, inc: 5 } },
+  { group: "back", dayId: "upperB", minLevel: "specialize", ex: { id: "bonus_pullover", name: "Straight-Arm Pulldown", cat: "vpull", repMin: 12, repMax: 20, start: 40, inc: 5 } },
+  { group: "legs", dayId: "lowerA", minLevel: "specialize", ex: { id: "bonus_walkinglunge", name: "Walking Lunge (pain-free ROM)", cat: "quad", repMin: 10, repMax: 12, start: 0, inc: 5, perHand: true } },
 ];
+const LEVEL_RANK = { maintain: 0, normal: 1, emphasize: 2, specialize: 3 };
 const BONUS_EX = BONUS.map((b) => b.ex);
 
 BONUS_EX.forEach((b) => { if (!EX_BY_ID[b.id]) { ALL_KNOWN.push(b); EX_BY_ID[b.id] = b; } });
@@ -198,24 +272,173 @@ function adjustSets(baseSets, cat, focus) {
   return Math.max(1, Math.min((baseSets || 3) + 3, Math.round((baseSets || 3) * m)));
 }
 /* Which bonus exercises are active for a given day, based on Specialize focus. */
-function bonusForDay(dayId, focus) {
-  if (!focus) return [];
-  return BONUS.filter((b) => b.dayId === dayId && focus[b.group] === "specialize")
-    .map((b) => ({ ...b.ex, sets: 3, slotId: b.ex.id, swapped: false, isBonus: true }));
+function bonusForDay(day, focus, program) {
+  if (!focus || !day) return [];
+  const prog = program || PROGRAMS.balanced;
+  const out = [];
+  const groupIdx = {};
+  BONUS.forEach((b) => {
+    const cur = LEVEL_RANK[focus[b.group]] ?? 1;
+    if (cur < LEVEL_RANK[b.minLevel]) return;
+    const gcats = MUSCLE_GROUPS[b.group].cats;
+    const days = prog.filter((d) => d.exercises.some((e) => gcats.includes(e.cat)));
+    if (!days.length) return;
+    const i = (groupIdx[b.group] = (groupIdx[b.group] ?? -1) + 1);
+    const target = days[i % days.length];
+    if (target.id === day.id) {
+      out.push({ ...b.ex, sets: 3, baseSets: 3, slotId: b.ex.id, swapped: false, isBonus: true, bonusGroup: b.group, focusBoost: true });
+    }
+  });
+  return out;
 }
+
+/* ===== Time-budget engine =====
+   Fits a day into the user's session length. Estimated cost per exercise =
+   sets x (work + rest). Trimming order is research-informed: cut sets from
+   non-focused isolation first, keep compounds >= 2 sets, never touch a focused
+   muscle's volume until everything else is at minimum, and drop trailing
+   non-focused isolation lifts only as a last resort. */
+const COMPOUND_CATS = ["squat", "hinge", "hpress", "vpress", "hpull", "vpull"];
+const isCompound = (ex) => COMPOUND_CATS.includes(ex.cat);
+
+function fitDayToTime(list, sessionMin) {
+  const budget = Math.max(20, (sessionMin || 60) - 8) * 60; // minus ~8 min warm-up
+  const items = list.map((e) => ({ ...e }));
+  const dur = (ex) => ex.sets * (40 + restFor(ex).sec);
+  const total = () => items.reduce((a, e) => a + dur(e), 0);
+  const minSets = (ex) => (isCompound(ex) ? 2 : 1);
+  const prio = (ex) => (ex.focusBoost ? 2 : 0) + (isCompound(ex) ? 1 : 0);
+  let trimmed = 0;
+  const dropped = [];
+  let guard = 200;
+  while (total() > budget && guard-- > 0) {
+    const cands = items.filter((e) => e.sets > minSets(e));
+    if (cands.length) {
+      cands.sort((a, b) => prio(a) - prio(b) || items.indexOf(b) - items.indexOf(a));
+      cands[0].sets -= 1;
+      trimmed++;
+      continue;
+    }
+    // everything at minimum: drop the last non-focused isolation lift
+    let idx = -1;
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (!isCompound(items[i]) && !items[i].focusBoost) { idx = i; break; }
+    }
+    if (idx === -1) break;
+    dropped.push(items[idx].name);
+    items.splice(idx, 1);
+  }
+  return { list: items, trimmed, dropped, minutes: Math.round(total() / 60) + 8 };
+}
+
+function dayFittedMinutes(day, data) {
+  const f = data.focus || DEFAULT_FOCUS;
+  const p = getProgram(data);
+  const list = [
+    ...day.exercises.map((s) => resolveSlot(s, data.swaps, f)),
+    ...bonusForDay(day, f, p),
+  ];
+  return fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60).minutes;
+}
+
+/* ===== Auto-periodization (phase engine) =====
+   Detects where you are in the process and adjusts the program:
+   - Re-entry ramp: first ~4 weeks of logging after a layoff. Conservative
+     loads, fast weekly progression ("muscle memory" re-acquisition).
+   - Building block: the default. Double progression drives overload.
+   - Deload: suggested when estimated 1RMs have stalled across most lifts for
+     ~3 weeks (accumulated fatigue masking fitness). One week at ~60% sets and
+     ~90% loads, then back to building — the standard evidence-based reset.
+   - Block rotation: specialization splits are meant to run 8-12 weeks; after
+     ~10 the engine suggests rotating back to Balanced so de-emphasized
+     muscles return to full volume. Suggestions are one-tap, never silent. */
+
+function trainingWeeks(sessions) {
+  return new Set((sessions || []).map((s) => weekStart(s.date))).size;
+}
+
+function deloadActive(data) {
+  const p = data.phase;
+  return !!(p && p.deloadUntil && todayISO() <= p.deloadUntil);
+}
+
+/* Share of trained compound lifts whose weekly-best e1RM has not improved
+   over the last 3 recorded weeks. */
+function stallScore(data) {
+  const lifts = ALL_KNOWN.filter(
+    (ex) => isCompound(ex) && data.sessions.some((s) => s.exerciseId === ex.id)
+  );
+  let eligible = 0, stalled = 0;
+  lifts.forEach((ex) => {
+    const series = weeklySeries(data.sessions, ex.id);
+    if (series.length < 3) return;
+    eligible++;
+    const recent = series.slice(-3);
+    if (recent[2].e1 <= recent[0].e1 * 1.005) stalled++;
+  });
+  return { eligible, stalled, ratio: eligible ? stalled / eligible : 0 };
+}
+
+function templateWeeks(data) {
+  const since = data.plan && data.plan.templateSince;
+  if (!since) return 0;
+  const ms = new Date(todayISO()) - new Date(since);
+  return Math.floor(ms / (7 * 24 * 3600 * 1000));
+}
+
+function phaseInfo(data) {
+  const wks = trainingWeeks(data.sessions);
+  const suggestions = [];
+  if (deloadActive(data)) {
+    return {
+      name: "Deload week", icon: "recover",
+      note: `Reduced volume (~60% sets) and ~90% loads through ${shortDate(data.phase.deloadUntil)}. Fatigue drops faster than fitness — you'll come back stronger.`,
+      suggestions,
+    };
+  }
+  const st = stallScore(data);
+  if (wks >= 6 && st.eligible >= 3 && st.ratio >= 0.6) {
+    suggestions.push({
+      type: "deload",
+      text: `${st.stalled} of ${st.eligible} main lifts have stalled for ~3 weeks — the classic accumulated-fatigue signal. A 1-week deload is the evidence-based reset.`,
+    });
+  }
+  const tmpl = (data.plan && data.plan.template) || "balanced";
+  const tWks = templateWeeks(data);
+  if ((tmpl === "superhero" || tmpl === "upperFocus") && tWks >= 10) {
+    suggestions.push({
+      type: "rotate",
+      text: `You've run this specialization block for ${tWks} weeks. Research favors 8-12 week blocks, then rotating back to Balanced so de-emphasized muscles recover full volume.`,
+    });
+  }
+  if (wks < 4) {
+    return {
+      name: "Re-entry ramp", icon: "ramp",
+      note: `Week ${wks + 1} of ~4. Loads are deliberately conservative — post-layoff strength returns fast (myonuclear "muscle memory"), so expect quick weekly jumps without forcing them.`,
+      suggestions,
+    };
+  }
+  return {
+    name: "Building block", icon: "build",
+    note: `Week ${wks} of training. Double progression is the driver: hit the top of a rep range on all sets, add weight next session.`,
+    suggestions,
+  };
+}
+
 /* Live weekly-set tally per muscle group across the whole program + bonuses. */
 function weeklySetsByGroup(data) {
   const focus = data.focus || DEFAULT_FOCUS;
+  const program = getProgram(data);
   const t = {};
-  PROGRAM.forEach((day) => {
-    day.exercises.forEach((slot) => {
-      const ex = resolveSlot(slot, data.swaps, focus);
+  program.forEach((day) => {
+    const list = [
+      ...day.exercises.map((slot) => resolveSlot(slot, data.swaps, focus)),
+      ...bonusForDay(day, focus, program),
+    ];
+    const fitted = fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60).list;
+    fitted.forEach((ex) => {
       const g = CAT_TO_GROUP[ex.cat];
       if (g) t[g] = (t[g] || 0) + ex.sets;
-    });
-    bonusForDay(day.id, focus).forEach((b) => {
-      const g = CAT_TO_GROUP[b.cat];
-      if (g) t[g] = (t[g] || 0) + b.sets;
     });
   });
   return t;
@@ -276,6 +499,7 @@ function resolveSlot(slot, swaps, focus) {
   const baseSets = slot.sets;
   base.sets = focus ? adjustSets(baseSets, base.cat, focus) : baseSets;
   base.baseSets = baseSets;
+  base.focusBoost = focus ? (LEVEL_RANK[focus[CAT_TO_GROUP[base.cat]] ?? "normal"] >= 2) : false;
   return base;
 }
 
@@ -288,7 +512,7 @@ function lastWorkingWeight(sessions, exId) {
 
 /* Recommendation engine: double progression, plus cross-lift estimation for
    exercises you haven't logged yet (used when swapping something new in). */
-function recommend(ex, sessions) {
+function recommend(ex, sessions, deload) {
   const hist = sessions
     .filter((s) => s.exerciseId === ex.id)
     .sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -317,6 +541,9 @@ function recommend(ex, sessions) {
   const last = hist[hist.length - 1];
   const reps = last.sets.map((s) => Number(s.r) || 0);
   const w = Math.max(...last.sets.map((s) => Number(s.w) || 0));
+  if (deload) {
+    return { weight: round5(w * 0.9), tag: "Deload", note: `Deload week: ~90% of your last working weight (${w} lb), reduced sets, stop 3-4 reps shy of failure. Recovery is the goal.` };
+  }
   const allTop = reps.length > 0 && reps.every((r) => r >= ex.repMax);
   const anyBelow = reps.some((r) => r > 0 && r < ex.repMin);
   const inc = ex.inc ?? 5;
@@ -425,7 +652,7 @@ const S = {
 
 function App() {
   const [tab, setTab] = useState("today");
-  const [data, setData] = useState({ ...DEFAULT_DATA, focus: DEFAULT_FOCUS });
+  const [data, setData] = useState({ ...DEFAULT_DATA, focus: DEFAULT_FOCUS, plan: DEFAULT_PLAN, phase: {} });
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
@@ -447,6 +674,8 @@ function App() {
           swaps: found.swaps || {},
           nutrition: { ...DEFAULT_NUTRITION, ...(found.nutrition || {}) },
           focus: { ...DEFAULT_FOCUS, ...(found.focus || {}) },
+          plan: { ...DEFAULT_PLAN, ...(found.plan || {}) },
+          phase: found.phase || {},
         });
       }
       setLoaded(true);
@@ -493,21 +722,64 @@ const TabBtn = ({ icon: Icon, label, id, tab, setTab }) => (
 /* ============================ WORKOUT FLOW ============================ */
 /* Day picker → day page → tap an exercise to log it inline, with rest timer */
 
+function PhaseCard({ data, persist }) {
+  const info = phaseInfo(data);
+  const iconMap = { ramp: TrendingUp, build: Dumbbell, recover: Sparkles };
+  const Icon = iconMap[info.icon] || Dumbbell;
+
+  const startDeload = () => {
+    const until = new Date(todayISO());
+    until.setDate(until.getDate() + 7);
+    persist({ ...data, phase: { ...(data.phase || {}), deloadUntil: until.toISOString().slice(0, 10) } });
+  };
+  const endDeload = () => persist({ ...data, phase: { ...(data.phase || {}), deloadUntil: null } });
+  const rotateBalanced = () =>
+    persist({ ...data, plan: { ...(data.plan || DEFAULT_PLAN), template: "balanced", templateSince: todayISO() } });
+
+  return (
+    <div style={{ ...S.card, background: "#F7F7FA" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <Icon size={20} color={C.blue} />
+        <div style={{ fontWeight: 800, fontSize: 16 }}>{info.name}</div>
+        {deloadActive(data) && (
+          <button style={{ ...S.smallPill("#E9E9EB", C.sub), marginLeft: "auto" }} onClick={endDeload}>
+            End early
+          </button>
+        )}
+      </div>
+      <div style={{ fontSize: 13, color: "#3A3A3C", marginTop: 8, lineHeight: 1.5 }}>{info.note}</div>
+
+      {info.suggestions.map((s, i) => (
+        <div key={i} style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.line}` }}>
+          <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.5 }}>{s.text}</div>
+          {s.type === "deload" && (
+            <button style={{ ...S.pillBtn(C.green), marginTop: 10, width: "100%" }} onClick={startDeload}>
+              Start a deload week
+            </button>
+          )}
+          {s.type === "rotate" && (
+            <button style={{ ...S.pillBtn(), marginTop: 10, width: "100%" }} onClick={rotateBalanced}>
+              Rotate back to Balanced
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function WorkoutFlow({ data, persist }) {
   const [dayId, setDayId] = useState(null);
-  const day = dayId ? PROGRAM.find((d) => d.id === dayId) : null;
+  const program = getProgram(data);
+  const day = dayId ? program.find((d) => d.id === dayId) : null;
 
-  if (!day) return <DayPicker data={data} onPick={setDayId} />;
+  if (!day) return <DayPicker data={data} onPick={setDayId} persist={persist} />;
   return <DayPage day={day} data={data} persist={persist} onBack={() => setDayId(null)} />;
 }
 
-function DayPicker({ data, onPick }) {
-  const focus = {
-    upperA: "Chest · back · shoulders · arms",
-    lowerA: "Quads · hamstrings · calves · abs",
-    upperB: "Shoulders · lats · chest · arms",
-    lowerB: "Glutes · hinge · single-leg · core",
-  };
+function DayPicker({ data, onPick, persist }) {
+  const program = getProgram(data);
+  const tmpl = TEMPLATES.find((t) => t.key === ((data.plan && data.plan.template) || "balanced"));
 
   const lastDone = (day) => {
     const ids = day.exercises.map((slot) => resolveSlot(slot, data.swaps).id);
@@ -519,10 +791,14 @@ function DayPicker({ data, onPick }) {
     <div>
       <header style={S.header}>
         <h1 style={S.h1}>Workout</h1>
-        <div style={S.sub}>Which day are you on?</div>
+        <div style={S.sub}>
+          {tmpl ? tmpl.name : "Program"} · ~{(data.plan && data.plan.sessionMin) || 60} min sessions · change in Focus tab
+        </div>
       </header>
 
-      {PROGRAM.map((d) => {
+      <PhaseCard data={data} persist={persist} />
+
+      {program.map((d) => {
         const last = lastDone(d);
         return (
           <button
@@ -536,9 +812,9 @@ function DayPicker({ data, onPick }) {
           >
             <div>
               <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: -0.3 }}>{d.name}</div>
-              <div style={{ color: C.sub, fontSize: 13, marginTop: 3 }}>{focus[d.id]}</div>
+              <div style={{ color: C.sub, fontSize: 13, marginTop: 3 }}>{d.blurb}</div>
               <div style={{ color: C.sub, fontSize: 12.5, marginTop: 6 }}>
-                {d.exercises.length} exercises · ~{dayDurationMin(d, data.swaps, data.focus)} min
+                {d.exercises.length}+ exercises · ~{dayFittedMinutes(d, data)} min
                 {last ? ` · last done ${shortDate(last)}` : " · not started yet"}
               </div>
             </div>
@@ -550,12 +826,30 @@ function DayPicker({ data, onPick }) {
       <div style={{ ...S.card, background: "#EAF3FF" }}>
         <div style={{ fontWeight: 700, fontSize: 14, color: C.blue }}>Suggested rhythm</div>
         <div style={{ fontSize: 13, lineHeight: 1.5, marginTop: 6, color: "#3A3A3C" }}>
-          Upper A → Lower A → rest → Upper B → Lower B → weekend. But any order works —
-          just don't run the two lower days back to back while the hip is rebuilding.
+          Run the days in order with a rest day mid-week (e.g., day 1 → day 2 → rest → day 3 → day 4 → weekend).
+          Keep at least a day between the two most shoulder-heavy sessions, and don't stack leg work
+          back-to-back while the hip is rebuilding.
         </div>
       </div>
     </div>
   );
+}
+
+/* Summary of Focus effects on a given day: which muscles are emphasized here,
+   how many sets were added vs base, and how many bonus lifts were injected. */
+function dayFocusSummary(day, data) {
+  const focus = data.focus || DEFAULT_FOCUS;
+  let added = 0, groups = new Set();
+  day.exercises.forEach((slot) => {
+    const ex = resolveSlot(slot, data.swaps, focus);
+    const g = CAT_TO_GROUP[ex.cat];
+    const delta = (ex.sets || 0) - (ex.baseSets || ex.sets || 0);
+    if (delta > 0 && g) { added += delta; groups.add(MUSCLE_GROUPS[g]?.name); }
+    if (delta < 0 && g) { groups.add(MUSCLE_GROUPS[g]?.name); }
+  });
+  const bonus = bonusForDay(day, focus, getProgram(data));
+  bonus.forEach((b) => { const g = CAT_TO_GROUP[b.cat]; if (g) groups.add(MUSCLE_GROUPS[g]?.name); });
+  return { added, bonusCount: bonus.length, groups: [...groups] };
 }
 
 function DayPage({ day, data, persist, onBack }) {
@@ -578,17 +872,71 @@ function DayPage({ day, data, persist, onBack }) {
         <div style={S.sub}>Tap an exercise to log your sets. Rest times shown per lift.</div>
       </header>
 
-      {[...day.exercises, ...bonusForDay(day.id, data.focus)].map((slot) => (
-        <ExerciseCard
-          key={slot.id}
-          slot={slot}
-          data={data}
-          persist={persist}
-          open={openId === slot.id}
-          onToggle={() => setOpenId(openId === slot.id ? null : slot.id)}
-          done={!!loggedToday(resolveSlot(slot, data.swaps).id)}
-        />
-      ))}
+      {(() => {
+        const focusObj = data.focus || DEFAULT_FOCUS;
+        const program = getProgram(data);
+        const entries = [
+          ...day.exercises.map((s) => ({ slot: s, ex: resolveSlot(s, data.swaps, focusObj) })),
+          ...bonusForDay(day, focusObj, program).map((b) => ({ slot: b, ex: b })),
+        ];
+        const isDeload = deloadActive(data);
+        const pool = entries.map((e) => isDeload
+          ? { ...e.ex, sets: Math.max(isCompound(e.ex) ? 2 : 1, Math.round(e.ex.sets * 0.6)) }
+          : e.ex);
+        const fit = fitDayToTime(pool, (data.plan && data.plan.sessionMin) || 60);
+        const sum = dayFocusSummary(day, data);
+        const focusParts = [];
+        if (sum.added > 0) focusParts.push(`+${sum.added} set${sum.added > 1 ? "s" : ""}`);
+        if (sum.bonusCount > 0) focusParts.push(`${sum.bonusCount} bonus lift${sum.bonusCount > 1 ? "s" : ""}`);
+        return (
+          <>
+            {focusParts.length > 0 && (
+              <div style={{ ...S.card, background: "#EAF3FF", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <Target size={18} color={C.blue} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.45 }}>
+                  <b style={{ color: C.blue }}>Focus active:</b> {focusParts.join(" + ")} on this day
+                  {sum.groups.length ? ` for ${sum.groups.join(", ")}.` : "."} Adjust in the Focus tab.
+                </div>
+              </div>
+            )}
+            {isDeload && (
+              <div style={{ ...S.card, background: "#E8F8EE", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <Sparkles size={18} color={C.green} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.45 }}>
+                  <b style={{ color: C.green }}>Deload week:</b> sets cut to ~60%, loads to ~90%, through {shortDate(data.phase.deloadUntil)}.
+                  Move well, leave reps in the tank, come back fresh.
+                </div>
+              </div>
+            )}
+            {(fit.trimmed > 0 || fit.dropped.length > 0) && (
+              <div style={{ ...S.card, background: "#F7F7FA", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <Flame size={18} color={C.orange} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.45 }}>
+                  <b>Fitted to ~{fit.minutes} min</b> for your {(data.plan && data.plan.sessionMin) || 60}-minute session:
+                  trimmed {fit.trimmed} set{fit.trimmed !== 1 ? "s" : ""}
+                  {fit.dropped.length > 0 ? `, skipped ${fit.dropped.join(", ")}` : ""}.
+                  Compounds and focused muscles were protected first. More time = more volume — change it in Focus.
+                </div>
+              </div>
+            )}
+            {fit.list.map((ex) => {
+              const entry = entries.find((e) => e.ex.slotId === ex.slotId);
+              return (
+                <ExerciseCard
+                  key={ex.slotId}
+                  slot={entry ? entry.slot : ex}
+                  ex={ex}
+                  data={data}
+                  persist={persist}
+                  open={openId === ex.slotId}
+                  onToggle={() => setOpenId(openId === ex.slotId ? null : ex.slotId)}
+                  done={!!loggedToday(ex.id)}
+                />
+              );
+            })}
+          </>
+        );
+      })()}
 
       <div style={{ ...S.card, background: "#EAF3FF" }}>
         <div style={{ fontWeight: 700, fontSize: 14, color: C.blue }}>Coach notes</div>
@@ -602,9 +950,8 @@ function DayPage({ day, data, persist, onBack }) {
   );
 }
 
-function ExerciseCard({ slot, data, persist, open, onToggle, done }) {
-  const ex = resolveSlot(slot, data.swaps, data.focus);
-  const rec = recommend(ex, data.sessions);
+function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
+  const rec = recommend(ex, data.sessions, deloadActive(data));
   const rest = restFor(ex);
   const [sets, setSets] = useState(null);
   const [swapMode, setSwapMode] = useState(false);
@@ -656,6 +1003,8 @@ function ExerciseCard({ slot, data, persist, open, onToggle, done }) {
     : S.tag("#F0F0F3", C.sub);
 
   const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  const setDelta = (ex.sets || 0) - (ex.baseSets || ex.sets || 0);
+  const isBonus = !!slot.isBonus;
 
   return (
     <div style={{ ...S.card, borderLeft: done ? `4px solid ${C.green}` : "none" }}>
@@ -665,8 +1014,11 @@ function ExerciseCard({ slot, data, persist, open, onToggle, done }) {
         style={{ ...font, display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", background: "transparent", border: "none", cursor: "pointer", textAlign: "left", padding: 0 }}
       >
         <div>
-          <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>
-            {done && <span style={{ color: C.green }}>✓ </span>}{ex.name}
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.text, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>{done && <span style={{ color: C.green }}>✓ </span>}{ex.name}</span>
+            {isBonus && <span style={S.tag("#EAF3FF", C.blue)}>Focus bonus</span>}
+            {!isBonus && setDelta > 0 && <span style={S.tag("#E8F8EE", C.green)}>+{setDelta} set{setDelta > 1 ? "s" : ""}</span>}
+            {!isBonus && setDelta < 0 && <span style={S.tag("#F0F0F3", C.sub)}>maintain</span>}
           </div>
           <div style={{ color: C.sub, fontSize: 13, marginTop: 3 }}>
             {ex.sets} × {ex.repMin}–{ex.repMax} at {rec.weight === 0 ? "BW" : `${rec.weight} lb${ex.perHand ? "/hand" : ""}`} · rest {rest.label}
@@ -700,9 +1052,11 @@ function ExerciseCard({ slot, data, persist, open, onToggle, done }) {
             <button style={S.smallPill()} onClick={() => setSets([...(sets || []), { w: rec.weight === 0 ? "" : String(rec.weight), r: "" }])}>
               <Plus size={13} /> Add set
             </button>
-            <button style={S.smallPill(swapMode ? "#DCEBFF" : "#E9E9EB", swapMode ? C.blue : C.text)} onClick={() => setSwapMode(!swapMode)}>
-              {swapMode ? <X size={13} /> : <Repeat size={13} />} {swapMode ? "Close" : "Swap"}
-            </button>
+            {!slot.isBonus && (
+              <button style={S.smallPill(swapMode ? "#DCEBFF" : "#E9E9EB", swapMode ? C.blue : C.text)} onClick={() => setSwapMode(!swapMode)}>
+                {swapMode ? <X size={13} /> : <Repeat size={13} />} {swapMode ? "Close" : "Swap"}
+              </button>
+            )}
             {timer === null ? (
               <button style={S.smallPill("#FFF1E5", C.orange)} onClick={() => setTimer(rest.sec)}>
                 Start {rest.label} rest
@@ -771,7 +1125,7 @@ function ExerciseCard({ slot, data, persist, open, onToggle, done }) {
 /* ============================ LOG ============================ */
 
 function Log({ data, persist, loaded }) {
-  const resolvedProgram = PROGRAM.map((d) => ({
+  const resolvedProgram = getProgram(data).map((d) => ({
     ...d,
     exercises: d.exercises.map((slot) => resolveSlot(slot, data.swaps, data.focus)),
   }));
@@ -1125,6 +1479,89 @@ function Focus({ data, persist }) {
         <div style={S.sub}>Dial up a body part and the program shifts sets toward it — automatically.</div>
       </header>
 
+      {(() => {
+        const plan = data.plan || DEFAULT_PLAN;
+        const rec = recommendTemplate(focus);
+        const setPlan = (patch) => persist({ ...data, plan: { ...plan, ...patch } });
+        const legsMaintained = focus.legs === "maintain";
+        const upperHeavy = plan.template === "upperFocus" || plan.template === "superhero";
+        return (
+          <>
+            <div style={S.card}>
+              <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>Weekly split</div>
+              <div style={{ fontSize: 12.5, color: C.sub, marginBottom: 12 }}>
+                The engine recommends a split from your emphasis settings below. You always choose.
+              </div>
+              {TEMPLATES.map((t) => {
+                const active = plan.template === t.key;
+                const recommended = rec.key === t.key;
+                return (
+                  <button
+                    key={t.key}
+                    onClick={() => persist({ ...data, plan: { ...plan, template: t.key, templateSince: todayISO() } })}
+                    style={{
+                      ...font, display: "block", width: "100%", textAlign: "left", cursor: "pointer",
+                      background: active ? "#EAF3FF" : "#F7F7FA",
+                      border: active ? `1.5px solid ${C.blue}` : `1px solid ${C.line}`,
+                      borderRadius: 14, padding: "12px 14px", marginBottom: 10,
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontWeight: 800, fontSize: 15, color: active ? C.blue : C.text }}>{t.name}</span>
+                      {recommended && <span style={S.tag("#E8F8EE", C.green)}>Recommended</span>}
+                    </div>
+                    <div style={{ fontSize: 12.5, color: C.sub, marginTop: 3 }}>{t.tagline}</div>
+                    <div style={{ fontSize: 12.5, color: "#3A3A3C", marginTop: 6, lineHeight: 1.45 }}>{t.desc}</div>
+                  </button>
+                );
+              })}
+              <div style={{ fontSize: 12.5, color: C.sub, lineHeight: 1.45, marginTop: 2 }}>
+                <b style={{ color: C.blue }}>Why:</b> {rec.why}
+              </div>
+            </div>
+
+            <div style={S.card}>
+              <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>Session length</div>
+              <div style={{ fontSize: 12.5, color: C.sub, marginBottom: 10 }}>
+                Days auto-fit your time: sets are trimmed from non-focused isolation work first;
+                compounds and your focused muscles are protected.
+              </div>
+              <div style={S.row}>
+                {[45, 60, 75].map((m) => (
+                  <button key={m} style={S.chip(plan.sessionMin === m)} onClick={() => setPlan({ sessionMin: m })}>
+                    {m === 75 ? "75+ min" : `${m} min`}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {upperHeavy && (
+              <div style={{ ...S.card, borderLeft: `4px solid ${C.blue}` }}>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>Why there's still a leg day</div>
+                <div style={{ fontSize: 13, color: "#3A3A3C", marginTop: 6, lineHeight: 1.5 }}>
+                  The research is clear on this one: training a muscle zero times per week lets it slowly
+                  detrain, while a small "maintenance dose" (roughly a third of normal volume, once weekly)
+                  retains what you've built. Skipping legs entirely also hurts overall physique balance and
+                  costs you the systemic stimulus of big lower-body lifts. So every split here keeps one
+                  lower day — upper-emphasis means legs are <b>maintained</b>, never abandoned. Superhero-sized
+                  arms with medium legs is a legitimate choice; zero legs isn't one this app will program.
+                </div>
+              </div>
+            )}
+            {!legsMaintained && plan.template === "superhero" && (
+              <div style={{ ...S.card, borderLeft: `4px solid ${C.orange}` }}>
+                <div style={{ fontWeight: 700, fontSize: 14, color: C.orange }}>Tip</div>
+                <div style={{ fontSize: 13, color: "#3A3A3C", marginTop: 6, lineHeight: 1.5 }}>
+                  You're on the Superhero block but Legs isn't set to Maintain below — that stacks extra leg
+                  sets onto a split designed to minimize them. Set Legs to Maintain to match the block's intent
+                  (and to keep total fatigue recoverable while the hip rebuilds).
+                </div>
+              </div>
+            )}
+          </>
+        );
+      })()}
+
       {emphasized > 2 && (
         <div style={{ ...S.card, borderLeft: `4px solid ${C.orange}` }}>
           <div style={{ fontWeight: 700, fontSize: 14, color: C.orange }}>Spreading yourself thin</div>
@@ -1307,6 +1744,7 @@ function Fuel({ data, persist }) {
     </div>
   );
 }
+
 
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
