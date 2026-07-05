@@ -500,6 +500,170 @@ function weeklySetsByGroup(data) {
   return t;
 }
 
+
+/* ===== Research corpus =====
+   Structured findings from exercise science literature, embedded in-app (21 rows:
+   tag-matching beats a database at this scale — move to Supabase only if it grows
+   past ~100 entries). The prompt builder pulls only phase-relevant findings. */
+const RESEARCH_CORPUS = [
+  // ── Post-injury / re-entry ──
+  { id:"r01", topic:"post_injury_frequency", phase:["reentry","injury_recovery"],
+    finding:"2x/week submaximal loading outperforms 1x/week for tendon remodeling during return-to-sport phases; higher frequency allows lower per-session load while preserving total stimulus.",
+    param:"session_frequency", source:"Cook & Purdam tendon loading framework; Rio et al. 2015" },
+  { id:"r02", topic:"labral_loading", phase:["reentry","injury_recovery"],
+    finding:"Hip labral pathology responds best to pain-monitored progressive loading with strict depth limits; avoid deep hip flexion under load until 8+ pain-free weeks at submaximal intensity.",
+    param:"exercise_selection", source:"Lewis & Sahrmann 2006; Groh & Herrera 2009" },
+  { id:"r03", topic:"hamstring_tendinopathy", phase:["reentry","injury_recovery"],
+    finding:"Proximal hamstring tendinopathy managed with slow heavy loading (3-4s eccentric) at pain ≤4/10 shows superior outcomes to rest; avoid compressive positions (deep hip flexion + knee extension).",
+    param:"exercise_selection", source:"Goom et al. 2016 British Journal of Sports Medicine" },
+  { id:"r04", topic:"detraining_muscle_memory", phase:["reentry"],
+    finding:"After 3-6 month detraining, myonuclear retention allows strength recovery 40-60% faster than initial acquisition; conservative loads in week 1-4 are protective not limiting.",
+    param:"starting_loads", source:"Schwartz et al. 2021; Bruusgaard et al. 2010" },
+
+  // ── Volume & MEV/MAV ──
+  { id:"r05", topic:"volume_hypertrophy", phase:["building","all"],
+    finding:"Dose-response relationship between weekly hard sets and hypertrophy is well-established up to ~20 sets/muscle/week; beyond that, additional sets show diminishing returns for most individuals.",
+    param:"weekly_sets", source:"Schoenfeld et al. 2017 meta-analysis; Krieger 2010" },
+  { id:"r06", topic:"mev_practical", phase:["building","maintain"],
+    finding:"Minimum effective volume to prevent detraining is approximately 4-6 hard sets/muscle/week; maintenance phases can use 30-50% of peak volume to retain adaptations.",
+    param:"weekly_sets", source:"Israetel et al. RP Strength MEV/MRV framework" },
+  { id:"r07", topic:"specialization_reallocation", phase:["building","upperFocus","superhero"],
+    finding:"Specialization works through reallocation, not addition: emphasizing 1-2 muscles requires reducing others to maintenance to keep total weekly volume recoverable. Attempting to raise all simultaneously stalls progress.",
+    param:"focus_distribution", source:"Israetel et al. periodization research" },
+
+  // ── Frequency ──
+  { id:"r08", topic:"frequency_hypertrophy", phase:["building","all"],
+    finding:"Training each muscle 2x/week produces significantly greater hypertrophy than 1x/week at equated volume (effect size ~0.2-0.4); benefit diminishes beyond 3x/week for most trainees.",
+    param:"session_frequency", source:"Schoenfeld et al. 2016 meta-analysis; Ralston et al. 2017" },
+  { id:"r09", topic:"frequency_upper_lower", phase:["upperFocus","superhero"],
+    finding:"Upper/lower splits with 2-3 upper sessions per week consistently outperform full-body or push/pull/legs for upper-body hypertrophy when lower body is not the priority.",
+    param:"split_template", source:"Colquhoun et al. 2018; Yue et al. 2018" },
+
+  // ── Intensity & progression ──
+  { id:"r10", topic:"proximity_failure", phase:["building","all"],
+    finding:"Sets taken to within 1-4 reps of failure produce similar hypertrophy across a wide load range (5-30 reps); proximity to failure matters more than exact rep count.",
+    param:"rep_range", source:"Schoenfeld & Grgic 2019; Morton et al. 2016" },
+  { id:"r11", topic:"double_progression", phase:["building","all"],
+    finding:"Double progression (add reps within a range, then add load) is an effective and injury-conservative overload strategy for intermediates; prevents premature load jumps that elevate injury risk.",
+    param:"progression_model", source:"Standard periodization consensus; Zourdos et al. 2016" },
+  { id:"r12", topic:"e1rm_validity", phase:["building","all"],
+    finding:"Estimated 1RM from submaximal reps (Epley formula: w×(1+r/30)) correlates r=0.95 with tested 1RM in trained individuals; reliable for within-person trend tracking without max-effort testing.",
+    param:"progress_metric", source:"Epley 1985; Mayhew et al. 1995" },
+
+  // ── Deload & fatigue ──
+  { id:"r13", topic:"deload_rationale", phase:["deload","stalled"],
+    finding:"Planned or reactive deloads (50-60% volume, 85-90% intensity, 1 week) allow supercompensation; fatigue masks fitness — lifters often emerge stronger after deload than at pre-deload peak.",
+    param:"deload_protocol", source:"Zatsiorsky & Kraemer 2006; Issurin 2010" },
+  { id:"r14", topic:"stall_detection", phase:["stalled","building"],
+    finding:"Lack of estimated 1RM progression over 3 consecutive weeks in ≥60% of trained lifts is a reliable practical indicator of accumulated fatigue requiring either deload or program adjustment.",
+    param:"deload_trigger", source:"Practical programming consensus; Israetel fatigue indicators" },
+
+  // ── Body composition ──
+  { id:"r15", topic:"recomp_rate", phase:["building","all"],
+    finding:"Simultaneous fat loss and muscle gain (body recomposition) is achievable in intermediate trainees at a deficit of 200-400 kcal/day; optimal rate 0.5-0.75% bodyweight loss/week preserves lean mass.",
+    param:"calorie_target", source:"Barakat et al. 2020 S&C Journal; Helms et al. 2014" },
+  { id:"r16", topic:"protein_synthesis", phase:["building","all"],
+    finding:"Protein intake of 1.6-2.2 g/kg/day maximizes muscle protein synthesis; distributing across 3-4 meals of 25-40g each is marginally superior to bolus intake.",
+    param:"protein_target", source:"Morton et al. 2018 BJSM meta-analysis; Moore et al. 2009" },
+  { id:"r17", topic:"deficit_muscle_loss", phase:["building","all"],
+    finding:"Deficits >500 kcal/day reliably compromise muscle retention in lean individuals even with adequate protein; signs of excessive deficit: multiple stalled lifts + scale dropping >1 lb/week.",
+    param:"calorie_floor", source:"Helms et al. 2014; Barakat et al. 2020" },
+
+  // ── Shoulder/arm aesthetics ──
+  { id:"r18", topic:"lateral_delt_isolation", phase:["superhero","upperFocus"],
+    finding:"Lateral (side) deltoid is primarily developed through isolation (lateral raises 12-20 reps) rather than compound pressing; it receives minimal stimulus from overhead press.",
+    param:"exercise_selection", source:"Boehler 2011 EMG; Coratella et al. 2020" },
+  { id:"r19", topic:"arm_direct_work", phase:["superhero","upperFocus"],
+    finding:"Direct bicep/tricep work produces meaningful additional hypertrophy beyond compound movements; 6-15 additional sets/week on top of compound stimulus is the evidence-supported range.",
+    param:"weekly_sets", source:"Gentil et al. 2013; Barbalho et al. 2020" },
+  { id:"r20", topic:"superhero_block_structure", phase:["superhero"],
+    finding:"Screen transformation programs (e.g., Marvel actors) consistently use 8-16 week specialization blocks targeting shoulders/arms/upper chest with 1 lower maintenance day; visible abs primarily achieved via sustained caloric deficit.",
+    param:"split_template", source:"Celebrity trainer interviews; D&B training methodology analysis" },
+
+  // ── Creatine ──
+  { id:"r21", topic:"creatine", phase:["all"],
+    finding:"Creatine monohydrate 3-5g/day consistently improves strength and power output 5-15% and augments hypertrophy response; one of few supplements with unambiguous evidence.",
+    param:"supplementation", source:"Rawson & Volek 2003; Lanhers et al. 2017 meta-analysis" },
+];
+
+function researchForPhase(data) {
+  const plan = (data.plan && data.plan.template) || "balanced";
+  const weeks = trainingWeeks(data.sessions || []);
+  const isReentry = weeks < 6;
+  const isDeloading = deloadActive(data);
+  const ss = stallScore(data);
+  const isStalled = ss.eligible >= 2 && ss.ratio >= 0.5;
+  const tags = new Set(["all"]);
+  if (isReentry) { tags.add("reentry"); tags.add("injury_recovery"); }
+  if (isDeloading) tags.add("deload");
+  if (isStalled) tags.add("stalled");
+  tags.add(plan);
+  if (weeks >= 6 && !isDeloading && !isStalled) tags.add("building");
+  // Specific-phase findings (injury, current template, stall) outrank generic ones,
+  // so the 8-slot cap never crowds out the findings that matter most right now.
+  const specificity = (r) => {
+    if (r.phase.some((p) => ["reentry", "injury_recovery", "deload", "stalled"].includes(p) && tags.has(p))) return 0;
+    if (r.phase.some((p) => ["superhero", "upperFocus", "maintain"].includes(p) && tags.has(p))) return 1;
+    if (r.phase.includes("building") && tags.has("building")) return 2;
+    return 3;
+  };
+  return RESEARCH_CORPUS
+    .filter((r) => r.phase.some((p) => tags.has(p)))
+    .sort((a, b) => specificity(a) - specificity(b))
+    .slice(0, 8);
+}
+
+/* ===== Coach brief builder =====
+   Assembles the export prompt following Anthropic prompt-engineering practice:
+   role first, data in XML-tagged sections before instructions, explicit
+   constraints, numbered tasks, and a strict output contract (one fenced JSON
+   block) so the reply can be pasted back and applied through the safety gates. */
+function buildCoachBrief(data, goalProfile) {
+  const m = coachMetrics(data);
+  m.lifts = m.lifts.slice(-14); // cap for prompt size
+  const research = researchForPhase(data);
+  const injury = goalProfile.injuryRecovery !== false;
+  const gateLine = injury && m.weeksTraining < 8
+    ? `HARD CONSTRAINT: the user is ${m.weeksTraining} logged week(s) into a return from injury. The template MUST be "balanced" until ~8 pain-free logged weeks, regardless of stated goals. If the goal implies otherwise, explain why this constraint wins for now and when it lifts.`
+    : `Injury status: ${injury ? `recovering, ${m.weeksTraining} logged weeks (specialization gate lifts around week 8)` : "not currently in injury recovery"}.`;
+
+  return `You are an evidence-based hypertrophy and body-recomposition coach reviewing real training data. Every number in <training_metrics> was computed deterministically from logged sessions — never invent, round, or adjust figures. Be direct: where the user's goals conflict with their constraints or the research, say so plainly rather than accommodating.
+
+<goal_profile>
+${goalProfile.text || "(not stated yet)"}
+</goal_profile>
+
+<constraints>
+${gateLine}
+Known injury history: hip labral tear + proximal hamstring tendinosis. No loaded deep hip flexion; squats stop at safety pins above parallel; hinges reduced ROM; any pain >3/10 during or 24h after a lift means reducing that lift 20% next session.
+</constraints>
+
+<training_metrics>
+${JSON.stringify(m)}
+</training_metrics>
+
+<research_context>
+${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
+</research_context>
+
+<instructions>
+1. Assess progress against the stated goal using the actual numbers — name specific lifts and their trends.
+2. Push back explicitly on every conflict between the user's desires and their constraints or the research above. Cite research_context sources when they drive a decision.
+3. Recommend a plan: template ("balanced" | "upperFocus" | "superhero"); focus for each of shoulders, arms, chest, back, legs, core (each "maintain" | "normal" | "emphasize" | "specialize", with at most 2 groups at emphasize or above); sessionMin (45 | 60 | 75); calorieDelta (integer between -300 and +300 relative to the current target); and what to watch before the next check-in.
+4. Keep the narrative under 300 words.
+5. End your reply with exactly one fenced \`\`\`json code block containing ONLY this object (no comments): {"template":"...","focus":{"shoulders":"...","arms":"...","chest":"...","back":"...","legs":"...","core":"..."},"sessionMin":60,"calorieDelta":0} — the app parses this block to apply your plan through its safety gates.
+</instructions>`;
+}
+
+function extractPlanJson(text) {
+  const fence = text.match(/```json\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/);
+  const raw = fence ? fence[1] : text;
+  const s = raw.indexOf("{");
+  const e = raw.lastIndexOf("}");
+  if (s === -1 || e === -1) throw new Error("No plan JSON found in the pasted text.");
+  return JSON.parse(raw.slice(s, e + 1));
+}
+
 /* ============================ HELPERS ============================ */
 
 const e1rm = (w, r) => (r >= 1 ? (w === 0 ? r : w * (1 + r / 30)) : 0);
@@ -806,7 +970,7 @@ function App() {
       {tab === "today" && <WorkoutFlow data={data} persist={persist} />}
       {tab === "log" && <Log data={data} persist={persist} loaded={loaded} sbUser={sbUser} syncStatus={syncStatus} onSignedIn={onSignedIn} onSignedOut={onSignedOut} />}
       {tab === "progress" && <Progress data={data} />}
-      {tab === "insights" && <Insights data={data} />}
+      {tab === "insights" && <Insights data={data} persist={persist} />}
       {tab === "fuel" && <Fuel data={data} persist={persist} />}
       {tab === "focus" && <Focus data={data} persist={persist} />}
 
@@ -1601,76 +1765,148 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
 
 function Progress({ data }) {
   const trained = ALL_KNOWN.filter((ex) => data.sessions.some((s) => s.exerciseId === ex.id));
+  const [view, setView] = useState("overview");
+  const [query, setQuery] = useState("");
   const [exId, setExId] = useState(null);
-  const activeId = exId || (trained[0] && trained[0].id);
-  const ex = activeId ? EX_BY_ID[activeId] : null;
 
-  const series = useMemo(
-    () => (activeId ? weeklySeries(data.sessions, activeId) : []),
-    [data.sessions, activeId]
-  );
-  const chartData = series.map((s) => ({ name: shortDate(s.week), e1RM: Math.round(s.e1 * 10) / 10 }));
+  const rows = useMemo(() => trained.map((ex) => {
+    const series = weeklySeries(data.sessions, ex.id);
+    const last = series[series.length - 1];
+    const best = series.reduce((a, s) => Math.max(a, s.e1), 0);
+    const t = trendPct(series);
+    const lastDate = data.sessions.filter((s) => s.exerciseId === ex.id).map((s) => s.date).sort().slice(-1)[0];
+    return { ex, series, last, best, trend: t, lastDate };
+  }).sort((a, b) => (a.lastDate < b.lastDate ? 1 : -1)), [data.sessions, trained.length]);
+
+  const matches = query.trim()
+    ? rows.filter((r) => r.ex.name.toLowerCase().includes(query.trim().toLowerCase()))
+    : rows;
+  const active = rows.find((r) => r.ex.id === exId) || null;
 
   const bwSorted = [...data.weights].sort((a, b) => (a.date < b.date ? -1 : 1));
   const bwChart = bwSorted.map((w) => ({ name: shortDate(w.date), lbs: w.lbs }));
+
+  const LiftChart = ({ row }) => {
+    const chartData = row.series.map((s) => ({ name: shortDate(s.week), e1RM: Math.round(s.e1 * 10) / 10 }));
+    return (
+      <div style={S.card}>
+        <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>{row.ex.name}</div>
+        <div style={{ color: C.sub, fontSize: 13, marginBottom: 10 }}>Estimated 1RM by week (lb)</div>
+        <div style={{ width: "100%", height: 200 }}>
+          <ResponsiveContainer>
+            <LineChart data={chartData} margin={{ top: 6, right: 8, left: -18, bottom: 0 }}>
+              <CartesianGrid stroke={C.line} vertical={false} />
+              <XAxis dataKey="name" tick={{ fontSize: 11, fill: C.sub }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: C.sub }} axisLine={false} tickLine={false} domain={["auto", "auto"]} />
+              <Tooltip />
+              <Line type="monotone" dataKey="e1RM" stroke={C.blue} strokeWidth={2.5} dot={{ r: 3.5 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+        <table style={{ width: "100%", marginTop: 12, borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ color: C.sub, textAlign: "left" }}>
+              <th style={{ padding: "6px 0", fontWeight: 600 }}>Week of</th>
+              <th style={{ fontWeight: 600 }}>Top set</th>
+              <th style={{ fontWeight: 600 }}>Volume</th>
+              <th style={{ fontWeight: 600 }}>e1RM</th>
+            </tr>
+          </thead>
+          <tbody>
+            {row.series.map((s) => (
+              <tr key={s.week} style={{ borderTop: `1px solid ${C.line}` }}>
+                <td style={{ padding: "8px 0" }}>{shortDate(s.week)}</td>
+                <td>{s.topW || "BW"} × {s.topR}</td>
+                <td>{Math.round(s.vol || 0).toLocaleString()} lb</td>
+                <td style={{ fontWeight: 700 }}>{Math.round(s.e1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
 
   return (
     <div>
       <header style={S.header}>
         <h1 style={S.h1}>Progress</h1>
-        <div style={S.sub}>Weekly best estimated 1RM per lift, plus your scale trend.</div>
+        <div style={S.sub}>Every lift at a glance, or deep-dive any chart.</div>
       </header>
 
-      {trained.length === 0 ? (
+      <div style={{ display: "flex", gap: 8, padding: "8px 16px" }}>
+        <button style={S.chip(view === "overview")} onClick={() => setView("overview")}>Overview</button>
+        <button style={S.chip(view === "charts")} onClick={() => setView("charts")}>Charts</button>
+      </div>
+
+      {trained.length === 0 && (
         <div style={{ ...S.card, color: C.sub, fontSize: 14 }}>
-          Charts appear after your first logged session.
+          Progress appears after your first logged session.
         </div>
-      ) : (
-        <>
-          <div style={{ display: "flex", gap: 8, padding: "8px 16px", overflowX: "auto" }}>
-            {trained.map((t) => (
-              <button key={t.id} style={S.chip(t.id === activeId)} onClick={() => setExId(t.id)}>
-                {t.name.split(" (")[0]}
-              </button>
-            ))}
-          </div>
+      )}
 
-          <div style={S.card}>
-            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>{ex.name}</div>
-            <div style={{ color: C.sub, fontSize: 13, marginBottom: 10 }}>Estimated 1RM by week (lb)</div>
-            <div style={{ width: "100%", height: 200 }}>
-              <ResponsiveContainer>
-                <LineChart data={chartData} margin={{ top: 6, right: 8, left: -18, bottom: 0 }}>
-                  <CartesianGrid stroke={C.line} vertical={false} />
-                  <XAxis dataKey="name" tick={{ fontSize: 11, fill: C.sub }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fontSize: 11, fill: C.sub }} axisLine={false} tickLine={false} domain={["auto", "auto"]} />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="e1RM" stroke={C.blue} strokeWidth={2.5} dot={{ r: 3.5 }} />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-
-            <table style={{ width: "100%", marginTop: 12, borderCollapse: "collapse", fontSize: 13 }}>
-              <thead>
-                <tr style={{ color: C.sub, textAlign: "left" }}>
-                  <th style={{ padding: "6px 0", fontWeight: 600 }}>Week of</th>
-                  <th style={{ fontWeight: 600 }}>Top set</th>
-                  <th style={{ fontWeight: 600 }}>Volume</th>
-                  <th style={{ fontWeight: 600 }}>e1RM</th>
+      {view === "overview" && trained.length > 0 && (
+        <div style={S.card}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ color: C.sub, textAlign: "left" }}>
+                <th style={{ padding: "6px 0", fontWeight: 600 }}>Lift</th>
+                <th style={{ fontWeight: 600, textAlign: "right" }}>Last top set</th>
+                <th style={{ fontWeight: 600, textAlign: "right" }}>Best e1RM</th>
+                <th style={{ fontWeight: 600, textAlign: "right" }}>Trend</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.ex.id} style={{ borderTop: `1px solid ${C.line}`, cursor: "pointer" }}
+                    onClick={() => { setExId(r.ex.id); setView("charts"); setQuery(""); }}>
+                  <td style={{ padding: "10px 0", fontWeight: 600, maxWidth: 140 }}>{r.ex.name.split(" (")[0]}</td>
+                  <td style={{ textAlign: "right" }}>{r.last ? `${r.last.topW || "BW"}×${r.last.topR}` : "—"}</td>
+                  <td style={{ textAlign: "right", fontWeight: 700 }}>{Math.round(r.best)}</td>
+                  <td style={{ textAlign: "right", fontWeight: 700,
+                       color: r.trend ? (r.trend.pct >= 0 ? C.green : C.red) : C.sub }}>
+                    {r.trend ? `${r.trend.pct >= 0 ? "+" : ""}${r.trend.pct.toFixed(1)}%` : "·"}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {series.map((s) => (
-                  <tr key={s.week} style={{ borderTop: `1px solid ${C.line}` }}>
-                    <td style={{ padding: "8px 0" }}>{shortDate(s.week)}</td>
-                    <td>{s.topW || "BW"} × {s.topR}</td>
-                    <td>{Math.round(s.vol || 0).toLocaleString()} lb</td>
-                    <td style={{ fontWeight: 700 }}>{Math.round(s.e1)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ fontSize: 12, color: C.sub, marginTop: 10 }}>
+            Trend = estimated-1RM change over the last ~4 logged weeks. Tap any row for its chart.
           </div>
+        </div>
+      )}
+
+      {view === "charts" && trained.length > 0 && (
+        <>
+          <div style={{ ...S.card, paddingBottom: active && !query ? 12 : 8 }}>
+            <input
+              style={S.input}
+              placeholder="Type to find a lift (e.g., bench, lateral…)"
+              value={query}
+              onChange={(e) => { setQuery(e.target.value); }}
+            />
+            {(query || !active) && (
+              <div style={{ marginTop: 8, maxHeight: 220, overflowY: "auto" }}>
+                {matches.length === 0 && (
+                  <div style={{ color: C.sub, fontSize: 13, padding: "8px 2px" }}>No logged lift matches that.</div>
+                )}
+                {matches.map((r) => (
+                  <button key={r.ex.id}
+                    onClick={() => { setExId(r.ex.id); setQuery(""); }}
+                    style={{ ...font, display: "flex", justifyContent: "space-between", alignItems: "center",
+                      width: "100%", background: exId === r.ex.id ? "#EAF3FF" : "transparent", border: "none",
+                      borderTop: `1px solid ${C.line}`, padding: "10px 4px", cursor: "pointer", textAlign: "left" }}>
+                    <span style={{ fontSize: 14, fontWeight: 600 }}>{r.ex.name.split(" (")[0]}</span>
+                    <span style={{ fontSize: 12.5, color: C.sub }}>
+                      best {Math.round(r.best)}{r.trend ? ` · ${r.trend.pct >= 0 ? "+" : ""}${r.trend.pct.toFixed(1)}%` : ""}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          {active && <LiftChart row={active} />}
         </>
       )}
 
@@ -1698,7 +1934,327 @@ function Progress({ data }) {
 
 /* ============================ INSIGHTS ============================ */
 
-function Insights({ data }) {
+/* ============================ AI COACH (in-app, direct API) ============================ */
+/* Calls the Anthropic API directly from the browser using the user's own API
+   key (stored ONLY in this device's localStorage — never synced to the cloud
+   blob). Deterministic metrics are computed here; hard safety gates run in
+   code AFTER the model responds. The LLM interprets and narrates; rules decide. */
+
+const API_KEY_LS = "recompcoach:apikey";
+
+function coachMetrics(data) {
+  const sessions = data.sessions || [];
+  const trained = ALL_KNOWN.filter((ex) => sessions.some((s) => s.exerciseId === ex.id));
+  const lifts = trained.map((ex) => {
+    const series = weeklySeries(sessions, ex.id);
+    const t = trendPct(series);
+    const stalled = series.length >= 3 &&
+      series[series.length - 1].e1 <= series[series.length - 3].e1 * 1.005;
+    return {
+      id: ex.id, name: ex.name, group: CAT_TO_GROUP[ex.cat] || ex.cat,
+      weeksLogged: series.length,
+      latestE1: series.length ? Math.round(series[series.length - 1].e1) : null,
+      trendPct: t ? Math.round(t.pct * 10) / 10 : null,
+      stalled,
+    };
+  });
+  const w = [...(data.weights || [])].sort((a, b) => (a.date < b.date ? -1 : 1));
+  let bwSlope = null;
+  if (w.length >= 4) {
+    const half = Math.floor(w.length / 2);
+    const avg = (a) => a.reduce((x, y) => x + y.lbs, 0) / a.length;
+    const spanDays = (new Date(w[w.length - 1].date) - new Date(w[0].date)) / 86400000 || 1;
+    bwSlope = Math.round(((avg(w.slice(half)) - avg(w.slice(0, half))) / (spanDays / 7)) * 100) / 100;
+  }
+  return {
+    weeksTraining: trainingWeeks(sessions),
+    totalSessions: sessions.length,
+    latestBw: w.length ? w[w.length - 1].lbs : null,
+    bwSlopePerWeek: bwSlope,
+    stalledLifts: lifts.filter((l) => l.weeksLogged >= 3 && l.stalled).length,
+    lifts: lifts.filter((l) => l.weeksLogged >= 1),
+    currentPlan: data.plan || null,
+    currentFocus: data.focus || null,
+    nutritionTarget: computeNutrition(data.nutrition || DEFAULT_NUTRITION, w.length ? w[w.length - 1].lbs : null).target,
+    deloadActive: deloadActive(data),
+  };
+}
+
+function applyCoachGates(rec, metrics, injuryRecovery) {
+  const gated = { ...rec, gates: [] };
+  if (injuryRecovery && metrics.weeksTraining < 8 && gated.template !== "balanced") {
+    gated.gates.push(`Overrode "${TEMPLATES.find((t) => t.key === gated.template)?.name || gated.template}" → Balanced: you're ${metrics.weeksTraining} logged week(s) into a return from injury. Two lighter lower-body exposures/week beats one concentrated session while tendons rebuild — this gate lifts automatically around week 8.`);
+    gated.template = "balanced";
+  }
+  if (!TEMPLATES.some((t) => t.key === gated.template)) { gated.template = "balanced"; gated.gates.push("Unknown template from model — defaulted to Balanced."); }
+  const lv = ["maintain", "normal", "emphasize", "specialize"];
+  const f = gated.focus || {};
+  Object.keys(MUSCLE_GROUPS).forEach((g) => { if (!lv.includes(f[g])) f[g] = "normal"; });
+  const emphasized = Object.values(f).filter((v) => v === "emphasize" || v === "specialize").length;
+  if (emphasized > 2) gated.gates.push(`Model emphasized ${emphasized} muscle groups — research supports 1–2 at a time; consider trimming one.`);
+  gated.focus = f;
+  const cd = Number(gated.calorieDelta) || 0;
+  gated.calorieDelta = Math.max(-300, Math.min(300, cd));
+  if (![45, 60, 75].includes(gated.sessionMin)) gated.sessionMin = (metrics.currentPlan && metrics.currentPlan.sessionMin) || 60;
+  return gated;
+}
+
+async function askCoachLLM(apiKey, metrics, goalProfile) {
+  const prompt = `You are the analytical coaching brain inside a hypertrophy/recomposition training app. All metrics below were computed deterministically from the user's real logs — never invent numbers. Interpret the goal, assess progress vs goal, recommend settings, and PUSH BACK wherever the user's stated desires conflict with their constraints (especially injury recovery). Ground reasoning in established research: ~2x/week frequency default; 10-20 hard sets/muscle/week productive; specialization = reallocation (max 1-2 muscles, others to maintenance); deload on multi-lift stalls; recomp pace -0.5 to -0.75 lb/week; post-injury re-entry favors frequent submaximal exposure for ~8 weeks before specialization.
+
+Nutrition logic: bwSlopePerWeek < -1.0 AND multiple stalls → deficit too aggressive, positive calorieDelta. Slope >= 0 for weeks with a fat-loss goal → small negative delta. Lifts progressing AND slope -0.25 to -0.75 → recomp working, delta 0.
+
+USER GOAL PROFILE: ${JSON.stringify(goalProfile)}
+METRICS: ${JSON.stringify(metrics)}
+
+Respond ONLY with JSON, no markdown fences:
+{"template":"balanced|upperFocus|superhero","focus":{${Object.keys(MUSCLE_GROUPS).map((g) => `"${g}":"..."`).join(",")}},"sessionMin":45,"calorieDelta":0,"pushback":["<each disagreement with the user's desires and why; empty array if none>"],"assessment":"<2-4 sentences, progress vs goal, using the real numbers>","nutritionNote":"<1-2 sentences>","nextCheckIn":"<what to watch over 2-4 weeks>"}`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(res.status === 401 ? "API key rejected — check it in settings." : `API error ${res.status}: ${t.slice(0, 140)}`);
+  }
+  const out = await res.json();
+  const text = (out.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  return JSON.parse(text.replace(/```json|```/g, "").trim());
+}
+
+function CoachCard({ data, persist }) {
+  const [apiKey, setApiKey] = useState(localStorage.getItem(API_KEY_LS) || "");
+  const [showSettings, setShowSettings] = useState(!localStorage.getItem(API_KEY_LS));
+  const gp = data.goalProfile || { text: "", injuryRecovery: true };
+  const [goalText, setGoalText] = useState(gp.text || "");
+  const [injury, setInjury] = useState(gp.injuryRecovery !== false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [result, setResult] = useState(null);
+  const [applied, setApplied] = useState(false);
+  const [pasted, setPasted] = useState("");
+  const [copyMsg, setCopyMsg] = useState("");
+  const weeks = trainingWeeks(data.sessions || []);
+  const UNLOCK_WEEKS = 3;
+  const unlocked = weeks >= UNLOCK_WEEKS;
+
+  const currentProfile = () => ({ text: goalText.trim(), injuryRecovery: injury, updatedAt: new Date().toISOString() });
+
+  const copyBrief = async () => {
+    if (!goalText.trim()) { setErr("Describe your goal first — the brief includes it."); return; }
+    setErr("");
+    const profile = currentProfile();
+    persist({ ...data, goalProfile: profile });
+    const brief = buildCoachBrief(data, profile);
+    try {
+      await navigator.clipboard.writeText(brief);
+      setCopyMsg("Copied — paste it into any Claude chat.");
+    } catch (e) {
+      // fallback for older webviews
+      const ta = document.createElement("textarea");
+      ta.value = brief; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); setCopyMsg("Copied — paste it into any Claude chat."); }
+      catch (e2) { setCopyMsg("Couldn't access the clipboard on this device."); }
+      document.body.removeChild(ta);
+    }
+    setTimeout(() => setCopyMsg(""), 4000);
+  };
+
+  const openInClaude = () => {
+    if (!goalText.trim()) { setErr("Describe your goal first — the brief includes it."); return; }
+    setErr("");
+    const profile = currentProfile();
+    persist({ ...data, goalProfile: profile });
+    const brief = buildCoachBrief(data, profile);
+    const url = "https://claude.ai/new?q=" + encodeURIComponent(brief);
+    if (url.length > 7500) {
+      copyBrief();
+      setCopyMsg("Brief too long for a link — copied to clipboard instead. Paste into Claude.");
+      setTimeout(() => setCopyMsg(""), 4000);
+      return;
+    }
+    window.open(url, "_blank");
+  };
+
+  const applyPasted = () => {
+    setErr(""); setApplied(false);
+    try {
+      const raw = extractPlanJson(pasted);
+      const metrics = coachMetrics(data);
+      const gated = applyCoachGates(raw, metrics, injury);
+      setResult({ ...gated, assessment: gated.assessment || "Plan applied from pasted Claude reply.", pushback: gated.pushback || [], nutritionNote: gated.nutritionNote || "See Claude's reply for the reasoning.", nextCheckIn: gated.nextCheckIn || "Re-run a check-in in 2\u20134 weeks with fresh logs." });
+      persist({
+        ...data,
+        goalProfile: currentProfile(),
+        plan: { ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: todayISO() },
+        focus: gated.focus,
+        coachNote: { assessment: "Applied from pasted Claude plan.", gates: gated.gates, calorieDelta: gated.calorieDelta, at: new Date().toISOString() },
+      });
+      setApplied(true);
+      setPasted("");
+    } catch (e) {
+      setErr("Couldn't parse a plan from that — paste Claude's full reply (it ends with a json block).");
+    }
+  };
+
+  const saveKey = () => { localStorage.setItem(API_KEY_LS, apiKey.trim()); setShowSettings(false); setErr(""); };
+
+  const run = async () => {
+    setErr(""); setApplied(false);
+    const key = localStorage.getItem(API_KEY_LS);
+    if (!key) { setShowSettings(true); setErr("Add your Anthropic API key first (stored only on this device)."); return; }
+    if (!goalText.trim()) { setErr("Describe your goal first — one or two sentences is enough."); return; }
+    setBusy(true);
+    try {
+      const profile = { text: goalText.trim(), injuryRecovery: injury, updatedAt: new Date().toISOString() };
+      const metrics = coachMetrics(data);
+      const raw = await askCoachLLM(key, metrics, profile);
+      const gated = applyCoachGates(raw, metrics, injury);
+      setResult(gated);
+      // save the goal profile immediately (plan applies only on user confirmation)
+      persist({ ...data, goalProfile: profile });
+    } catch (e) {
+      setErr(e.message || "Analysis failed — try again.");
+    }
+    setBusy(false);
+  };
+
+  const applyPlan = () => {
+    if (!result) return;
+    persist({
+      ...data,
+      plan: { ...(data.plan || DEFAULT_PLAN), template: result.template, sessionMin: result.sessionMin, templateSince: todayISO() },
+      focus: result.focus,
+      coachNote: { assessment: result.assessment, pushback: result.pushback, gates: result.gates, calorieDelta: result.calorieDelta, nutritionNote: result.nutritionNote, nextCheckIn: result.nextCheckIn, at: new Date().toISOString() },
+    });
+    setApplied(true);
+  };
+
+  return (
+    <div style={{ ...S.card, background: "#F0F7FF" }}>
+      <div style={{ ...S.row, justifyContent: "space-between" }}>
+        <span style={{ fontWeight: 800, fontSize: 16 }}>AI Coach</span>
+        <button style={S.smallPill("transparent", C.blue)} onClick={() => setShowSettings(!showSettings)}>
+          {showSettings ? "Hide settings" : "Settings"}
+        </button>
+      </div>
+
+      {showSettings && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 12.5, color: C.sub, lineHeight: 1.5, marginBottom: 8 }}>
+            Paste an Anthropic API key (console.anthropic.com → API keys). Stored only on this device —
+            never synced to the cloud. Each analysis costs about a cent.
+          </div>
+          <input style={{ ...S.input, marginBottom: 8 }} type="password" placeholder="sk-ant-..." value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)} />
+          <button style={S.pillBtn()} onClick={saveKey}>Save key</button>
+        </div>
+      )}
+
+      <div style={{ marginTop: 12 }}>
+        <div style={{ fontSize: 12.5, fontWeight: 700, color: C.sub, marginBottom: 6 }}>YOUR GOAL</div>
+        <textarea
+          style={{ ...S.input, minHeight: 64, resize: "vertical" }}
+          placeholder="e.g., Capped shoulders and visible abs by summer. Coming back from a hip labral tear. 45 minutes, 4 days a week."
+          value={goalText}
+          onChange={(e) => setGoalText(e.target.value)}
+        />
+        <button
+          style={{ ...S.smallPill(injury ? "#FFF1E5" : "#E9E9EB", injury ? C.orange : C.text), marginTop: 8 }}
+          onClick={() => setInjury(!injury)}
+        >
+          {injury ? "Recovering from injury: ON (gate active)" : "Recovering from injury: OFF"}
+        </button>
+      </div>
+
+      {!unlocked ? (
+        <div style={{ marginTop: 14, background: "#F7F7FA", borderRadius: 12, padding: 14 }}>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>Coach unlocks after {UNLOCK_WEEKS} weeks of logs</div>
+          <div style={{ background: "#E5E5EA", borderRadius: 999, height: 8, marginTop: 10, overflow: "hidden" }}>
+            <div style={{ background: C.blue, height: 8, width: `${Math.min(100, Math.round((weeks / UNLOCK_WEEKS) * 100))}%`, borderRadius: 999 }} />
+          </div>
+          <div style={{ fontSize: 12.5, color: C.sub, marginTop: 8, lineHeight: 1.45 }}>
+            {weeks} of {UNLOCK_WEEKS} weeks logged. Trends need ~3 weekly data points to mean anything —
+            recommendations before that would be guesswork. Keep logging; the coach is quietly building your
+            metrics in the background. You can write your goal above now so it's ready.
+          </div>
+        </div>
+      ) : (
+        <>
+          <div style={{ ...S.row, marginTop: 12 }}>
+            <button style={{ ...S.pillBtn(), flex: 1 }} onClick={copyBrief}>Copy coach prompt</button>
+            <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} onClick={openInClaude}>Open in Claude</button>
+          </div>
+          {copyMsg && <div style={{ color: C.green, fontSize: 13, marginTop: 8, fontWeight: 600 }}>{copyMsg}</div>}
+          <div style={{ fontSize: 12, color: C.sub, marginTop: 8, lineHeight: 1.45 }}>
+            Free path: the app packages your metrics, injury constraints, and the relevant research into a
+            structured brief. Paste it into Claude, then paste Claude's reply below — the plan applies through
+            the same safety gates.
+          </div>
+          <textarea
+            style={{ ...S.input, minHeight: 60, resize: "vertical", marginTop: 10 }}
+            placeholder="Paste Claude's full reply here to apply the plan…"
+            value={pasted}
+            onChange={(e) => setPasted(e.target.value)}
+          />
+          <button style={{ ...S.pillBtn(C.green), width: "100%", marginTop: 8 }} onClick={applyPasted}>
+            Apply pasted plan
+          </button>
+          <button style={{ ...S.pillBtn(busy ? "#8E8E93" : "#E9E9EB", busy ? "#fff" : C.text), width: "100%", marginTop: 8 }} disabled={busy} onClick={run}>
+            {busy ? "Coach is analyzing your logs…" : "Run in-app check-in (optional · uses your API key)"}
+          </button>
+        </>
+      )}
+      {err && <div style={{ color: C.red, fontSize: 13, marginTop: 8, lineHeight: 1.4 }}>{err}</div>}
+
+      {result && (
+        <div style={{ marginTop: 14 }}>
+          {result.gates.length > 0 && (
+            <div style={{ background: "#FFF7EC", borderRadius: 12, padding: 12, marginBottom: 10 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, color: C.orange }}>Safety gate applied</div>
+              {result.gates.map((g, i) => (
+                <div key={i} style={{ fontSize: 13, color: "#3A3A3C", marginTop: 4, lineHeight: 1.5 }}>{g}</div>
+              ))}
+            </div>
+          )}
+          {result.pushback && result.pushback.length > 0 && (
+            <div style={{ background: "#FDECEC", borderRadius: 12, padding: 12, marginBottom: 10 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, color: C.red }}>Coach pushback</div>
+              {result.pushback.map((p, i) => (
+                <div key={i} style={{ fontSize: 13, color: "#3A3A3C", marginTop: 4, lineHeight: 1.5 }}>{p}</div>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.55 }}>{result.assessment}</div>
+          <div style={{ fontSize: 13, marginTop: 8 }}>
+            <b>Plan:</b> {TEMPLATES.find((t) => t.key === result.template)?.name} · {result.sessionMin} min ·{" "}
+            {Object.entries(result.focus).filter(([, v]) => v !== "normal").map(([g, v]) => `${MUSCLE_GROUPS[g]?.name || g} ${v}`).join(", ") || "all normal"}
+          </div>
+          <div style={{ fontSize: 13, marginTop: 6 }}>
+            <b>Nutrition:</b> {result.calorieDelta === 0 ? "hold current target" : `${result.calorieDelta > 0 ? "+" : ""}${result.calorieDelta} kcal/day`} — {result.nutritionNote}
+          </div>
+          <div style={{ fontSize: 13, marginTop: 6 }}><b>Watch next:</b> {result.nextCheckIn}</div>
+          <button style={{ ...S.pillBtn(applied ? C.green : C.blue), width: "100%", marginTop: 12 }} onClick={applyPlan}>
+            {applied ? "Plan applied ✓" : "Apply this plan"}
+          </button>
+          <div style={{ fontSize: 12, color: C.sub, marginTop: 6, lineHeight: 1.4 }}>
+            Applying sets your split, session length, and focus sliders in one tap. Your logs are untouched.
+            Calorie changes: adjust manually in Fuel per the note above.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Insights({ data, persist }) {
   const trained = ALL_KNOWN.filter((ex) => data.sessions.some((s) => s.exerciseId === ex.id));
 
   const bwSorted = [...data.weights].sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -1720,6 +2276,8 @@ function Insights({ data }) {
         <h1 style={S.h1}>Insights</h1>
         <div style={S.sub}>Trend analysis and your next targets, from your own data.</div>
       </header>
+
+      <CoachCard data={data} persist={persist} />
 
       {trained.length === 0 && (
         <div style={{ ...S.card, color: C.sub, fontSize: 14 }}>

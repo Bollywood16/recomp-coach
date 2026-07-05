@@ -1,5 +1,5 @@
 /* Recomp Coach service worker — offline support */
-const CACHE = "recomp-coach-v9";
+const CACHE = "recomp-coach-v12";
 
 /* App shell + the CDN libraries the app needs to boot. Caching these means the
    app opens with no network after the first successful load. */
