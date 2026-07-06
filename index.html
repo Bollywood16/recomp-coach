@@ -256,6 +256,22 @@ async function cloudPush(client, uid, payload) {
   const { error } = await client.from("app_data").upsert(body);
   if (error) throw error;
 }
+
+/* Merge-on-push: EVERY upload first pulls the cloud copy and unions with it,
+   so a wiped/evicted device can never overwrite real history. (Root cause of
+   the Jul 2026 data-loss incident: a raw background push from an
+   evicted-empty container.) If the pull fails while local is empty of logs,
+   the push is refused rather than risked. */
+async function safeCloudSync(client, uid, localData) {
+  let cloud = null, pullOk = false;
+  try { cloud = await cloudPull(client, uid); pullOk = true; } catch (e) { /* network */ }
+  if (!pullOk && (localData.sessions || []).length === 0) {
+    throw new Error("Refusing to sync an empty dataset without reading the cloud copy first.");
+  }
+  const merged = cloud ? mergeData(localData, cloud) : localData;
+  await cloudPush(client, uid, merged);
+  return merged;
+}
 let _pushTimer = null;
 const OLD_KEY = "recompcoach:v1";
 
@@ -922,7 +938,13 @@ function App() {
       _pushTimer = setTimeout(async () => {
         try {
           setSyncStatus("Syncing…");
-          await cloudPush(client, sbUser.id, stamped);
+          const merged = await safeCloudSync(client, sbUser.id, stamped);
+          // If the cloud held sessions this device didn't (fresh/evicted
+          // container), adopt the merged copy locally too.
+          if ((merged.sessions || []).length > (stamped.sessions || []).length) {
+            setData(merged);
+            try { await window.storage.set(STORAGE_KEY, JSON.stringify(merged)); } catch (e2) {}
+          }
           setSyncStatus("Synced");
           setTimeout(() => setSyncStatus(""), 1500);
         } catch (e) {
@@ -939,11 +961,16 @@ function App() {
     if (!client || !user) return;
     try {
       setSyncStatus("Syncing…");
-      const cloud = await cloudPull(client, user.id);
-      const merged = mergeData(data, cloud);
+      // Read freshest local state directly from storage to avoid stale-closure
+      // pushes from a component that mounted before local data finished loading.
+      let localNow = data;
+      try {
+        const r = await window.storage.get(STORAGE_KEY);
+        if (r && r.value) localNow = JSON.parse(r.value);
+      } catch (e2) { /* keep in-memory state */ }
+      const merged = await safeCloudSync(client, user.id, localNow);
       setData(merged);
       await window.storage.set(STORAGE_KEY, JSON.stringify(merged));
-      await cloudPush(client, user.id, merged); // push the merge back up
       setSyncStatus("Synced");
       setTimeout(() => setSyncStatus(""), 1500);
     } catch (e) {

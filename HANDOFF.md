@@ -84,3 +84,11 @@ esbuild bundle check on every change; headless Node load tests with stubbed Reac
 - **Free loop:** Copy coach prompt (clipboard, primary) / Open in Claude (`claude.ai/new?q=`, guarded at 7500 URL chars, falls back to copy) → user pastes Claude's reply → `extractPlanJson` → `applyCoachGates` → applied. Zero API cost.
 - **3-week unlock:** coach actions gated behind `trainingWeeks >= 3` with a progress bar; goal text editable before unlock. In-app API-key path retained as optional.
 - Supabase: no schema changes in v12 (deliberate — see corpus decision).
+
+## v13 addendum (sync incident postmortem + fix)
+
+**Incident (Jul 2026):** iOS evicted the home-screen container's localStorage; the app opened signed-in with default-empty state; a background auto-push uploaded the empty blob over the user's cloud row. Root cause: `persist()` pushed raw local state — the union merge only ran at sign-in. Recovery: user's exported backup file re-imported.
+
+**Fix:** all uploads now route through `safeCloudSync(client, uid, local)` — pull → `mergeData` union → push. A device that lost its data now *recovers* from the cloud on its next push instead of destroying it. If the pre-push pull fails while local has zero sessions, the push is refused outright. `onSignedIn` also re-reads freshest local state from storage before syncing (stale-closure guard). Incident replayed in tests: v12 behavior = cloud wiped to 0 sessions; v13 = cloud retains 3, device adopts merged copy.
+
+**Standing advice encoded in UX:** periodic Export backup remains the last-resort layer; recommend export before any app update.
