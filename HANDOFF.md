@@ -92,3 +92,11 @@ esbuild bundle check on every change; headless Node load tests with stubbed Reac
 **Fix:** all uploads now route through `safeCloudSync(client, uid, local)` — pull → `mergeData` union → push. A device that lost its data now *recovers* from the cloud on its next push instead of destroying it. If the pre-push pull fails while local has zero sessions, the push is refused outright. `onSignedIn` also re-reads freshest local state from storage before syncing (stale-closure guard). Incident replayed in tests: v12 behavior = cloud wiped to 0 sessions; v13 = cloud retains 3, device adopts merged copy.
 
 **Standing advice encoded in UX:** periodic Export backup remains the last-resort layer; recommend export before any app update.
+
+## v14 addendum (load management + exercise selection)
+
+- **Bidirectional progression.** `recommend()` no longer only ratchets up. New signals: `belowMin` (sets under repMin) and `decay` (inter-set rep collapse, (first-worst)/first). Rules: `belowMin>=2 || decay>=0.5` → **Reduce** (load via `stepDown()` = −10% floored at one equipment increment); `belowMin==1` → **Back-off sets** (hold top load, drop ~10% on failing sets); all sets ≥ repMax → Add weight; else Add reps. Rationale: correct load permits the range on ALL sets at 1–3 RIR (Zourdos RIR framework); decay >30–40% indicates load exceeds intra-rest recovery (Senna rest-interval work). Verified against the reported failure case (20 lb curls 12/6/6 → Reduce to 17.5).
+- **Last-session panel** in `ExerciseCard` via `lastSessionFor()`: per-set weight×reps from the previous session, reps under repMin flagged orange, plus the back-off scheme when `rec.backoff` is set.
+- **`LIBRARY_EXT`**: 19 additional alternates across all patterns, each with `why` (what the variation buys) and `rank` (1 = best-value swap; alternates list is rank-sorted). Row pattern now offers 9 options (T-bar/seal ranked above bent-over given the hamstring tendinosis).
+- **Corpus r22–r24** added (load selection, inter-set decay, back-off sets); `buildCoachBrief` gains a `<set_quality>` section with the last 8 sessions' per-set detail and an explicit instruction that progression is bidirectional.
+- **Paused:** event-sourced sync (one row per session) — still the recommended structural fix over the v13 merge-on-push patch. Best done in Claude Code alongside the Supabase schema change.

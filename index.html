@@ -197,9 +197,61 @@ const LIBRARY = [
   { id: "kasglute", name: "KAS Glute Bridge", cat: "glute", start: 95, inc: 10, basedOn: { ex: "hipthrust", ratio: 0.9 } },
 ];
 
+
+/* ===== Extended alternate pool =====
+   Same movement pattern, different joint demands / stability / resistance
+   profile. `why` explains what each option buys you, so a swap is a reasoned
+   choice rather than a coin flip. Ranked by `rank` (1 = highest-value swap). */
+const LIBRARY_EXT = [
+  // Rows (hpull)
+  { id: "bbrow", name: "Bent-Over Barbell Row", cat: "hpull", start: 75, inc: 5, rank: 2, basedOn: { ex: "csrow", ratio: 1.0 },
+    why: "Most loadable row, but the torso holds an unsupported hip-hinge — with hamstring tendinosis this is the row to approach carefully or skip.", caution: "Loaded hinge position — hip/hamstring demand." },
+  { id: "tbarrow", name: "Chest-Supported T-Bar Row", cat: "hpull", start: 70, inc: 5, rank: 1, basedOn: { ex: "csrow", ratio: 1.0 },
+    why: "Closest match to chest-supported row: pad removes all lower-back and hip demand, so every rep goes to the mid-back. Best first swap for your situation." },
+  { id: "sealrow", name: "Seal Row (bench-supported)", cat: "hpull", start: 65, inc: 5, rank: 1, basedOn: { ex: "csrow", ratio: 0.9 },
+    why: "Fully prone on a bench — zero hip involvement and no body English, so the lats and rhomboids can't be cheated." },
+  { id: "meadows", name: "Meadows Row (landmine)", cat: "hpull", start: 45, inc: 5, perHand: true, rank: 3,
+    why: "Unilateral with a strong stretch at the bottom; the staggered stance is easier on the hip than a symmetrical bent-over position." },
+  { id: "invrow", name: "Inverted Row / Ring Row", cat: "hpull", start: 0, inc: 0, rank: 3,
+    why: "Bodyweight, spine-neutral, self-limiting. Useful on days a loaded row aggravates something." },
+  // Pulldowns (vpull)
+  { id: "chinup", name: "Chin-Up (supinated)", cat: "vpull", start: 0, inc: 5, rank: 2,
+    why: "Supinated grip adds meaningful biceps stimulus alongside lat work — efficient when arms are a priority." },
+  { id: "wideLatpd", name: "Wide-Grip Lat Pulldown", cat: "vpull", start: 85, inc: 5, rank: 2, basedOn: { ex: "latpd", ratio: 0.95 },
+    why: "Wider grip biases lat width over thickness — the shape that reads as a broader upper body." },
+  // Chest (hpress)
+  { id: "inclinebar", name: "Incline Barbell Press", cat: "hpress", start: 75, inc: 5, rank: 2, basedOn: { ex: "bench", ratio: 0.8 },
+    why: "Upper-chest bias; the clavicular fibers are what visually connect the chest to the delts." },
+  { id: "pecdeck", name: "Pec Deck / Machine Fly", cat: "hpress", start: 60, inc: 5, rank: 3,
+    why: "Pure adduction with the shoulder in a fixed path — lets you train chest hard when pressing bothers a shoulder." },
+  // Shoulders (vpress / delts)
+  { id: "arnold", name: "Arnold Press", cat: "vpress", start: 25, inc: 5, perHand: true, rank: 3, basedOn: { ex: "dbohp", ratio: 1.0 },
+    why: "Adds rotation through the press; more front-delt time under tension per rep at lighter loads." },
+  { id: "landminepress", name: "Landmine Press", cat: "vpress", start: 45, inc: 5, rank: 2,
+    why: "Angled press path — the most shoulder-friendly overhead option if straight-up pressing pinches." },
+  { id: "lean_lat", name: "Leaning Cable Lateral Raise", cat: "delts", start: 10, inc: 2.5, rank: 1,
+    why: "Leaning away loads the side delt in its stretched position, where cable tension is highest — a stronger stimulus per set than a dumbbell raise." },
+  { id: "machlat", name: "Lateral Raise Machine", cat: "delts", start: 40, inc: 5, rank: 2,
+    why: "Fixed path removes the swing that creeps into dumbbell raises as you fatigue — cleaner reps deep into a set." },
+  // Arms
+  { id: "inclinecurl", name: "Incline DB Curl (bench back)", cat: "biceps", start: 15, inc: 2.5, perHand: true, rank: 1,
+    why: "Arm behind the torso puts the long head of the biceps under stretch — the position research associates with the strongest growth stimulus." },
+  { id: "cablecurl", name: "Cable Curl", cat: "biceps", start: 30, inc: 5, rank: 2,
+    why: "Constant tension through the full arc; no dead spot at the top like free weights." },
+  { id: "jmpress", name: "JM Press / Close-Grip Bench", cat: "triceps", start: 75, inc: 5, rank: 2, basedOn: { ex: "bench", ratio: 0.75 },
+    why: "The heaviest way to load triceps — compound pattern lets you use real weight when isolation stalls." },
+  { id: "ohdbext", name: "Overhead DB Triceps Extension", cat: "triceps", start: 25, inc: 5, rank: 1,
+    why: "Overhead position stretches the long head, which pressdowns barely reach — the biggest of the three heads by volume." },
+  // Legs (hip-safe options)
+  { id: "reversehyper", name: "Reverse Hyper / Back Extension", cat: "glute", start: 0, inc: 5, rank: 2,
+    why: "Trains hip extension with minimal spinal load and no deep flexion — friendly to both the labrum and the hamstring tendon." },
+  { id: "sledpush", name: "Sled Push / Prowler", cat: "quad", start: 50, inc: 10, rank: 3,
+    why: "Concentric-only, so it builds legs with almost no eccentric soreness or joint stress — a good maintenance-day tool." },
+];
+
 const PROGRAM_EXERCISES = Object.values(PROGRAMS).flatMap((p) => p.flatMap((d) => d.exercises));
 const _dedupe = (arr) => { const seen = {}; return arr.filter((e) => (seen[e.id] ? false : (seen[e.id] = true))); };
-const ALL_KNOWN = _dedupe([...PROGRAM_EXERCISES, ...LIBRARY]);  // bonus added after BONUS_EX defined
+const ALL_KNOWN = _dedupe([...PROGRAM_EXERCISES, ...LIBRARY, ...LIBRARY_EXT]);  // bonus added after BONUS_EX defined
 const EX_BY_ID = Object.fromEntries(ALL_KNOWN.map((e) => [e.id, e]));
 const STORAGE_KEY = "recompcoach:v2";
 
@@ -246,12 +298,73 @@ function mergeData(local, cloud) {
   };
 }
 
+/* Event-sourced reads: one row per session/weigh-in, one settings row. */
 async function cloudPull(client, uid) {
-  const { data, error } = await client.from("app_data").select("payload").eq("user_id", uid).maybeSingle();
-  if (error) throw error;
-  return data ? data.payload : null;
+  const [sessRes, wRes, setRes] = await Promise.all([
+    client.from("sessions").select("id, date, exerciseId:exercise_id, sets").eq("user_id", uid),
+    client.from("weights").select("date, lbs").eq("user_id", uid),
+    client.from("settings").select("*").eq("user_id", uid).maybeSingle(),
+  ]);
+  if (sessRes.error) throw sessRes.error;
+  if (wRes.error) throw wRes.error;
+  if (setRes.error) throw setRes.error;
+  const s = setRes.data;
+  if (!(sessRes.data || []).length && !(wRes.data || []).length && !s) return null;
+  return {
+    sessions: sessRes.data || [],
+    weights: (wRes.data || []).map((w) => ({ date: w.date, lbs: Number(w.lbs) })),
+    swaps: (s && s.swaps) || {},
+    nutrition: (s && s.nutrition) || DEFAULT_NUTRITION,
+    focus: (s && s.focus) || null,
+    plan: (s && s.plan) || null,
+    phase: (s && s.phase) || null,
+    goalProfile: s && s.goal_profile,
+    coachNote: s && s.coach_note,
+    _updatedAt: (s && s.updated_at) || null,
+  };
 }
-async function cloudPush(client, uid, payload) {
+
+/* Additive-only write: insert whatever local has that cloud doesn't (by
+   session id / weight date), upsert the single settings row. Never deletes —
+   a wiped/evicted device just has nothing new to insert, so it can no longer
+   destroy cloud history the way a whole-blob overwrite could (root cause of
+   the Jul 2026 incident). The only DELETE in the sync layer lives in
+   deleteSession, scoped to the one row the user explicitly removed. */
+async function cloudPush(client, uid, local, cloud) {
+  const cloudSessionIds = new Set((cloud?.sessions || []).map((s) => s.id));
+  const cloudWeightByDate = Object.fromEntries((cloud?.weights || []).map((w) => [w.date, w.lbs]));
+
+  for (const sn of (local.sessions || []).filter((s) => !cloudSessionIds.has(s.id))) {
+    const { error } = await client.from("sessions").upsert(
+      { user_id: uid, id: sn.id, date: sn.date, exercise_id: sn.exerciseId, sets: sn.sets, updated_at: new Date().toISOString() },
+      { onConflict: "user_id,id" }
+    );
+    if (error) throw error;
+  }
+
+  for (const w of (local.weights || []).filter((w) => cloudWeightByDate[w.date] === undefined || Number(cloudWeightByDate[w.date]) !== Number(w.lbs))) {
+    const { error } = await client.from("weights").upsert(
+      { user_id: uid, date: w.date, lbs: w.lbs, updated_at: new Date().toISOString() },
+      { onConflict: "user_id,date" }
+    );
+    if (error) throw error;
+  }
+
+  const { error: setErr } = await client.from("settings").upsert(
+    { user_id: uid, swaps: local.swaps || {}, nutrition: local.nutrition || DEFAULT_NUTRITION,
+      focus: local.focus, plan: local.plan, phase: local.phase,
+      goal_profile: local.goalProfile ?? null, coach_note: local.coachNote ?? null,
+      updated_at: new Date().toISOString() },
+    { onConflict: "user_id" }
+  );
+  if (setErr) throw setErr;
+}
+
+/* Dual-write fallback (temporary): mirrors the pre-event-sourcing behavior
+   into app_data so reverting index.html alone, with zero DB changes, fully
+   restores the old sync path. Remove once the event-sourced path has proven
+   itself in the field. */
+async function cloudPushBlob(client, uid, payload) {
   const body = { user_id: uid, payload: { ...payload, _updatedAt: new Date().toISOString() }, updated_at: new Date().toISOString() };
   const { error } = await client.from("app_data").upsert(body);
   if (error) throw error;
@@ -269,7 +382,8 @@ async function safeCloudSync(client, uid, localData) {
     throw new Error("Refusing to sync an empty dataset without reading the cloud copy first.");
   }
   const merged = cloud ? mergeData(localData, cloud) : localData;
-  await cloudPush(client, uid, merged);
+  await cloudPush(client, uid, merged, cloud);
+  await cloudPushBlob(client, uid, merged);
   return merged;
 }
 let _pushTimer = null;
@@ -566,6 +680,17 @@ const RESEARCH_CORPUS = [
     finding:"Estimated 1RM from submaximal reps (Epley formula: w×(1+r/30)) correlates r=0.95 with tested 1RM in trained individuals; reliable for within-person trend tracking without max-effort testing.",
     param:"progress_metric", source:"Epley 1985; Mayhew et al. 1995" },
 
+  // ── Load selection & set quality ──
+  { id:"r22", topic:"load_selection", phase:["building","all"],
+    finding:"Correct load is the one permitting the target rep range on ALL prescribed sets at 1-3 reps in reserve. Loads that only allow the range on set 1 reduce total stimulating reps and raise joint stress for less growth.",
+    param:"load_selection", source:"Zourdos et al. 2016 RIR framework; Helms et al. 2016" },
+  { id:"r23", topic:"inter_set_decay", phase:["building","stalled","all"],
+    finding:"Inter-set rep decay beyond ~30-40% at fixed load indicates load exceeds what recovers within the rest interval; the corrective is reducing load or extending rest, not repeating the same weight.",
+    param:"load_selection", source:"Senna et al. 2011 rest-interval research; Grgic et al. 2018" },
+  { id:"r24", topic:"backoff_sets", phase:["building","all"],
+    finding:"Back-off sets (10-20% load reduction after a heavy top set) maintain reps within the target range across all sets, preserving effective volume — superior to grinding a fixed load into rep collapse.",
+    param:"progression_model", source:"Standard autoregulation practice; Helms et al. 2018 RPE-based loading" },
+
   // ── Deload & fatigue ──
   { id:"r13", topic:"deload_rationale", phase:["deload","stalled"],
     finding:"Planned or reactive deloads (50-60% volume, 85-90% intensity, 1 week) allow supercompensation; fatigue masks fitness — lifters often emerge stronger after deload than at pre-deload peak.",
@@ -658,16 +783,22 @@ Known injury history: hip labral tear + proximal hamstring tendinosis. No loaded
 ${JSON.stringify(m)}
 </training_metrics>
 
+<set_quality>
+Recent per-set detail for the most recently trained lifts (weight x reps, in set order). Inter-set rep decay beyond ~30-40%, or sets landing under the prescribed rep minimum, means the load is too heavy for the prescribed set count — the fix is a load reduction or back-off sets, not repeating the weight.
+${(data.sessions || []).slice(-8).map((s) => `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: ${s.sets.map((x) => `${x.w || "BW"}x${x.r}`).join(", ")}`).join("\n") || "(no sessions logged yet)"}
+</set_quality>
+
 <research_context>
 ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 </research_context>
 
 <instructions>
 1. Assess progress against the stated goal using the actual numbers — name specific lifts and their trends.
-2. Push back explicitly on every conflict between the user's desires and their constraints or the research above. Cite research_context sources when they drive a decision.
-3. Recommend a plan: template ("balanced" | "upperFocus" | "superhero"); focus for each of shoulders, arms, chest, back, legs, core (each "maintain" | "normal" | "emphasize" | "specialize", with at most 2 groups at emphasize or above); sessionMin (45 | 60 | 75); calorieDelta (integer between -300 and +300 relative to the current target); and what to watch before the next check-in.
-4. Keep the narrative under 300 words.
-5. End your reply with exactly one fenced \`\`\`json code block containing ONLY this object (no comments): {"template":"...","focus":{"shoulders":"...","arms":"...","chest":"...","back":"...","legs":"...","core":"..."},"sessionMin":60,"calorieDelta":0} — the app parses this block to apply your plan through its safety gates.
+2. Review <set_quality> for load-selection errors: flag any lift where reps collapse across sets or fall below the range, and state the corrected load (down, not up) or a back-off scheme. Progression is bidirectional — recommend reducing where the data says so.
+3. Push back explicitly on every conflict between the user's desires and their constraints or the research above. Cite research_context sources when they drive a decision.
+4. Recommend a plan: template ("balanced" | "upperFocus" | "superhero"); focus for each of shoulders, arms, chest, back, legs, core (each "maintain" | "normal" | "emphasize" | "specialize", with at most 2 groups at emphasize or above); sessionMin (45 | 60 | 75); calorieDelta (integer between -300 and +300 relative to the current target); and what to watch before the next check-in.
+5. Keep the narrative under 300 words.
+6. End your reply with exactly one fenced \`\`\`json code block containing ONLY this object (no comments): {"template":"...","focus":{"shoulders":"...","arms":"...","chest":"...","back":"...","legs":"...","core":"..."},"sessionMin":60,"calorieDelta":0} — the app parses this block to apply your plan through its safety gates.
 </instructions>`;
 }
 
@@ -684,6 +815,11 @@ function extractPlanJson(text) {
 
 const e1rm = (w, r) => (r >= 1 ? (w === 0 ? r : w * (1 + r / 30)) : 0);
 const round5 = (x) => Math.max(5, Math.round(x / 5) * 5);
+/* Step a load down by ~10%, but never less than one equipment increment. */
+function stepDown(w, inc) {
+  const step = Math.max(inc || 5, Math.round((w * 0.1) / (inc || 5)) * (inc || 5));
+  return Math.max(inc || 5, w - step);
+}
 
 function weekStart(dateISO) {
   const d = new Date(dateISO + "T12:00:00");
@@ -784,16 +920,48 @@ function recommend(ex, sessions, deload) {
   if (deload) {
     return { weight: round5(w * 0.9), tag: "Deload", note: `Deload week: ~90% of your last working weight (${w} lb), reduced sets, stop 3-4 reps shy of failure. Recovery is the goal.` };
   }
-  const allTop = reps.length > 0 && reps.every((r) => r >= ex.repMax);
-  const anyBelow = reps.some((r) => r > 0 && r < ex.repMin);
   const inc = ex.inc ?? 5;
-  if (allTop && inc > 0) {
-    return { weight: w + inc, tag: "Add weight", note: `You hit ${ex.repMax}+ reps on every set at ${w} lb. Move up.` };
+  const live = reps.filter((r) => r > 0);
+  const allTop = live.length > 0 && live.every((r) => r >= ex.repMax);
+  const belowMin = live.filter((r) => r < ex.repMin).length;
+  const first = live[0] || 0;
+  const worst = live.length ? Math.min(...live) : 0;
+  // Inter-set rep decay: how much the last sets collapse vs the first.
+  const decay = first > 0 ? (first - worst) / first : 0;
+
+  /* Load selection is BIDIRECTIONAL. The target load is the one that keeps every
+     prescribed set inside the rep range at ~1-3 reps in reserve. A large decay
+     across sets (>=35%) means the load exceeds what can be repeated within the
+     rest period: set 1 is productive, later sets fall out of the range and
+     deliver less stimulus at higher joint cost. The fix is a step DOWN in load,
+     or back-off sets after a heavy top set — not grinding the same weight. */
+  if (belowMin >= 2 || (belowMin >= 1 && decay >= 0.5)) {
+    const target = stepDown(w, inc);
+    return {
+      weight: target,
+      tag: "Reduce",
+      backoff: target,
+      note: `Your reps fell from ${first} to ${worst} at ${w} lb — that's a ${Math.round(decay * 100)}% drop, and ${belowMin} set${belowMin > 1 ? "s" : ""} landed under ${ex.repMin}. The right load is one you can hold across all ${ex.sets || live.length} sets. Drop to ${target} lb. (Alternative: keep ${w} lb for set 1, then back off to ${target} for the rest.)`,
+    };
   }
-  if (anyBelow) {
-    return { weight: w, tag: "Hold", note: `Some sets fell under ${ex.repMin} reps. Stay at ${w} lb and build reps.` };
+  if (belowMin >= 1) {
+    return {
+      weight: w,
+      tag: "Back-off sets",
+      backoff: stepDown(w, inc),
+      note: `Only the last set slipped under ${ex.repMin}. Keep ${w} lb while reps are still in range, and drop to ${stepDown(w, inc)} lb on any set that would fall short — back-off loading keeps every set inside the range instead of grinding.`,
+    };
+  }
+  if (allTop && inc > 0) {
+    return { weight: w + inc, tag: "Add weight", note: `You hit ${ex.repMax}+ reps on every set at ${w} lb. Move up — and if the last set drops below ${ex.repMin} at the new load, back off rather than grinding.` };
   }
   return { weight: w, tag: "Add reps", note: `Same weight (${w} lb) — aim for +1 rep per set toward ${ex.repMax}.` };
+}
+
+/* Last logged session for an exercise, for the "last time" reference display. */
+function lastSessionFor(sessions, exId) {
+  const hist = sessions.filter((s) => s.exerciseId === exId).sort((a, b) => (a.date < b.date ? -1 : 1));
+  return hist.length ? hist[hist.length - 1] : null;
 }
 
 function trendPct(series) {
@@ -1306,7 +1474,8 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
 
   const alternates = [
     ...(ex.swapped ? [{ ...slot, isOriginal: true }] : []),
-    ...ALL_KNOWN.filter((a) => a.cat === slot.cat && a.id !== ex.id && a.id !== slot.id),
+    ...ALL_KNOWN.filter((a) => a.cat === slot.cat && a.id !== ex.id && a.id !== slot.id)
+      .sort((a, b) => (a.rank || 4) - (b.rank || 4)),
   ];
 
   const tagStyle =
@@ -1318,6 +1487,7 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   const setDelta = (ex.sets || 0) - (ex.baseSets || ex.sets || 0);
   const isBonus = !!slot.isBonus;
+  const lastSess = lastSessionFor(data.sessions || [], ex.id);
 
   return (
     <div style={{ ...S.card, borderLeft: done ? `4px solid ${C.green}` : "none" }}>
@@ -1345,7 +1515,30 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
 
       {open && (
         <div style={{ marginTop: 14, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
-          <div style={{ color: C.sub, fontSize: 13, lineHeight: 1.45, marginBottom: 12 }}>{rec.note}</div>
+          <div style={{ color: C.sub, fontSize: 13, lineHeight: 1.45, marginBottom: 10 }}>{rec.note}</div>
+
+          {lastSess && (
+            <div style={{ background: "#F7F7FA", borderRadius: 12, padding: "10px 12px", marginBottom: 12 }}>
+              <div style={{ fontSize: 11.5, fontWeight: 700, color: C.sub, letterSpacing: 0.4 }}>
+                LAST TIME · {shortDate(lastSess.date)}
+              </div>
+              <div style={{ display: "flex", gap: 14, marginTop: 6, flexWrap: "wrap" }}>
+                {lastSess.sets.map((s, i) => (
+                  <div key={i} style={{ fontSize: 14 }}>
+                    <span style={{ color: C.sub, fontSize: 11.5 }}>S{i + 1} </span>
+                    <b>{s.w || "BW"}</b>
+                    <span style={{ color: C.sub }}> × </span>
+                    <b style={{ color: (s.r < ex.repMin) ? C.orange : C.text }}>{s.r}</b>
+                  </div>
+                ))}
+              </div>
+              {rec.backoff && rec.backoff !== rec.weight && (
+                <div style={{ fontSize: 12, color: C.blue, marginTop: 8, lineHeight: 1.4 }}>
+                  Back-off option: {rec.weight} lb on set 1, then {rec.backoff} lb to keep every set in range.
+                </div>
+              )}
+            </div>
+          )}
 
           {ex.assistable && (
             <div style={{ marginBottom: 12 }}>
@@ -1431,8 +1624,11 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                       <div style={{ fontSize: 14, fontWeight: 600 }}>
                         {alt.isOriginal ? `Back to program: ${alt.name}` : alt.name}
                       </div>
+                      {alt.why && (
+                        <div style={{ fontSize: 12, color: C.sub, marginTop: 3, lineHeight: 1.4 }}>{alt.why}</div>
+                      )}
                       {alt.caution && (
-                        <div style={{ fontSize: 12, color: C.orange, marginTop: 2 }}>{alt.caution}</div>
+                        <div style={{ fontSize: 12, color: C.orange, marginTop: 3 }}>{alt.caution}</div>
                       )}
                     </div>
                     <div style={{ color: C.blue, fontWeight: 700, fontSize: 13, whiteSpace: "nowrap", marginLeft: 8 }}>
@@ -1675,6 +1871,12 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
   };
 
   const deleteSession = (id) => {
+    const client = getSbClient();
+    if (client && sbUser) {
+      // The ONLY delete in the sync layer: one row, explicitly user-initiated.
+      client.from("sessions").delete().eq("user_id", sbUser.id).eq("id", id)
+        .then(({ error }) => { if (error) console.error("Cloud delete failed", error); });
+    }
     persist({ ...data, sessions: data.sessions.filter((s) => s.id !== id) });
   };
 
