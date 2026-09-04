@@ -286,6 +286,13 @@ function mergeData(local, cloud) {
   const weights = Object.values(wByDate).sort((a, b) => (a.date < b.date ? -1 : 1));
   const localNewer = (local._updatedAt || "") >= (cloud._updatedAt || "");
   const settingsSrc = localNewer ? local : cloud;
+  // injuryProfileHistory is unioned by (at, device) identity — independent of
+  // which side's injuryProfile snapshot "wins" below — so a stale device's
+  // overwrite is still visible after the fact instead of silently vanishing.
+  const histById = {};
+  [...(cloud.injuryProfileHistory || []), ...(local.injuryProfileHistory || [])]
+    .forEach((h) => { histById[`${h.at}|${h.device}`] = h; });
+  const injuryProfileHistory = Object.values(histById).sort((a, b) => (a.at < b.at ? -1 : 1));
   return {
     ...cloud, ...local,
     sessions, weights,
@@ -294,6 +301,8 @@ function mergeData(local, cloud) {
     focus: settingsSrc.focus || local.focus,
     plan: settingsSrc.plan || local.plan,
     phase: settingsSrc.phase || local.phase,
+    injuryProfile: settingsSrc.injuryProfile || local.injuryProfile,
+    injuryProfileHistory,
     _updatedAt: new Date().toISOString(),
   };
 }
@@ -334,7 +343,7 @@ const CAT_NAMES = {
 };
 
 const DEFAULT_NUTRITION = { age: 35, sex: "male", heightIn: 67, deskJob: true, steps: 7000, workouts: 4 };
-const DEFAULT_DATA = { sessions: [], weights: [], swaps: {}, nutrition: DEFAULT_NUTRITION, focus: null, plan: null, phase: null };
+const DEFAULT_DATA = { sessions: [], weights: [], swaps: {}, nutrition: DEFAULT_NUTRITION, focus: null, plan: null, phase: null, injuryProfile: null, injuryProfileHistory: [] };
 
 
 /* ===== Emphasis model (research-driven set redistribution) =====
@@ -362,6 +371,50 @@ const EMPHASIS_LEVELS = [
 const DEFAULT_FOCUS = { shoulders: "normal", arms: "normal", chest: "normal", back: "normal", legs: "normal", core: "normal" };
 const DEFAULT_PLAN = { template: "balanced", sessionMin: 60, templateSince: null };
 const getProgram = (data) => PROGRAMS[(data.plan && data.plan.template) || "balanced"] || PROGRAMS.balanced;
+
+/* ===== Injury profile (protected, clinician-defined data) =====
+   recoveringMode gates exercise selection (Gate 2, Task 4) and NEVER auto-lifts
+   on a week counter — a labral tear doesn't resolve on a schedule. It is
+   editable only from the Log tab's Injury Profile card (see InjuryProfileCard).
+   The separate, purely-derived isSpecializationUnlocked() below covers the
+   unrelated "is specialization timing appropriate yet" question that used to
+   be conflated with this same flag. */
+const DEFAULT_INJURY_PROFILE = {
+  recoveringMode: true,
+  injuries: [
+    { id: "hip_labrum", label: "Hip labral tear", side: "left", status: "recovering", since: "2026-01" },
+    { id: "prox_hamstring_tendinosis", label: "Proximal hamstring tendinosis", side: null, status: "recovering", since: null },
+  ],
+  movementConstraints: {
+    forbidden: ["loaded_deep_hip_flexion"],
+    limited: [
+      { attribute: "squat_depth", maxValue: "above_parallel", enforce: "safety_pins" },
+      { attribute: "hinge_rom", maxValue: "mid_shin" },
+    ],
+    painRule: { threshold: 3, window24h: true, action: "reduce_load_pct", value: 20 },
+  },
+  clinicianReviewed: false,
+  lastReviewDate: null,
+};
+
+/* Job (b): "is specialization timing appropriate yet" — separate from Gate 2's
+   movement-safety job, which recoveringMode alone covers and which never lifts.
+   This is intentionally derived, not stored: it tracks metrics.weeksTraining
+   directly, so there is no second field that can drift out of sync with it. */
+function isSpecializationUnlocked(injuryProfile, metrics) {
+  return !injuryProfile.recoveringMode || (metrics.weeksTraining || 0) >= 8;
+}
+
+/* Stable per-device label (not synced) so a cloud-merged injuryProfileHistory
+   can show which device made which edit. */
+const DEVICE_ID_KEY = "recompcoach:deviceId";
+function getDeviceId() {
+  try {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (!id) { id = "dev_" + Math.random().toString(36).slice(2, 10); localStorage.setItem(DEVICE_ID_KEY, id); }
+    return id;
+  } catch (e) { return "dev_unknown"; }
+}
 
 /* Bonus exercises unlocked when a group is set to Specialize. Injected into the
    matching day so the extra volume lands where it trains that muscle. */
@@ -701,10 +754,11 @@ function buildCoachBrief(data, goalProfile) {
   const m = coachMetrics(data);
   m.lifts = m.lifts.slice(-14); // cap for prompt size
   const research = researchForPhase(data);
-  const injury = goalProfile.injuryRecovery !== false;
-  const gateLine = injury && m.weeksTraining < 8
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const specUnlocked = isSpecializationUnlocked(injuryProfile, m);
+  const gateLine = injuryProfile.recoveringMode && !specUnlocked
     ? `HARD CONSTRAINT: the user is ${m.weeksTraining} logged week(s) into a return from injury. The template MUST be "balanced" until ~8 pain-free logged weeks, regardless of stated goals. If the goal implies otherwise, explain why this constraint wins for now and when it lifts.`
-    : `Injury status: ${injury ? `recovering, ${m.weeksTraining} logged weeks (specialization gate lifts around week 8)` : "not currently in injury recovery"}.`;
+    : `Injury status: ${injuryProfile.recoveringMode ? `recovering, ${m.weeksTraining} logged weeks (specialization gate lifts around week 8)` : "not currently in injury recovery"}.`;
 
   return `You are an evidence-based hypertrophy and body-recomposition coach reviewing real training data. Every number in <training_metrics> was computed deterministically from logged sessions — never invent, round, or adjust figures. Be direct: where the user's goals conflict with their constraints or the research, say so plainly rather than accommodating.
 
@@ -714,7 +768,9 @@ ${goalProfile.text || "(not stated yet)"}
 
 <constraints>
 ${gateLine}
-Known injury history: hip labral tear + proximal hamstring tendinosis. No loaded deep hip flexion; squats stop at safety pins above parallel; hinges reduced ROM; any pain >3/10 during or 24h after a lift means reducing that lift 20% next session.
+This injuryProfile record is authoritative and not yours to modify — any plan you propose is checked
+against it by the app's gates before it can apply, and a plan that conflicts is rejected outright:
+${JSON.stringify(injuryProfile)}
 </constraints>
 
 <training_metrics>
@@ -902,6 +958,22 @@ function lastSessionFor(sessions, exId) {
   return hist.length ? hist[hist.length - 1] : null;
 }
 
+/* painRule (Gate 4, Task 4) covers pain "during OR within 24h after" a lift.
+   `pain` on the session row only ever captures the during-session half — this
+   finds the most recent prior session for this lift that still needs the
+   delayed-onset half answered, so the UI can ask for it next time that lift
+   is opened. Delayed-onset pain is exactly the case that matters for
+   tendinosis, so this is not optional context. */
+function findPendingPainRetro(sessions, exId, today) {
+  const t = today || todayISO();
+  const hist = (sessions || [])
+    .filter((s) => s.exerciseId === exId && s.date !== t && s.painRetro == null)
+    .sort((a, b) => (a.date < b.date ? 1 : -1));
+  if (!hist.length) return null;
+  const days = Math.round((new Date(t) - new Date(hist[0].date)) / 86400000);
+  return days >= 1 && days <= 2 ? hist[0] : null;
+}
+
 function trendPct(series) {
   if (series.length < 2) return null;
   const recent = series.slice(-4);
@@ -998,7 +1070,7 @@ const S = {
 
 function App() {
   const [tab, setTab] = useState("today");
-  const [data, setData] = useState({ ...DEFAULT_DATA, focus: DEFAULT_FOCUS, plan: DEFAULT_PLAN, phase: {} });
+  const [data, setData] = useState({ ...DEFAULT_DATA, focus: DEFAULT_FOCUS, plan: DEFAULT_PLAN, phase: {}, injuryProfile: DEFAULT_INJURY_PROFILE });
   const [loaded, setLoaded] = useState(false);
   const [sbUser, setSbUser] = useState(null);
   const [syncStatus, setSyncStatus] = useState("");
@@ -1017,6 +1089,13 @@ function App() {
         } catch (e) { /* no v1 data either */ }
       }
       if (found) {
+        // One-time migration: goalProfile.injuryRecovery used to conflate Gate 2's
+        // movement-safety job with the week-based specialization-timing job (see
+        // isSpecializationUnlocked). injuryProfile.recoveringMode takes over job (a)
+        // only, and never auto-lifts. Only applies when no injuryProfile exists yet.
+        const migratedInjuryProfile = found.injuryProfile
+          ? { ...DEFAULT_INJURY_PROFILE, ...found.injuryProfile }
+          : { ...DEFAULT_INJURY_PROFILE, recoveringMode: found.goalProfile ? found.goalProfile.injuryRecovery !== false : true };
         setData({
           ...DEFAULT_DATA, ...found,
           swaps: found.swaps || {},
@@ -1024,6 +1103,8 @@ function App() {
           focus: { ...DEFAULT_FOCUS, ...(found.focus || {}) },
           plan: { ...DEFAULT_PLAN, ...(found.plan || {}) },
           phase: found.phase || {},
+          injuryProfile: migratedInjuryProfile,
+          injuryProfileHistory: found.injuryProfileHistory || [],
         });
       }
       setLoaded(true);
@@ -1179,9 +1260,16 @@ function WorkoutFlow({ data, persist }) {
   const [dayId, setDayId] = useState(null);
   const program = getProgram(data);
   const day = dayId ? program.find((d) => d.id === dayId) : null;
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
 
-  if (!day) return <DayPicker data={data} onPick={setDayId} persist={persist} />;
-  return <DayPage day={day} data={data} persist={persist} onBack={() => setDayId(null)} />;
+  return (
+    <div>
+      {!injuryProfile.clinicianReviewed && <ClinicianReviewNotice />}
+      {!day
+        ? <DayPicker data={data} onPick={setDayId} persist={persist} />
+        : <DayPage day={day} data={data} persist={persist} onBack={() => setDayId(null)} />}
+    </div>
+  );
 }
 
 function DayPicker({ data, onPick, persist }) {
@@ -1365,7 +1453,11 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const [timer, setTimer] = useState(null);
   const [flash, setFlash] = useState(false);
   const [assist, setAssist] = useState(true); // for assistable lifts: enter machine assist
+  const [pain, setPain] = useState("");
+  const [retroValue, setRetroValue] = useState("");
   const bw = currentBodyweight(data);
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const pendingRetro = injuryProfile.recoveringMode ? findPendingPainRetro(data.sessions, ex.id) : null;
 
   useEffect(() => {
     if (timer === null || timer <= 0) return;
@@ -1378,7 +1470,7 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
     if (open && sets === null) {
       setSets(Array.from({ length: ex.sets }, () => ({ w: rec.weight === 0 ? "" : String(rec.weight), r: "" })));
     }
-    if (!open) { setSets(null); setSwapMode(false); setTimer(null); }
+    if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); setRetroValue(""); }
   }, [open]); // eslint-disable-line
 
   const saveSession = () => {
@@ -1396,10 +1488,24 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
       })
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
-    const session = { id: Date.now(), date: todayISO(), exerciseId: ex.id, sets: clean };
+    const session = {
+      id: Date.now(), date: todayISO(), exerciseId: ex.id, sets: clean,
+      pain: pain === "" ? null : Math.max(0, Math.min(10, Number(pain) || 0)),
+      painRetro: null, painRetroAt: null,
+    };
     persist({ ...data, sessions: [...data.sessions, session] });
     setFlash(true);
     setTimeout(() => { setFlash(false); onToggle(); }, 900);
+  };
+
+  // Answers the delayed-onset half of painRule for a PRIOR session, not the one
+  // being logged now — see findPendingPainRetro.
+  const saveRetro = (value) => {
+    if (!pendingRetro) return;
+    const v = Math.max(0, Math.min(10, Number(value) || 0));
+    const sessions = data.sessions.map((s) => (s.id === pendingRetro.id ? { ...s, painRetro: v, painRetroAt: new Date().toISOString() } : s));
+    persist({ ...data, sessions });
+    setRetroValue("");
   };
 
   const setSwap = (newExId) => {
@@ -1453,6 +1559,22 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
 
       {open && (
         <div style={{ marginTop: 14, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
+          {pendingRetro && (
+            <div style={{ background: "#FFF1E5", borderRadius: 12, padding: "10px 12px", marginBottom: 12 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.orange }}>
+                Any pain in the 24h after your {shortDate(pendingRetro.date)} session?
+              </div>
+              <div style={{ ...S.row, marginTop: 8, flexWrap: "wrap" }}>
+                <input
+                  style={{ ...S.input, width: 70 }} type="number" inputMode="numeric" min="0" max="10"
+                  placeholder="0–10" value={retroValue} onChange={(e) => setRetroValue(e.target.value)}
+                />
+                <button style={S.smallPill()} onClick={() => saveRetro(0)}>No pain</button>
+                <button style={S.pillBtn(C.orange)} onClick={() => saveRetro(retroValue)}>Save</button>
+              </div>
+            </div>
+          )}
+
           <div style={{ color: C.sub, fontSize: 13, lineHeight: 1.45, marginBottom: 10 }}>{rec.note}</div>
 
           {lastSess && (
@@ -1507,6 +1629,16 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
               />
             </div>
           ))}
+
+          {injuryProfile.recoveringMode && (
+            <div style={{ ...S.row, marginTop: 4, marginBottom: 10 }}>
+              <span style={{ fontSize: 12.5, color: C.sub }}>Pain during this session (0–10, optional)</span>
+              <input
+                style={{ ...S.input, width: 60 }} type="number" inputMode="numeric" min="0" max="10"
+                placeholder="0" value={pain} onChange={(e) => setPain(e.target.value)}
+              />
+            </div>
+          )}
           {ex.assistable && assist && (sets || []).some((s) => Number(s.w) > 0) && (
             <div style={{ fontSize: 12, color: C.blue, marginBottom: 4 }}>
               Will log: {(sets || []).filter((s) => Number(s.w) > 0 || Number(s.r) > 0).map((s, i) =>
@@ -1741,6 +1873,10 @@ function BackupCard({ data, persist }) {
           focus: { ...(data.focus || {}), ...(incoming.focus || {}) },
           plan: { ...(data.plan || {}), ...(incoming.plan || {}) },
           phase: incoming.phase || data.phase || {},
+          injuryProfile: incoming.injuryProfile
+            ? { ...DEFAULT_INJURY_PROFILE, ...incoming.injuryProfile }
+            : (data.injuryProfile || DEFAULT_INJURY_PROFILE),
+          injuryProfileHistory: incoming.injuryProfileHistory || data.injuryProfileHistory || [],
         };
         persist(merged);
         flash(`Restored ${merged.sessions.length} sessions and ${merged.weights.length} weigh-ins.`);
@@ -1776,6 +1912,170 @@ function BackupCard({ data, persist }) {
   );
 }
 
+/* ============================ INJURY PROFILE ============================ */
+
+/* Persistent, non-dismissable while clinicianReviewed is false. Rendered on
+   the Workout tab and inside the Coach card — the two places a stale ROM
+   limit would actually bite — while editing stays confined to the Log tab. */
+function ClinicianReviewNotice({ compact }) {
+  return (
+    <div style={{ ...S.card, background: "#FFF1E5", display: "flex", gap: 10, alignItems: "flex-start", ...(compact ? { margin: "10px 0 0", padding: 12 } : {}) }}>
+      <Flame size={18} color={C.orange} style={{ marginTop: 1, flexShrink: 0 }} />
+      <div style={{ fontSize: 12.5, color: "#3A3A3C", lineHeight: 1.45 }}>
+        <b style={{ color: C.orange }}>Not clinician-reviewed:</b> the depth and ROM limits in your
+        injury profile were set in-app, not signed off by the clinician managing your injury.
+        Treat them as a starting point, not medical clearance.
+      </div>
+    </div>
+  );
+}
+
+/* The only place injuryProfile is ever written. `save` is a plain closure
+   variable, never assigned to a module-level binding — the plan parser and
+   gate pipeline (extractPlanJson, applyCoachGates, and Task 4's gate runner)
+   only ever receive `data` as a read-only prop, so there is no shared
+   reference they could call even if a pasted plan tried to smuggle one in. */
+function InjuryProfileCard({ data, persist }) {
+  const profile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const [open, setOpen] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+
+  const save = (next) => {
+    const stamped = { ...DEFAULT_INJURY_PROFILE, ...next };
+    const historyEntry = { at: new Date().toISOString(), device: getDeviceId(), profile: stamped };
+    persist({
+      ...data,
+      injuryProfile: stamped,
+      injuryProfileHistory: [...(data.injuryProfileHistory || []), historyEntry].slice(-50),
+    });
+  };
+
+  const toggleRecovering = () => save({ ...profile, recoveringMode: !profile.recoveringMode });
+  const toggleClinicianReviewed = () => save({
+    ...profile,
+    clinicianReviewed: !profile.clinicianReviewed,
+    lastReviewDate: !profile.clinicianReviewed ? todayISO() : profile.lastReviewDate,
+  });
+  const updateInjury = (idx, patch) => save({ ...profile, injuries: profile.injuries.map((inj, i) => (i === idx ? { ...inj, ...patch } : inj)) });
+  const removeInjury = (idx) => save({ ...profile, injuries: profile.injuries.filter((_, i) => i !== idx) });
+  const addInjury = () => save({
+    ...profile,
+    injuries: [...profile.injuries, { id: `injury_${Date.now()}`, label: "", side: null, status: "recovering", since: null }],
+  });
+
+  const history = [...(data.injuryProfileHistory || [])].sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 8);
+  const mc = profile.movementConstraints || DEFAULT_INJURY_PROFILE.movementConstraints;
+
+  return (
+    <div style={{ ...S.card, background: "#F7F7FA" }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{ ...font, display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", background: "transparent", border: "none", cursor: "pointer", textAlign: "left", padding: 0 }}
+      >
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>Injury profile</div>
+          <div style={{ fontSize: 12.5, color: C.sub, marginTop: 2 }}>
+            {profile.recoveringMode ? "Recovering — movement gates active" : "Not in injury recovery"}
+          </div>
+        </div>
+        <ChevronRight size={18} color={C.sub} style={{ transform: open ? "rotate(90deg)" : "none" }} />
+      </button>
+
+      {!profile.clinicianReviewed && <ClinicianReviewNotice compact />}
+
+      {open && (
+        <div style={{ marginTop: 14, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
+          <div style={{ ...S.row, justifyContent: "space-between" }}>
+            <div style={{ fontSize: 14, fontWeight: 600 }}>Recovering from injury</div>
+            <button style={S.smallPill(profile.recoveringMode ? "#FFF1E5" : "#E9E9EB", profile.recoveringMode ? C.orange : C.text)} onClick={toggleRecovering}>
+              {profile.recoveringMode ? "ON — gates active" : "OFF"}
+            </button>
+          </div>
+          <div style={{ fontSize: 12, color: C.sub, marginTop: 6, lineHeight: 1.4 }}>
+            Manual only — this never auto-lifts on a week counter. The separate specialization-timing
+            rule (template locks to Balanced under 8 logged weeks) still applies on its own schedule
+            regardless of this switch.
+          </div>
+
+          <div style={{ ...S.row, justifyContent: "space-between", marginTop: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 600 }}>Clinician-reviewed</div>
+            <button style={S.smallPill(profile.clinicianReviewed ? "#E8F8EE" : "#E9E9EB", profile.clinicianReviewed ? C.green : C.text)} onClick={toggleClinicianReviewed}>
+              {profile.clinicianReviewed ? `Confirmed${profile.lastReviewDate ? " " + shortDate(profile.lastReviewDate) : ""}` : "Not yet"}
+            </button>
+          </div>
+
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.sub, textTransform: "uppercase", letterSpacing: 0.4, marginTop: 18, marginBottom: 8 }}>
+            Injuries
+          </div>
+          {profile.injuries.map((inj, i) => (
+            <div key={inj.id || i} style={{ background: "#FFF", border: `1px solid ${C.line}`, borderRadius: 12, padding: 10, marginBottom: 8 }}>
+              <input
+                style={{ ...S.input, marginBottom: 6 }} placeholder="Injury (e.g. Hip labral tear)"
+                value={inj.label || ""} onChange={(e) => updateInjury(i, { label: e.target.value })}
+              />
+              <div style={{ ...S.row, gap: 6 }}>
+                <select style={{ ...S.input, flex: 1 }} value={inj.side || ""} onChange={(e) => updateInjury(i, { side: e.target.value || null })}>
+                  <option value="">No side</option>
+                  <option value="left">Left</option>
+                  <option value="right">Right</option>
+                  <option value="bilateral">Bilateral</option>
+                </select>
+                <select style={{ ...S.input, flex: 1 }} value={inj.status || "recovering"} onChange={(e) => updateInjury(i, { status: e.target.value })}>
+                  <option value="recovering">Recovering</option>
+                  <option value="resolved">Resolved</option>
+                  <option value="chronic">Chronic</option>
+                </select>
+              </div>
+              <div style={{ ...S.row, marginTop: 6, justifyContent: "space-between" }}>
+                <input
+                  style={{ ...S.input, flex: 1, marginRight: 8 }} type="month" placeholder="Since"
+                  value={inj.since || ""} onChange={(e) => updateInjury(i, { since: e.target.value || null })}
+                />
+                <button style={{ background: "transparent", border: "none", cursor: "pointer", color: C.red }} onClick={() => removeInjury(i)} aria-label="Remove injury">
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            </div>
+          ))}
+          <button style={S.smallPill()} onClick={addInjury}><Plus size={13} /> Add injury</button>
+
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.sub, textTransform: "uppercase", letterSpacing: 0.4, marginTop: 18, marginBottom: 8 }}>
+            Movement constraints
+          </div>
+          <div style={{ fontSize: 12.5, color: "#3A3A3C", lineHeight: 1.6 }}>
+            <div><b>Forbidden:</b> {mc.forbidden.join(", ") || "none"}</div>
+            <div style={{ marginTop: 4 }}><b>Limited:</b> {mc.limited.map((l) => `${l.attribute} ≤ ${l.maxValue}`).join("; ") || "none"}</div>
+            <div style={{ marginTop: 4 }}>
+              <b>Pain rule:</b> pain &gt;{mc.painRule.threshold}/10{mc.painRule.window24h ? " (during or within 24h)" : ""} → reduce load {mc.painRule.value}%
+            </div>
+            <div style={{ marginTop: 8, fontStyle: "italic" }}>
+              Direct editing of these lands with Task 1's movement-attribute vocabulary — for now
+              they're set to the values Gate 2 (Task 4) will enforce.
+            </div>
+          </div>
+
+          {history.length > 0 && (
+            <div style={{ marginTop: 16 }}>
+              <button style={S.smallPill()} onClick={() => setShowHistory(!showHistory)}>
+                {showHistory ? "Hide" : "Show"} change history ({history.length})
+              </button>
+              {showHistory && (
+                <div style={{ marginTop: 8 }}>
+                  {history.map((h, i) => (
+                    <div key={i} style={{ fontSize: 11.5, color: C.sub, padding: "4px 0", borderBottom: i < history.length - 1 ? `1px solid ${C.line}` : "none" }}>
+                      {new Date(h.at).toLocaleString()} · {h.device}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOut }) {
   const resolvedProgram = getProgram(data).map((d) => ({
     ...d,
@@ -1785,6 +2085,10 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
   const [sets, setSets] = useState([{ w: "", r: "" }, { w: "", r: "" }, { w: "", r: "" }]);
   const [bw, setBw] = useState("");
   const [savedFlash, setSavedFlash] = useState("");
+  const [pain, setPain] = useState("");
+  const [retroValue, setRetroValue] = useState("");
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const pendingRetro = injuryProfile.recoveringMode ? findPendingPainRetro(data.sessions, exId) : null;
 
   const flash = (msg) => { setSavedFlash(msg); setTimeout(() => setSavedFlash(""), 2000); };
 
@@ -1793,10 +2097,23 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
       .map((s) => ({ w: Number(s.w) || 0, r: Number(s.r) || 0 }))
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
-    const session = { id: Date.now(), date: todayISO(), exerciseId: exId, sets: clean };
+    const session = {
+      id: Date.now(), date: todayISO(), exerciseId: exId, sets: clean,
+      pain: pain === "" ? null : Math.max(0, Math.min(10, Number(pain) || 0)),
+      painRetro: null, painRetroAt: null,
+    };
     persist({ ...data, sessions: [...data.sessions, session] });
     setSets([{ w: "", r: "" }, { w: "", r: "" }, { w: "", r: "" }]);
+    setPain("");
     flash("Session saved");
+  };
+
+  const saveRetro = (value) => {
+    if (!pendingRetro) return;
+    const v = Math.max(0, Math.min(10, Number(value) || 0));
+    const sessions = data.sessions.map((s) => (s.id === pendingRetro.id ? { ...s, painRetro: v, painRetroAt: new Date().toISOString() } : s));
+    persist({ ...data, sessions });
+    setRetroValue("");
   };
 
   const saveWeight = () => {
@@ -1866,6 +2183,22 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
           )}
         </select>
 
+        {pendingRetro && (
+          <div style={{ background: "#FFF1E5", borderRadius: 12, padding: "10px 12px", marginBottom: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.orange }}>
+              Any pain in the 24h after your {shortDate(pendingRetro.date)} session?
+            </div>
+            <div style={{ ...S.row, marginTop: 8, flexWrap: "wrap" }}>
+              <input
+                style={{ ...S.input, width: 70 }} type="number" inputMode="numeric" min="0" max="10"
+                placeholder="0–10" value={retroValue} onChange={(e) => setRetroValue(e.target.value)}
+              />
+              <button style={S.smallPill()} onClick={() => saveRetro(0)}>No pain</button>
+              <button style={S.pillBtn(C.orange)} onClick={() => saveRetro(retroValue)}>Save</button>
+            </div>
+          </div>
+        )}
+
         {sets.map((s, i) => (
           <div key={i} style={{ ...S.row, marginBottom: 8 }}>
             <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
@@ -1879,6 +2212,16 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
             />
           </div>
         ))}
+
+        {injuryProfile.recoveringMode && (
+          <div style={{ ...S.row, marginBottom: 8 }}>
+            <span style={{ fontSize: 12.5, color: C.sub }}>Pain during this session (0–10, optional)</span>
+            <input
+              style={{ ...S.input, width: 60 }} type="number" inputMode="numeric" min="0" max="10"
+              placeholder="0" value={pain} onChange={(e) => setPain(e.target.value)}
+            />
+          </div>
+        )}
 
         <div style={{ ...S.row, marginTop: 12 }}>
           <button
@@ -1918,6 +2261,7 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
 
       <SyncCard data={data} sbUser={sbUser} syncStatus={syncStatus} onSignedIn={onSignedIn} onSignedOut={onSignedOut} />
       <BackupCard data={data} persist={persist} />
+      <InjuryProfileCard data={data} persist={persist} />
     </div>
   );
 }
@@ -2141,9 +2485,12 @@ function coachMetrics(data) {
   };
 }
 
-function applyCoachGates(rec, metrics, injuryRecovery) {
+function applyCoachGates(rec, metrics, injuryProfile) {
   const gated = { ...rec, gates: [] };
-  if (injuryRecovery && metrics.weeksTraining < 8 && gated.template !== "balanced") {
+  // Job (b) only — specialization timing. Job (a), movement safety, is Gate 2
+  // (Task 4) and reads injuryProfile.recoveringMode directly; it is never
+  // folded into this override, and this override never touches recoveringMode.
+  if (injuryProfile.recoveringMode && !isSpecializationUnlocked(injuryProfile, metrics) && gated.template !== "balanced") {
     gated.gates.push(`Overrode "${TEMPLATES.find((t) => t.key === gated.template)?.name || gated.template}" → Balanced: you're ${metrics.weeksTraining} logged week(s) into a return from injury. Two lighter lower-body exposures/week beats one concentrated session while tendons rebuild — this gate lifts automatically around week 8.`);
     gated.template = "balanced";
   }
@@ -2160,10 +2507,13 @@ function applyCoachGates(rec, metrics, injuryRecovery) {
   return gated;
 }
 
-async function askCoachLLM(apiKey, metrics, goalProfile) {
+async function askCoachLLM(apiKey, metrics, goalProfile, injuryProfile) {
   const prompt = `You are the analytical coaching brain inside a hypertrophy/recomposition training app. All metrics below were computed deterministically from the user's real logs — never invent numbers. Interpret the goal, assess progress vs goal, recommend settings, and PUSH BACK wherever the user's stated desires conflict with their constraints (especially injury recovery). Ground reasoning in established research: ~2x/week frequency default; 10-20 hard sets/muscle/week productive; specialization = reallocation (max 1-2 muscles, others to maintenance); deload on multi-lift stalls; recomp pace -0.5 to -0.75 lb/week; post-injury re-entry favors frequent submaximal exposure for ~8 weeks before specialization.
 
 Nutrition logic: bwSlopePerWeek < -1.0 AND multiple stalls → deficit too aggressive, positive calorieDelta. Slope >= 0 for weeks with a fat-loss goal → small negative delta. Lifts progressing AND slope -0.25 to -0.75 → recomp working, delta 0.
+
+This INJURY PROFILE is authoritative and not yours to modify — the app checks any recommendation
+against it before applying: ${JSON.stringify(injuryProfile)}
 
 USER GOAL PROFILE: ${JSON.stringify(goalProfile)}
 METRICS: ${JSON.stringify(metrics)}
@@ -2193,9 +2543,8 @@ Respond ONLY with JSON, no markdown fences:
 function CoachCard({ data, persist }) {
   const [apiKey, setApiKey] = useState(localStorage.getItem(API_KEY_LS) || "");
   const [showSettings, setShowSettings] = useState(!localStorage.getItem(API_KEY_LS));
-  const gp = data.goalProfile || { text: "", injuryRecovery: true };
+  const gp = data.goalProfile || { text: "" };
   const [goalText, setGoalText] = useState(gp.text || "");
-  const [injury, setInjury] = useState(gp.injuryRecovery !== false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [result, setResult] = useState(null);
@@ -2205,8 +2554,12 @@ function CoachCard({ data, persist }) {
   const weeks = trainingWeeks(data.sessions || []);
   const UNLOCK_WEEKS = 3;
   const unlocked = weeks >= UNLOCK_WEEKS;
+  // recoveringMode is read-only here — editable only from the Log tab's Injury
+  // Profile card (InjuryProfileCard). This card used to carry its own toggle
+  // bound to goalProfile.injuryRecovery; that flag is gone.
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
 
-  const currentProfile = () => ({ text: goalText.trim(), injuryRecovery: injury, updatedAt: new Date().toISOString() });
+  const currentProfile = () => ({ text: goalText.trim(), updatedAt: new Date().toISOString() });
 
   const copyBrief = async () => {
     if (!goalText.trim()) { setErr("Describe your goal first — the brief includes it."); return; }
@@ -2249,7 +2602,7 @@ function CoachCard({ data, persist }) {
     try {
       const raw = extractPlanJson(pasted);
       const metrics = coachMetrics(data);
-      const gated = applyCoachGates(raw, metrics, injury);
+      const gated = applyCoachGates(raw, metrics, injuryProfile);
       setResult({ ...gated, assessment: gated.assessment || "Plan applied from pasted Claude reply.", pushback: gated.pushback || [], nutritionNote: gated.nutritionNote || "See Claude's reply for the reasoning.", nextCheckIn: gated.nextCheckIn || "Re-run a check-in in 2\u20134 weeks with fresh logs." });
       persist({
         ...data,
@@ -2274,10 +2627,10 @@ function CoachCard({ data, persist }) {
     if (!goalText.trim()) { setErr("Describe your goal first — one or two sentences is enough."); return; }
     setBusy(true);
     try {
-      const profile = { text: goalText.trim(), injuryRecovery: injury, updatedAt: new Date().toISOString() };
+      const profile = { text: goalText.trim(), updatedAt: new Date().toISOString() };
       const metrics = coachMetrics(data);
-      const raw = await askCoachLLM(key, metrics, profile);
-      const gated = applyCoachGates(raw, metrics, injury);
+      const raw = await askCoachLLM(key, metrics, profile, injuryProfile);
+      const gated = applyCoachGates(raw, metrics, injuryProfile);
       setResult(gated);
       // save the goal profile immediately (plan applies only on user confirmation)
       persist({ ...data, goalProfile: profile });
@@ -2319,6 +2672,8 @@ function CoachCard({ data, persist }) {
         </div>
       )}
 
+      {!injuryProfile.clinicianReviewed && <ClinicianReviewNotice compact />}
+
       <div style={{ marginTop: 12 }}>
         <div style={{ fontSize: 12.5, fontWeight: 700, color: C.sub, marginBottom: 6 }}>YOUR GOAL</div>
         <textarea
@@ -2327,12 +2682,9 @@ function CoachCard({ data, persist }) {
           value={goalText}
           onChange={(e) => setGoalText(e.target.value)}
         />
-        <button
-          style={{ ...S.smallPill(injury ? "#FFF1E5" : "#E9E9EB", injury ? C.orange : C.text), marginTop: 8 }}
-          onClick={() => setInjury(!injury)}
-        >
-          {injury ? "Recovering from injury: ON (gate active)" : "Recovering from injury: OFF"}
-        </button>
+        <div style={{ ...S.smallPill(injuryProfile.recoveringMode ? "#FFF1E5" : "#E9E9EB", injuryProfile.recoveringMode ? C.orange : C.text), marginTop: 8 }}>
+          {injuryProfile.recoveringMode ? "Recovering from injury: ON (gate active)" : "Recovering from injury: OFF"} · edit in Log tab
+        </div>
       </div>
 
       {!unlocked ? (
