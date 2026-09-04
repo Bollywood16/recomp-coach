@@ -1,0 +1,9 @@
+{
+  "name": "recomp-coach",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Single-file React PWA, static-hosted on GitHub Pages.",
+  "scripts": {
+    "test": "node scripts/check-write-isolation.js"
+  }
+}

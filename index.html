@@ -343,7 +343,7 @@ const CAT_NAMES = {
 };
 
 const DEFAULT_NUTRITION = { age: 35, sex: "male", heightIn: 67, deskJob: true, steps: 7000, workouts: 4 };
-const DEFAULT_DATA = { sessions: [], weights: [], swaps: {}, nutrition: DEFAULT_NUTRITION, focus: null, plan: null, phase: null, injuryProfile: null, injuryProfileHistory: [] };
+const DEFAULT_DATA = { sessions: [], weights: [], swaps: {}, nutrition: DEFAULT_NUTRITION, focus: null, plan: null, phase: null, injuryProfile: null, injuryProfileHistory: [], injuryProfileMigration: null };
 
 
 /* ===== Emphasis model (research-driven set redistribution) =====
@@ -396,6 +396,23 @@ const DEFAULT_INJURY_PROFILE = {
   clinicianReviewed: false,
   lastReviewDate: null,
 };
+
+/* Runtime backstop for Gate 2's read-only guarantee (spec correction C). There
+   is no module system in this app, so "the parser cannot write injuryProfile"
+   can't be enforced by imports/exports alone — InjuryProfileCard's closure
+   design is the real guarantee, but this doesn't depend on that design being
+   followed correctly by every future edit. Freezing the object handed to the
+   parser/gate path means a future accidental mutation throws (or no-ops)
+   instead of silently corrupting the record. Deep, since the nested
+   injuries/movementConstraints are exactly what Gate 2 keys on in Task 4. */
+function deepFreeze(obj) {
+  if (obj && typeof obj === "object" && !Object.isFrozen(obj)) {
+    Object.getOwnPropertyNames(obj).forEach((k) => deepFreeze(obj[k]));
+    Object.freeze(obj);
+  }
+  return obj;
+}
+deepFreeze(DEFAULT_INJURY_PROFILE);
 
 /* Job (b): "is specialization timing appropriate yet" — separate from Gate 2's
    movement-safety job, which recoveringMode alone covers and which never lifts.
@@ -754,7 +771,7 @@ function buildCoachBrief(data, goalProfile) {
   const m = coachMetrics(data);
   m.lifts = m.lifts.slice(-14); // cap for prompt size
   const research = researchForPhase(data);
-  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const injuryProfile = deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE);
   const specUnlocked = isSpecializationUnlocked(injuryProfile, m);
   const gateLine = injuryProfile.recoveringMode && !specUnlocked
     ? `HARD CONSTRAINT: the user is ${m.weeksTraining} logged week(s) into a return from injury. The template MUST be "balanced" until ~8 pain-free logged weeks, regardless of stated goals. If the goal implies otherwise, explain why this constraint wins for now and when it lifts.`
@@ -959,19 +976,30 @@ function lastSessionFor(sessions, exId) {
 }
 
 /* painRule (Gate 4, Task 4) covers pain "during OR within 24h after" a lift.
-   `pain` on the session row only ever captures the during-session half — this
-   finds the most recent prior session for this lift that still needs the
-   delayed-onset half answered, so the UI can ask for it next time that lift
-   is opened. Delayed-onset pain is exactly the case that matters for
-   tendinosis, so this is not optional context. */
-function findPendingPainRetro(sessions, exId, today) {
+   `pain` on the session row only ever captures the during-session half.
+   This finds pending delayed-onset answers across ALL lifts, not gated on
+   reopening the specific exercise trained — on a ~7-day split (the hip
+   lifts: RDL, goblet squat, hip thrust) that exercise-specific trigger would
+   close its window six days before the user ever reopens it, so exactly the
+   movements the labrum/hamstring constraints exist for would never get
+   asked. Surfaced once per app-open/session-start via
+   PendingPainRetroPrompts, dismissible (painRetroDismissed) so it doesn't
+   re-nag once skipped. */
+function findAllPendingPainRetros(sessions, injuryProfile, today) {
+  if (!injuryProfile || !injuryProfile.recoveringMode) return [];
   const t = today || todayISO();
-  const hist = (sessions || [])
-    .filter((s) => s.exerciseId === exId && s.date !== t && s.painRetro == null)
-    .sort((a, b) => (a.date < b.date ? 1 : -1));
-  if (!hist.length) return null;
-  const days = Math.round((new Date(t) - new Date(hist[0].date)) / 86400000);
-  return days >= 1 && days <= 2 ? hist[0] : null;
+  const seen = new Set();
+  const out = [];
+  [...(sessions || [])]
+    .filter((s) => s.date !== t && s.painRetro == null && s.painRetroDismissed !== true)
+    .sort((a, b) => (a.date < b.date ? 1 : -1))
+    .forEach((s) => {
+      if (seen.has(s.exerciseId)) return; // most recent unanswered session per lift only
+      seen.add(s.exerciseId);
+      const days = Math.round((new Date(t) - new Date(s.date)) / 86400000);
+      if (days >= 1 && days <= 3) out.push(s);
+    });
+  return out;
 }
 
 function trendPct(series) {
@@ -1093,10 +1121,38 @@ function App() {
         // movement-safety job with the week-based specialization-timing job (see
         // isSpecializationUnlocked). injuryProfile.recoveringMode takes over job (a)
         // only, and never auto-lifts. Only applies when no injuryProfile exists yet.
-        const migratedInjuryProfile = found.injuryProfile
-          ? { ...DEFAULT_INJURY_PROFILE, ...found.injuryProfile }
-          : { ...DEFAULT_INJURY_PROFILE, recoveringMode: found.goalProfile ? found.goalProfile.injuryRecovery !== false : true };
-        setData({
+        //
+        // Fails safe: goalProfile.injuryRecovery was only ever written by the
+        // user's own toggle in CoachCard (grepped — applyCoachGates's week-8
+        // override mutates gated.template only, never goalProfile), so a real
+        // `false` is unambiguous. But absent/null/anything else-falsy is not a
+        // confirmed user choice, and a silent OFF-with-no-gating is the one
+        // failure mode where nothing surfaces — so only a strict `=== false`
+        // carries forward as OFF; everything else defaults ON.
+        const migrating = !found.injuryProfile && !!found.goalProfile;
+        let migratedInjuryProfile;
+        if (found.injuryProfile) {
+          migratedInjuryProfile = { ...DEFAULT_INJURY_PROFILE, ...found.injuryProfile };
+        } else {
+          const explicitlyOff = found.goalProfile && found.goalProfile.injuryRecovery === false;
+          migratedInjuryProfile = { ...DEFAULT_INJURY_PROFILE, recoveringMode: !explicitlyOff };
+        }
+        // One-time, dismissible, and recorded — so a migration that silently
+        // changed effective behavior is never silent to the user.
+        let injuryProfileHistory = found.injuryProfileHistory || [];
+        let migrationNotice = found.injuryProfileMigration || null;
+        if (migrating && !migrationNotice) {
+          const at = new Date().toISOString();
+          migrationNotice = {
+            at,
+            message: migratedInjuryProfile.recoveringMode
+              ? "Injury gating has been turned on. Adjust in the Log tab."
+              : "Injury gating stayed off, carried over from your previous setting. Adjust in the Log tab.",
+            dismissed: false,
+          };
+          injuryProfileHistory = [...injuryProfileHistory, { at, device: "migration", profile: migratedInjuryProfile }];
+        }
+        const stamped = {
           ...DEFAULT_DATA, ...found,
           swaps: found.swaps || {},
           nutrition: { ...DEFAULT_NUTRITION, ...(found.nutrition || {}) },
@@ -1104,8 +1160,15 @@ function App() {
           plan: { ...DEFAULT_PLAN, ...(found.plan || {}) },
           phase: found.phase || {},
           injuryProfile: migratedInjuryProfile,
-          injuryProfileHistory: found.injuryProfileHistory || [],
-        });
+          injuryProfileHistory,
+          injuryProfileMigration: migrationNotice,
+        };
+        setData(stamped);
+        // Persist the migration itself immediately — it must not depend on the
+        // user happening to trigger some other write before it becomes durable.
+        if (migrating) {
+          try { await window.storage.set(STORAGE_KEY, JSON.stringify({ ...stamped, _updatedAt: new Date().toISOString() })); } catch (e) { /* saved in memory at least */ }
+        }
       }
       setLoaded(true);
     })();
@@ -1264,6 +1327,8 @@ function WorkoutFlow({ data, persist }) {
 
   return (
     <div>
+      <InjuryMigrationNotice data={data} persist={persist} />
+      <PendingPainRetroPrompts data={data} persist={persist} />
       {!injuryProfile.clinicianReviewed && <ClinicianReviewNotice />}
       {!day
         ? <DayPicker data={data} onPick={setDayId} persist={persist} />
@@ -1454,10 +1519,8 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const [flash, setFlash] = useState(false);
   const [assist, setAssist] = useState(true); // for assistable lifts: enter machine assist
   const [pain, setPain] = useState("");
-  const [retroValue, setRetroValue] = useState("");
   const bw = currentBodyweight(data);
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
-  const pendingRetro = injuryProfile.recoveringMode ? findPendingPainRetro(data.sessions, ex.id) : null;
 
   useEffect(() => {
     if (timer === null || timer <= 0) return;
@@ -1470,7 +1533,7 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
     if (open && sets === null) {
       setSets(Array.from({ length: ex.sets }, () => ({ w: rec.weight === 0 ? "" : String(rec.weight), r: "" })));
     }
-    if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); setRetroValue(""); }
+    if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); }
   }, [open]); // eslint-disable-line
 
   const saveSession = () => {
@@ -1488,24 +1551,18 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
       })
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
+    // Delayed-onset pain (painRetro) is asked for separately, across all lifts,
+    // by PendingPainRetroPrompts — not gated on reopening this specific
+    // exercise, which on a ~7-day split would close the window long before
+    // the user ever comes back to it. See findAllPendingPainRetros.
     const session = {
       id: Date.now(), date: todayISO(), exerciseId: ex.id, sets: clean,
       pain: pain === "" ? null : Math.max(0, Math.min(10, Number(pain) || 0)),
-      painRetro: null, painRetroAt: null,
+      painRetro: null, painRetroAt: null, painRetroDismissed: false,
     };
     persist({ ...data, sessions: [...data.sessions, session] });
     setFlash(true);
     setTimeout(() => { setFlash(false); onToggle(); }, 900);
-  };
-
-  // Answers the delayed-onset half of painRule for a PRIOR session, not the one
-  // being logged now — see findPendingPainRetro.
-  const saveRetro = (value) => {
-    if (!pendingRetro) return;
-    const v = Math.max(0, Math.min(10, Number(value) || 0));
-    const sessions = data.sessions.map((s) => (s.id === pendingRetro.id ? { ...s, painRetro: v, painRetroAt: new Date().toISOString() } : s));
-    persist({ ...data, sessions });
-    setRetroValue("");
   };
 
   const setSwap = (newExId) => {
@@ -1559,22 +1616,6 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
 
       {open && (
         <div style={{ marginTop: 14, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
-          {pendingRetro && (
-            <div style={{ background: "#FFF1E5", borderRadius: 12, padding: "10px 12px", marginBottom: 12 }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: C.orange }}>
-                Any pain in the 24h after your {shortDate(pendingRetro.date)} session?
-              </div>
-              <div style={{ ...S.row, marginTop: 8, flexWrap: "wrap" }}>
-                <input
-                  style={{ ...S.input, width: 70 }} type="number" inputMode="numeric" min="0" max="10"
-                  placeholder="0–10" value={retroValue} onChange={(e) => setRetroValue(e.target.value)}
-                />
-                <button style={S.smallPill()} onClick={() => saveRetro(0)}>No pain</button>
-                <button style={S.pillBtn(C.orange)} onClick={() => saveRetro(retroValue)}>Save</button>
-              </div>
-            </div>
-          )}
-
           <div style={{ color: C.sub, fontSize: 13, lineHeight: 1.45, marginBottom: 10 }}>{rec.note}</div>
 
           {lastSess && (
@@ -1914,6 +1955,65 @@ function BackupCard({ data, persist }) {
 
 /* ============================ INJURY PROFILE ============================ */
 
+/* One-time, dismissible notice shown after the goalProfile.injuryRecovery ->
+   injuryProfile.recoveringMode migration (see App's load effect). Whatever
+   the migration did to effective behavior, the user is told about it once. */
+function InjuryMigrationNotice({ data, persist }) {
+  const notice = data.injuryProfileMigration;
+  if (!notice || notice.dismissed) return null;
+  const dismiss = () => persist({ ...data, injuryProfileMigration: { ...notice, dismissed: true } });
+  return (
+    <div style={{ ...S.card, background: "#EAF3FF", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+      <div style={{ fontSize: 12.5, color: "#3A3A3C", lineHeight: 1.45 }}>{notice.message}</div>
+      <button
+        style={{ background: "transparent", border: "none", cursor: "pointer", color: C.sub, flexShrink: 0, padding: 0 }}
+        onClick={dismiss} aria-label="Dismiss"
+      >
+        <X size={16} />
+      </button>
+    </div>
+  );
+}
+
+/* Surfaces delayed-onset pain answers pending across ALL lifts (see
+   findAllPendingPainRetros) — rendered once, at the top of the Workout tab,
+   rather than gated on reopening any one specific exercise. */
+function PendingPainRetroPrompts({ data, persist }) {
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const pending = findAllPendingPainRetros(data.sessions, injuryProfile);
+  const [values, setValues] = useState({});
+  if (pending.length === 0) return null;
+
+  const save = (session, value) => {
+    const v = Math.max(0, Math.min(10, Number(value) || 0));
+    const sessions = data.sessions.map((s) => (s.id === session.id ? { ...s, painRetro: v, painRetroAt: new Date().toISOString() } : s));
+    persist({ ...data, sessions });
+  };
+  const dismiss = (session) => {
+    const sessions = data.sessions.map((s) => (s.id === session.id ? { ...s, painRetroDismissed: true } : s));
+    persist({ ...data, sessions });
+  };
+
+  return pending.map((s) => (
+    <div key={s.id} style={{ ...S.card, background: "#FFF1E5" }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: C.orange }}>
+        Any pain in the 24h after your {shortDate(s.date)} {(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId} session?
+      </div>
+      <div style={{ ...S.row, marginTop: 8, flexWrap: "wrap" }}>
+        <input
+          style={{ ...S.input, width: 70 }} type="number" inputMode="numeric" min="0" max="10"
+          placeholder="0–10" value={values[s.id] || ""} onChange={(e) => setValues({ ...values, [s.id]: e.target.value })}
+        />
+        <button style={S.smallPill()} onClick={() => save(s, 0)}>No pain</button>
+        <button style={S.pillBtn(C.orange)} onClick={() => save(s, values[s.id])}>Save</button>
+        <button style={{ background: "transparent", border: "none", cursor: "pointer", color: C.sub, fontSize: 12.5 }} onClick={() => dismiss(s)}>
+          Skip
+        </button>
+      </div>
+    </div>
+  ));
+}
+
 /* Persistent, non-dismissable while clinicianReviewed is false. Rendered on
    the Workout tab and inside the Coach card — the two places a stale ROM
    limit would actually bite — while editing stays confined to the Log tab. */
@@ -2086,9 +2186,7 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
   const [bw, setBw] = useState("");
   const [savedFlash, setSavedFlash] = useState("");
   const [pain, setPain] = useState("");
-  const [retroValue, setRetroValue] = useState("");
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
-  const pendingRetro = injuryProfile.recoveringMode ? findPendingPainRetro(data.sessions, exId) : null;
 
   const flash = (msg) => { setSavedFlash(msg); setTimeout(() => setSavedFlash(""), 2000); };
 
@@ -2097,23 +2195,18 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
       .map((s) => ({ w: Number(s.w) || 0, r: Number(s.r) || 0 }))
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
+    // Delayed-onset pain (painRetro) is asked for separately, across all lifts —
+    // see findAllPendingPainRetros / PendingPainRetroPrompts, rendered on the
+    // Workout tab.
     const session = {
       id: Date.now(), date: todayISO(), exerciseId: exId, sets: clean,
       pain: pain === "" ? null : Math.max(0, Math.min(10, Number(pain) || 0)),
-      painRetro: null, painRetroAt: null,
+      painRetro: null, painRetroAt: null, painRetroDismissed: false,
     };
     persist({ ...data, sessions: [...data.sessions, session] });
     setSets([{ w: "", r: "" }, { w: "", r: "" }, { w: "", r: "" }]);
     setPain("");
     flash("Session saved");
-  };
-
-  const saveRetro = (value) => {
-    if (!pendingRetro) return;
-    const v = Math.max(0, Math.min(10, Number(value) || 0));
-    const sessions = data.sessions.map((s) => (s.id === pendingRetro.id ? { ...s, painRetro: v, painRetroAt: new Date().toISOString() } : s));
-    persist({ ...data, sessions });
-    setRetroValue("");
   };
 
   const saveWeight = () => {
@@ -2182,22 +2275,6 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
             </optgroup>
           )}
         </select>
-
-        {pendingRetro && (
-          <div style={{ background: "#FFF1E5", borderRadius: 12, padding: "10px 12px", marginBottom: 12 }}>
-            <div style={{ fontSize: 13, fontWeight: 700, color: C.orange }}>
-              Any pain in the 24h after your {shortDate(pendingRetro.date)} session?
-            </div>
-            <div style={{ ...S.row, marginTop: 8, flexWrap: "wrap" }}>
-              <input
-                style={{ ...S.input, width: 70 }} type="number" inputMode="numeric" min="0" max="10"
-                placeholder="0–10" value={retroValue} onChange={(e) => setRetroValue(e.target.value)}
-              />
-              <button style={S.smallPill()} onClick={() => saveRetro(0)}>No pain</button>
-              <button style={S.pillBtn(C.orange)} onClick={() => saveRetro(retroValue)}>Save</button>
-            </div>
-          </div>
-        )}
 
         {sets.map((s, i) => (
           <div key={i} style={{ ...S.row, marginBottom: 8 }}>
@@ -2486,6 +2563,9 @@ function coachMetrics(data) {
 }
 
 function applyCoachGates(rec, metrics, injuryProfile) {
+  // Frozen at the parser/gate path boundary — see deepFreeze. This is the
+  // actual entry point a pasted plan's data flows through today.
+  injuryProfile = deepFreeze(injuryProfile || DEFAULT_INJURY_PROFILE);
   const gated = { ...rec, gates: [] };
   // Job (b) only — specialization timing. Job (a), movement safety, is Gate 2
   // (Task 4) and reads injuryProfile.recoveringMode directly; it is never
