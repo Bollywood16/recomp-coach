@@ -292,7 +292,7 @@ function mergeData(local, cloud) {
   const histById = {};
   [...(cloud.injuryProfileHistory || []), ...(local.injuryProfileHistory || [])]
     .forEach((h) => { histById[`${h.at}|${h.device}`] = h; });
-  const injuryProfileHistory = Object.values(histById).sort((a, b) => (a.at < b.at ? -1 : 1));
+  const injuryProfileHistory = Object.values(histById).sort((a, b) => (a.at < b.at ? -1 : 1)).slice(-50);
   return {
     ...cloud, ...local,
     sessions, weights,
@@ -413,6 +413,23 @@ function deepFreeze(obj) {
   return obj;
 }
 deepFreeze(DEFAULT_INJURY_PROFILE);
+
+/* Every place that constructs a NEW injuryProfile record to persist (App's
+   migration, InjuryProfileCard.save(), BackupCard's import) must base it on
+   this, never on DEFAULT_INJURY_PROFILE directly. A shallow spread of a
+   found/incoming profile over the frozen singleton
+   (`{ ...DEFAULT_INJURY_PROFILE, ...found }`) leaves any key ABSENT from
+   `found` pointing at the frozen singleton's nested object BY REFERENCE —
+   movementConstraints/injuries would be `===` the module-level default, not
+   an independent copy. Reading that is harmless, but it's a landmine for any
+   future code that mutates in place instead of spreading. JSON round-trip is
+   safe here since the record is plain data (strings/booleans/null/arrays/
+   objects, no functions or Dates). Pure read-only fallbacks (data.injuryProfile
+   || DEFAULT_INJURY_PROFILE, used for display or handed into deepFreeze at
+   the gate boundary) are fine to keep pointing at the frozen singleton. */
+function cloneInjuryProfileDefaults() {
+  return JSON.parse(JSON.stringify(DEFAULT_INJURY_PROFILE));
+}
 
 /* Job (b): "is specialization timing appropriate yet" — separate from Gate 2's
    movement-safety job, which recoveringMode alone covers and which never lifts.
@@ -984,7 +1001,23 @@ function lastSessionFor(sessions, exId) {
    movements the labrum/hamstring constraints exist for would never get
    asked. Surfaced once per app-open/session-start via
    PendingPainRetroPrompts, dismissible (painRetroDismissed) so it doesn't
-   re-nag once skipped. */
+   re-nag once skipped.
+
+   Three distinct states per session — NOT two — and Gate 5 (Task 4) must
+   keep them distinct:
+     - answered:   painRetro is a number (0 counts — "No pain" is a real,
+                   explicit answer via its own one-tap button, distinct from
+                   dismissing)
+     - dismissed:  painRetroDismissed === true, painRetro stays null — the
+                   user was asked and explicitly skipped
+     - pending:    painRetro === null, painRetroDismissed !== true — not
+                   yet asked/answered, may still be inside or past the window
+   Gate 5 escalates on pain >3/10 in 2 of the last 4 sessions for a movement
+   pattern. Dismissed and pending are both UNKNOWN, never a confirmed zero —
+   treating either as "no pain" would silently fill Gate 5's denominator
+   with silence and the escalation would never fire. Do not re-decide this:
+   only an `answered` entry (including an explicit 0) may count toward that
+   denominator. */
 function findAllPendingPainRetros(sessions, injuryProfile, today) {
   if (!injuryProfile || !injuryProfile.recoveringMode) return [];
   const t = today || todayISO();
@@ -1000,6 +1033,29 @@ function findAllPendingPainRetros(sessions, injuryProfile, today) {
       if (days >= 1 && days <= 3) out.push(s);
     });
   return out;
+}
+
+/* Silent non-reporting on a constrained lift is itself a signal, not a clean
+   record — surfaced in InjuryProfileCard so it's visible even though it
+   never blocks anything. 3+ consecutive dismissed-and-unanswered retros on
+   the same lift, most-recent-first, trips this; a single answered session
+   (including an explicit "No pain") resets the streak. */
+function painReportingGaps(sessions, injuryProfile) {
+  if (!injuryProfile || !injuryProfile.recoveringMode) return [];
+  const byLift = {};
+  [...(sessions || [])]
+    .sort((a, b) => (a.date < b.date ? -1 : 1))
+    .forEach((s) => { (byLift[s.exerciseId] = byLift[s.exerciseId] || []).push(s); });
+  const gaps = [];
+  Object.entries(byLift).forEach(([exId, hist]) => {
+    let streak = 0;
+    for (let i = hist.length - 1; i >= 0; i--) {
+      if (hist[i].painRetroDismissed === true && hist[i].painRetro == null) { streak++; continue; }
+      break;
+    }
+    if (streak >= 3) gaps.push({ exerciseId: exId, streak });
+  });
+  return gaps;
 }
 
 function trendPct(series) {
@@ -1132,10 +1188,10 @@ function App() {
         const migrating = !found.injuryProfile && !!found.goalProfile;
         let migratedInjuryProfile;
         if (found.injuryProfile) {
-          migratedInjuryProfile = { ...DEFAULT_INJURY_PROFILE, ...found.injuryProfile };
+          migratedInjuryProfile = { ...cloneInjuryProfileDefaults(), ...found.injuryProfile };
         } else {
           const explicitlyOff = found.goalProfile && found.goalProfile.injuryRecovery === false;
-          migratedInjuryProfile = { ...DEFAULT_INJURY_PROFILE, recoveringMode: !explicitlyOff };
+          migratedInjuryProfile = { ...cloneInjuryProfileDefaults(), recoveringMode: !explicitlyOff };
         }
         // One-time, dismissible, and recorded — so a migration that silently
         // changed effective behavior is never silent to the user.
@@ -1150,7 +1206,7 @@ function App() {
               : "Injury gating stayed off, carried over from your previous setting. Adjust in the Log tab.",
             dismissed: false,
           };
-          injuryProfileHistory = [...injuryProfileHistory, { at, device: "migration", profile: migratedInjuryProfile }];
+          injuryProfileHistory = [...injuryProfileHistory, { at, device: "migration", profile: migratedInjuryProfile }].slice(-50);
         }
         const stamped = {
           ...DEFAULT_DATA, ...found,
@@ -1915,8 +1971,8 @@ function BackupCard({ data, persist }) {
           plan: { ...(data.plan || {}), ...(incoming.plan || {}) },
           phase: incoming.phase || data.phase || {},
           injuryProfile: incoming.injuryProfile
-            ? { ...DEFAULT_INJURY_PROFILE, ...incoming.injuryProfile }
-            : (data.injuryProfile || DEFAULT_INJURY_PROFILE),
+            ? { ...cloneInjuryProfileDefaults(), ...incoming.injuryProfile }
+            : (data.injuryProfile || cloneInjuryProfileDefaults()),
           injuryProfileHistory: incoming.injuryProfileHistory || data.injuryProfileHistory || [],
         };
         persist(merged);
@@ -2041,7 +2097,7 @@ function InjuryProfileCard({ data, persist }) {
   const [showHistory, setShowHistory] = useState(false);
 
   const save = (next) => {
-    const stamped = { ...DEFAULT_INJURY_PROFILE, ...next };
+    const stamped = { ...cloneInjuryProfileDefaults(), ...next };
     const historyEntry = { at: new Date().toISOString(), device: getDeviceId(), profile: stamped };
     persist({
       ...data,
@@ -2065,6 +2121,7 @@ function InjuryProfileCard({ data, persist }) {
 
   const history = [...(data.injuryProfileHistory || [])].sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 8);
   const mc = profile.movementConstraints || DEFAULT_INJURY_PROFILE.movementConstraints;
+  const reportingGaps = painReportingGaps(data.sessions, profile);
 
   return (
     <div style={{ ...S.card, background: "#F7F7FA" }}>
@@ -2138,6 +2195,16 @@ function InjuryProfileCard({ data, persist }) {
             </div>
           ))}
           <button style={S.smallPill()} onClick={addInjury}><Plus size={13} /> Add injury</button>
+
+          {reportingGaps.length > 0 && (
+            <div style={{ background: "#FFF1E5", borderRadius: 12, padding: "10px 12px", marginTop: 12 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: C.orange }}>Pain reporting gap</div>
+              <div style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>
+                {reportingGaps.map((g) => `${(EX_BY_ID[g.exerciseId] || {}).name || g.exerciseId} (${g.streak} skipped in a row)`).join(", ")}
+                {" "}— skipped, not confirmed pain-free. Answer next time it comes up if you can.
+              </div>
+            </div>
+          )}
 
           <div style={{ fontSize: 12, fontWeight: 700, color: C.sub, textTransform: "uppercase", letterSpacing: 0.4, marginTop: 18, marginBottom: 8 }}>
             Movement constraints

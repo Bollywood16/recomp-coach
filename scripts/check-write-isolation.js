@@ -9,9 +9,22 @@
  *
  *   1. No module-scope (top-level) binding with a setter-ish name for
  *      injuryProfile exists anywhere outside a function body.
- *   2. extractPlanJson and applyCoachGates — the actual parser/gate path a
- *      pasted plan runs through today — never reference `injuryProfile` as
- *      a write target.
+ *   2. extractPlanJson (the parser's entry point, checked unconditionally
+ *      even though it doesn't take injuryProfile as a parameter) and every
+ *      function discovered to take `injuryProfile` as a named parameter
+ *      never reference it as a write target.
+ *   3. That discovered set is compared against REVIEWED_READERS below. A
+ *      function found here that ISN'T in that list fails the check — Task 4
+ *      adds runGates and eight gate functions, Task 6 adds more, and a
+ *      hardcoded two-function check would go stale on exactly the commit
+ *      that makes it matter. Adding a new reader is a deliberate,
+ *      reviewed-and-added-here decision, not something that silently starts
+ *      passing.
+ *
+ * Convention this relies on: any function that consumes injuryProfile must
+ * take it as an explicitly named parameter (destructure it out of a context
+ * object if needed) rather than burying it in an opaque unnamed blob — that's
+ * what makes it visible to this scan. Keep that convention in Task 4/6.
  *
  * Run: node scripts/check-write-isolation.js  (also wired to `npm test`)
  * Exits non-zero and prints the violation(s) on failure.
@@ -19,6 +32,24 @@
 
 const fs = require("fs");
 const path = require("path");
+
+// Functions intentionally reviewed and confirmed to only READ injuryProfile.
+// InjuryProfileCard.save() is the one legitimate writer, but it's a closure
+// method on a component, not a top-level function taking injuryProfile as a
+// parameter — it isn't discovered by this scan, and that's correct: it never
+// appears here because it never takes injuryProfile as an input, it takes
+// `next` (the new record) and constructs the write from data/props directly.
+const REVIEWED_READERS = [
+  "isSpecializationUnlocked",
+  "findAllPendingPainRetros",
+  "painReportingGaps",
+  "applyCoachGates",
+  "askCoachLLM",
+];
+
+// Always checked regardless of its parameter list — the actual parser entry
+// point a pasted plan's text runs through first.
+const ALWAYS_CHECK = ["extractPlanJson"];
 
 const file = path.join(__dirname, "..", "index.html");
 const html = fs.readFileSync(file, "utf8");
@@ -30,7 +61,7 @@ if (!match) {
 const src = match[1];
 
 function extractFunctionBody(name) {
-  const re = new RegExp(`function\\s+${name}\\s*\\([^)]*\\)\\s*\\{`);
+  const re = new RegExp(`function\\s+${name}\\s*\\(([^)]*)\\)\\s*\\{`);
   const m = re.exec(src);
   if (!m) return null;
   let i = m.index + m[0].length;
@@ -41,7 +72,7 @@ function extractFunctionBody(name) {
     else if (src[i] === "}") depth--;
     i++;
   }
-  return src.slice(start, i - 1);
+  return { params: m[1], body: src.slice(start, i - 1) };
 }
 
 // Blank out the contents of every {...} block so what's left is only true
@@ -59,6 +90,15 @@ function stripBlocks(text) {
   return out.join("");
 }
 
+function writesInjuryProfile(body) {
+  // Object-literal key (building a payload for persist/setData) or a property
+  // mutation (injuryProfile.recoveringMode = ...). Reassigning the local
+  // `injuryProfile` binding itself — e.g. `injuryProfile =
+  // deepFreeze(injuryProfile || DEFAULT_INJURY_PROFILE)` — is fine: that's a
+  // local variable, not the stored record, and is the runtime-freeze backstop.
+  return /injuryProfile\s*:/.test(body) || /injuryProfile\.\w+\s*=(?!=)/.test(body);
+}
+
 const failures = [];
 
 // 1. No top-level setter-like binding for injuryProfile.
@@ -68,20 +108,39 @@ if (setterRe.test(topLevel)) {
   failures.push("A module-scope setter-like binding for injuryProfile exists outside InjuryProfileCard's closure.");
 }
 
-// 2. extractPlanJson and applyCoachGates never write injuryProfile: neither as
-// an object-literal key (e.g. building a payload for persist/setData) nor as
-// a property mutation (e.g. injuryProfile.recoveringMode = ...). Reassigning
-// the local `injuryProfile` binding itself (e.g. `injuryProfile =
-// deepFreeze(injuryProfile || DEFAULT_INJURY_PROFILE)`) is fine — that's a
-// local variable, not the stored record, and is exactly this file's own
-// runtime-freeze backstop.
-["extractPlanJson", "applyCoachGates"].forEach((name) => {
-  const body = extractFunctionBody(name);
-  if (body === null) {
+// 2. Discover every top-level function taking injuryProfile as a named
+// parameter (present in its raw parameter-list text, word-boundaried so
+// `injuryProfileHistory` etc. don't false-match).
+const discovered = new Set();
+const funcDeclRe = /function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*\{/g;
+let fm;
+while ((fm = funcDeclRe.exec(src))) {
+  const [, name, params] = fm;
+  if (/\binjuryProfile\b/.test(params)) discovered.add(name);
+}
+
+// 3. Every discovered function must be in the reviewed allowlist — an
+// undiscovered-but-present name fails loudly instead of silently passing.
+discovered.forEach((name) => {
+  if (!REVIEWED_READERS.includes(name)) {
+    failures.push(`${name} takes injuryProfile as a parameter but isn't in REVIEWED_READERS — review it (confirm it's read-only) and add it explicitly, or fix it if it writes.`);
+  }
+});
+REVIEWED_READERS.forEach((name) => {
+  if (!discovered.has(name)) {
+    console.warn(`NOTE: ${name} is in REVIEWED_READERS but no longer takes injuryProfile as a parameter (renamed/removed?) — safe to prune from the list.`);
+  }
+});
+
+// 4. Every discovered-and-reviewed function, plus the always-checked parser
+// entry point, must never write injuryProfile.
+[...ALWAYS_CHECK, ...discovered].forEach((name) => {
+  const fn = extractFunctionBody(name);
+  if (fn === null) {
     failures.push(`Could not locate function ${name} to check — has it been renamed?`);
     return;
   }
-  if (/injuryProfile\s*:/.test(body) || /injuryProfile\.\w+\s*=(?!=)/.test(body)) {
+  if (writesInjuryProfile(fn.body)) {
     failures.push(`${name} references injuryProfile as a write target — the parser/gate path must be read-only.`);
   }
 });
@@ -90,4 +149,4 @@ if (failures.length) {
   console.error("WRITE-ISOLATION CHECK FAILED:\n" + failures.map((f) => " - " + f).join("\n"));
   process.exit(1);
 }
-console.log("Write-isolation check passed: no module-scope injuryProfile setter, and the parser/gate path never writes injuryProfile.");
+console.log(`Write-isolation check passed: no module-scope injuryProfile setter; ${ALWAYS_CHECK.length} always-checked + ${discovered.size} discovered reader(s) (${[...discovered].join(", ")}) never write injuryProfile.`);
