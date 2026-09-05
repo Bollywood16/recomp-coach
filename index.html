@@ -886,6 +886,17 @@ function trainingWeeks(sessions) {
   return new Set((sessions || []).map((s) => weekStart(s.date))).size;
 }
 
+/* `sessions` rows are per-EXERCISE log entries (one row per lift logged on
+   a given day), not per-workout — logging 5 lifts in one gym visit creates
+   5 rows. A real session/workout count needs to dedupe by date, the same
+   pattern trainingWeeks already uses one level up (by week). Used by
+   coachMetrics.totalSessions and the Insights Consistency card — both
+   used to report sessions.length directly, which is really a set-row
+   count (Task 5 build-spec failure #6: "141 sessions over 8 weeks"). */
+function countTrainingSessions(sessions) {
+  return new Set((sessions || []).map((s) => s.date)).size;
+}
+
 function deloadActive(data) {
   const p = data.phase;
   return !!(p && p.deloadUntil && todayISO() <= p.deloadUntil);
@@ -1070,6 +1081,11 @@ const RESEARCH_CORPUS = [
     param:"supplementation", source:"Rawson & Volek 2003; Lanhers et al. 2017 meta-analysis" },
 ];
 
+/* Ranks (never filters or truncates) the research corpus by relevance to
+   the user's current phase — specific findings (injury, current template,
+   stall) sort first. Used to be filter-then-slice(0,8), sending only a
+   subset; the brief must send the full corpus ("all N entries, not a
+   subset" — Task 5/7), so this only reorders it now. */
 function researchForPhase(data) {
   const plan = (data.plan && data.plan.template) || "balanced";
   const weeks = trainingWeeks(data.sessions || []);
@@ -1083,18 +1099,14 @@ function researchForPhase(data) {
   if (isStalled) tags.add("stalled");
   tags.add(plan);
   if (weeks >= 6 && !isDeloading && !isStalled) tags.add("building");
-  // Specific-phase findings (injury, current template, stall) outrank generic ones,
-  // so the 8-slot cap never crowds out the findings that matter most right now.
   const specificity = (r) => {
     if (r.phase.some((p) => ["reentry", "injury_recovery", "deload", "stalled"].includes(p) && tags.has(p))) return 0;
     if (r.phase.some((p) => ["superhero", "upperFocus", "maintain"].includes(p) && tags.has(p))) return 1;
     if (r.phase.includes("building") && tags.has("building")) return 2;
-    return 3;
+    if (r.phase.some((p) => tags.has(p))) return 3;
+    return 4;
   };
-  return RESEARCH_CORPUS
-    .filter((r) => r.phase.some((p) => tags.has(p)))
-    .sort((a, b) => specificity(a) - specificity(b))
-    .slice(0, 8);
+  return [...RESEARCH_CORPUS].sort((a, b) => specificity(a) - specificity(b));
 }
 
 /* ===== Coach brief builder =====
@@ -1102,15 +1114,38 @@ function researchForPhase(data) {
    role first, data in XML-tagged sections before instructions, explicit
    constraints, numbered tasks, and a strict output contract (one fenced JSON
    block) so the reply can be pasted back and applied through the safety gates. */
+/* The full tagged library the model may select from (Task 5/7 requirement:
+   the model must be able to constraint-check its own selections before
+   proposing them, against the same attribute/romProfile/contraindications
+   data Gate 2 itself reads). Sends all of ALL_KNOWN — no subset — with
+   empty romProfile/contraindications omitted per-entry to keep the payload
+   a bit leaner without dropping any exercise or any field that has content. */
+function exerciseLibraryForBrief() {
+  return ALL_KNOWN.map((ex) => {
+    const entry = { id: ex.id, name: ex.name, group: CAT_TO_GROUP[ex.cat] || ex.cat, tagSource: ex.tagSource || "untagged" };
+    if (ex.attributes && ex.attributes.length) entry.attributes = ex.attributes;
+    if (ex.romProfile && Object.keys(ex.romProfile).length) entry.romProfile = ex.romProfile;
+    if (ex.contraindications && ex.contraindications.length) entry.contraindications = ex.contraindications;
+    return entry;
+  });
+}
+
 function buildCoachBrief(data, goalProfile) {
-  const m = coachMetrics(data);
-  m.lifts = m.lifts.slice(-14); // cap for prompt size
-  const research = researchForPhase(data);
+  const m = coachMetrics(data); // m.lifts is sent in full — no truncation (see failure #5 in the build spec: slice(-14) silently dropped foundational lifts declared early in ALL_KNOWN, regardless of training recency)
+  const research = researchForPhase(data); // full corpus, ranked by relevance — see researchForPhase
   const injuryProfile = deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE);
   const specUnlocked = isSpecializationUnlocked(injuryProfile, m);
   const gateLine = injuryProfile.recoveringMode && !specUnlocked
     ? `HARD CONSTRAINT: the user is ${m.weeksTraining} logged week(s) into a return from injury. The template MUST be "balanced" until ~8 pain-free logged weeks, regardless of stated goals. If the goal implies otherwise, explain why this constraint wins for now and when it lifts.`
     : `Injury status: ${injuryProfile.recoveringMode ? `recovering, ${m.weeksTraining} logged weeks (specialization gate lifts around week 8)` : "not currently in injury recovery"}.`;
+
+  const threshold = (injuryProfile.movementConstraints && injuryProfile.movementConstraints.painRule && injuryProfile.movementConstraints.painRule.threshold) ?? 3;
+  const escalatingCats = Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold));
+  const escalationLine = escalatingCats.length
+    ? `PAIN ESCALATION ACTIVE on: ${escalatingCats.map((c) => CAT_NAMES[c] || c).join(", ")}. No load or set increase is permitted on these movement patterns until the pattern clears (3 consecutive logged sessions with answered pain at or below ${threshold}/10) — any progression you propose there will be capped or rejected by the app's gates regardless of what you recommend, so don't propose it.`
+    : "No pain-escalation pattern currently active.";
+
+  const library = exerciseLibraryForBrief();
 
   return `You are an evidence-based hypertrophy and body-recomposition coach reviewing real training data. Every number in <training_metrics> was computed deterministically from logged sessions — never invent, round, or adjust figures. Be direct: where the user's goals conflict with their constraints or the research, say so plainly rather than accommodating.
 
@@ -1120,21 +1155,50 @@ ${goalProfile.text || "(not stated yet)"}
 
 <constraints>
 ${gateLine}
+${escalationLine}
 This injuryProfile record is authoritative and not yours to modify — any plan you propose is checked
 against it by the app's gates before it can apply, and a plan that conflicts is rejected outright:
 ${JSON.stringify(injuryProfile)}
 </constraints>
+
+<exercise_library>
+Every exercise you may select from or substitute, tagged with the same movement attributes, romProfile,
+and contraindications the app's own safety gates check against. Use these tags to constraint-check your
+own selections before proposing them. tagSource explains how confident each tag is: "descriptive" is a
+mechanical fact or a value read directly off the exercise's own name; "from_app_caution" was inferred from
+an existing in-app signal (a caution note, or what the app already prescribes safely today); a
+"conservative_default" tag is an UNVERIFIED GUESS — no clinical or in-app signal existed either way, so
+treat it with less confidence than the other two, not the same. If no exercise here is compatible with
+what a slot needs, say so and leave it out — do not substitute or invent an exercise you cannot verify
+against these tags.
+${JSON.stringify(library)}
+</exercise_library>
 
 <training_metrics>
 ${JSON.stringify(m)}
 </training_metrics>
 
 <set_quality>
-Recent per-set detail for the most recently trained lifts (weight x reps, in set order). Inter-set rep decay beyond ~30-40%, or sets landing under the prescribed rep minimum, means the load is too heavy for the prescribed set count — the fix is a load reduction or back-off sets, not repeating the weight.
-${(data.sessions || []).slice(-8).map((s) => `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: ${s.sets.map((x) => `${x.w || "BW"}x${x.r}`).join(", ")}`).join("\n") || "(no sessions logged yet)"}
+Recent per-set detail for the most recently trained lifts (weight x reps, in set order), with logged pain
+where present — "pain during" is same-session, "pain 24h after" is the delayed-onset answer for that same
+session. Inter-set rep decay beyond ~30-40%, or sets landing under the prescribed rep minimum, means the
+load is too heavy for the prescribed set count — the fix is a load reduction or back-off sets, not
+repeating the weight. Pain above ${threshold}/10 on a lift's last session forces a load reduction
+regardless of what you propose (Gate 4) — check here before recommending a load increase.
+${(data.sessions || []).slice(-8).map((s) => {
+    const setsStr = s.sets.map((x) => `${x.w || "BW"}x${x.r}`).join(", ");
+    const painParts = [];
+    if (s.pain != null) painParts.push(`pain during: ${s.pain}/10`);
+    if (s.painRetro != null) painParts.push(`pain 24h after: ${s.painRetro}/10`);
+    const painStr = painParts.length ? ` (${painParts.join(", ")})` : "";
+    return `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: ${setsStr}${painStr}`;
+  }).join("\n") || "(no sessions logged yet)"}
 </set_quality>
 
 <research_context>
+All ${RESEARCH_CORPUS.length} entries from the embedded research corpus, ranked by relevance to the
+user's current phase (most relevant first) — not a subset. Where this corpus doesn't cover a question,
+say so rather than asserting.
 ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 </research_context>
 
@@ -1142,9 +1206,9 @@ ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 1. Assess progress against the stated goal using the actual numbers — name specific lifts and their trends.
 2. Review <set_quality> for load-selection errors: flag any lift where reps collapse across sets or fall below the range, and state the corrected load (down, not up) or a back-off scheme. Progression is bidirectional — recommend reducing where the data says so.
 3. Push back explicitly on every conflict between the user's desires and their constraints or the research above. Cite research_context sources when they drive a decision.
-4. Recommend a plan: template ("balanced" | "upperFocus" | "superhero"); focus for each of shoulders, arms, chest, back, legs, core (each "maintain" | "normal" | "emphasize" | "specialize", with at most 2 groups at emphasize or above); sessionMin (45 | 60 | 75); calorieDelta (integer between -300 and +300 relative to the current target); and what to watch before the next check-in.
+4. Recommend a plan. You may reply with the coarse four-field schema (template/focus/sessionMin/calorieDelta), OR, optionally, add a \`prescriptions\` array of per-exercise overrides (each: exerciseId — must be an id from <exercise_library> — dayKey, order, sets, repMin, repMax, load, restSec; any field you omit falls back to the app's own generator/load logic) and an optional \`sessionRules\` object (maxSetsPerMovement, orderByFocus, trimPriority, weeklyGroupSetCaps). Every exerciseId you reference must come from <exercise_library> — if nothing there fits what a slot needs, leave it out and explain why rather than substituting or inventing one you cannot verify against its tags. Also give: template ("balanced" | "upperFocus" | "superhero"); focus for each of shoulders, arms, chest, back, legs, core (each "maintain" | "normal" | "emphasize" | "specialize", with at most 2 groups at emphasize or above); sessionMin (45 | 60 | 75); calorieDelta (integer between -300 and +300 relative to the current target); and what to watch before the next check-in.
 5. Keep the narrative under 300 words.
-6. End your reply with exactly one fenced \`\`\`json code block containing ONLY this object (no comments): {"template":"...","focus":{"shoulders":"...","arms":"...","chest":"...","back":"...","legs":"...","core":"..."},"sessionMin":60,"calorieDelta":0} — the app parses this block to apply your plan through its safety gates.
+6. End your reply with exactly one fenced \`\`\`json code block containing ONLY the plan object (no comments) — either the four-field shape, or the same four fields plus \`prescriptions\`/\`sessionRules\`. The app parses this block and applies your plan through its safety gates; Gate 2's injury constraints are never overridable regardless of what you propose.
 </instructions>`;
 }
 
@@ -3548,7 +3612,7 @@ function coachMetrics(data) {
   }
   return {
     weeksTraining: trainingWeeks(sessions),
-    totalSessions: sessions.length,
+    totalSessions: countTrainingSessions(sessions),
     latestBw: w.length ? w[w.length - 1].lbs : null,
     bwSlopePerWeek: bwSlope,
     stalledLifts: lifts.filter((l) => l.weeksLogged >= 3 && l.stalled).length,
@@ -3688,7 +3752,7 @@ function CoachCard({ data, persist }) {
     setTimeout(() => setCopyMsg(""), 4000);
   };
 
-  const openInClaude = () => {
+  const openInClaude = async () => {
     if (!goalText.trim()) { setErr("Describe your goal first — the brief includes it."); return; }
     setErr("");
     const profile = currentProfile();
@@ -3696,7 +3760,14 @@ function CoachCard({ data, persist }) {
     const brief = buildCoachBrief(data, profile);
     const url = "https://claude.ai/new?q=" + encodeURIComponent(brief);
     if (url.length > 7500) {
-      copyBrief();
+      // Pre-existing race, surfaced by Task 5's much larger payload (the
+      // brief now routinely exceeds 7500 chars, so this path is now the
+      // common case, not the rare one): copyBrief() is itself async and
+      // sets its own "Copied — paste it into any Claude chat." message on
+      // completion. Calling it without awaiting let that message land
+      // AFTER — and overwrite — the more specific one below, once the
+      // clipboard write's microtask resolved a beat later. Await it first.
+      await copyBrief();
       setCopyMsg("Brief too long for a link — copied to clipboard instead. Paste into Claude.");
       setTimeout(() => setCopyMsg(""), 4000);
       return;
@@ -3916,7 +3987,8 @@ function Insights({ data, persist }) {
   }
 
   const weeksLogged = new Set(data.sessions.map((s) => weekStart(s.date))).size;
-  const sessionsPerWeek = weeksLogged ? (data.sessions.length / weeksLogged).toFixed(1) : 0;
+  const totalSessions = countTrainingSessions(data.sessions);
+  const sessionsPerWeek = weeksLogged ? (totalSessions / weeksLogged).toFixed(1) : 0;
 
   return (
     <div>
@@ -3985,11 +4057,11 @@ function Insights({ data, persist }) {
         );
       })}
 
-      {data.sessions.length > 0 && (
+      {totalSessions > 0 && (
         <div style={{ ...S.card, background: "#EAF3FF" }}>
           <div style={{ fontWeight: 700, fontSize: 14, color: C.blue }}>Consistency</div>
           <div style={{ fontSize: 13, color: "#3A3A3C", marginTop: 6, lineHeight: 1.5 }}>
-            {data.sessions.length} sessions across {weeksLogged} week{weeksLogged !== 1 ? "s" : ""} (~{sessionsPerWeek}/week).
+            {totalSessions} sessions across {weeksLogged} week{weeksLogged !== 1 ? "s" : ""} (~{sessionsPerWeek}/week).
             The research is blunt on this one: 4 quality days a week, sustained, beats any program tweak.
           </div>
         </div>
