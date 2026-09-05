@@ -78,7 +78,8 @@ const D = {
   cablerow:{ id: "cablerow", name: "Seated Cable Row", cat: "hpull", start: 90, inc: 5 },
   latraise:{ id: "latraise", name: "Lateral Raise", cat: "delts", start: 10, inc: 2.5, perHand: true },
   hammer:  { id: "hammer", name: "Hammer Curl", cat: "biceps", start: 15, inc: 2.5, perHand: true },
-  goblet:  { id: "goblet", name: "Goblet / Box Squat", cat: "squat", start: 40, inc: 5 },
+  goblet:  { id: "goblet", name: "Goblet Squat (no box, self-limited)", cat: "squat", start: 40, inc: 5 },
+  boxsquat: { id: "boxsquat", name: "Box Squat (external stop)", cat: "squat", start: 40, inc: 5 },
   rdl:     { id: "rdl", name: "RDL (mid-shin range)", cat: "hinge", start: 75, inc: 5 },
   bss:     { id: "bss", name: "Bulgarian Split Squat (shallow)", cat: "quad", start: 0, inc: 5, perHand: true },
   hipthrust: { id: "hipthrust", name: "Hip Thrust", cat: "glute", start: 95, inc: 10 },
@@ -111,7 +112,7 @@ const PROGRAMS = {
       slot("ohp", 3, 6, 10), slot("pullup", 3, 6, 10), slot("incdb", 3, 8, 12),
       slot("cablerow", 3, 10, 15), slot("latraise", 3, 12, 20), slot("hammer", 2, 10, 15) ] },
     { id: "lowerB", name: "Lower B", blurb: "Glutes · hinge · single-leg · core", exercises: [
-      slot("goblet", 3, 8, 12), slot("rdl", 3, 8, 10), slot("bss", 2, 10, 12),
+      slot("boxsquat", 3, 8, 12), slot("rdl", 3, 8, 10), slot("bss", 2, 10, 12),
       slot("hipthrust", 3, 10, 12), slot("kneeraise", 3, 10, 15) ] },
   ],
   upperFocus: [
@@ -179,6 +180,7 @@ const LIBRARY = [
   { id: "hacksquat", name: "Hack Squat (pain-free depth)", cat: "squat", start: 90, inc: 10, basedOn: { ex: "legpress", ratio: 0.65 } },
   { id: "smithsquat", name: "Smith Machine Squat (limited depth)", cat: "squat", start: 70, inc: 10, basedOn: { ex: "pinsquat", ratio: 0.85 } },
   { id: "beltsquat", name: "Belt Squat", cat: "squat", start: 80, inc: 10, basedOn: { ex: "legpress", ratio: 0.6 } },
+  { id: "goblet", name: "Goblet Squat (no box, self-limited)", cat: "squat", start: 40, inc: 5 },
   { id: "machpress", name: "Machine Chest Press", cat: "hpress", start: 80, inc: 5, basedOn: { ex: "bench", ratio: 0.9 } },
   { id: "dips", name: "Dips (assisted ok)", cat: "hpress", start: 0, inc: 5 },
   { id: "dbbench", name: "Flat DB Press", cat: "hpress", start: 35, inc: 5, perHand: true, basedOn: { ex: "bench", ratio: 0.38 } },
@@ -343,7 +345,7 @@ const CAT_NAMES = {
 };
 
 const DEFAULT_NUTRITION = { age: 35, sex: "male", heightIn: 67, deskJob: true, steps: 7000, workouts: 4 };
-const DEFAULT_DATA = { sessions: [], weights: [], swaps: {}, nutrition: DEFAULT_NUTRITION, focus: null, plan: null, phase: null, injuryProfile: null, injuryProfileHistory: [], injuryProfileMigration: null };
+const DEFAULT_DATA = { sessions: [], weights: [], swaps: {}, nutrition: DEFAULT_NUTRITION, focus: null, plan: null, phase: null, injuryProfile: null, injuryProfileHistory: [], injuryProfileMigration: null, gobletBoxSquatMigration: null };
 
 
 /* ===== Emphasis model (research-driven set redistribution) =====
@@ -371,6 +373,47 @@ const EMPHASIS_LEVELS = [
 const DEFAULT_FOCUS = { shoulders: "normal", arms: "normal", chest: "normal", back: "normal", legs: "normal", core: "normal" };
 const DEFAULT_PLAN = { template: "balanced", sessionMin: 60, templateSince: null };
 const getProgram = (data) => PROGRAMS[(data.plan && data.plan.template) || "balanced"] || PROGRAMS.balanced;
+
+/* ===== Injury vocabulary (closed set) =====
+   contraindications:["hip_labrum"] etc. across the 74/75 tagged exercises
+   only matches if injuryProfile.injuries[].id is EXACTLY that string.
+   Without a closed vocabulary, renaming/removing/re-adding an injury in
+   InjuryProfileCard (free text previously) could silently stop matching
+   every exercise tagged against it — Gate 2 would then pass everything,
+   with nothing surfacing. InjuryProfileCard's editor selects from this list
+   (see the id/label select in InjuryProfileCard) rather than free-typing a
+   label; "Other" is still allowed but visibly unmatched against anything
+   tagged, since nothing has been reviewed against a custom id yet. */
+const INJURY_VOCABULARY = {
+  hip_labrum: "Hip labral tear",
+  prox_hamstring_tendinosis: "Proximal hamstring tendinosis",
+};
+
+/* Startup assertion (Task 1 item 2): every contraindication id across the
+   whole tagged library must exist in INJURY_VOCABULARY, or it can never
+   match anything and the tag is silently dead. Logs loudly rather than
+   failing quietly — this runs once at module load, in the browser. */
+function validateContraindicationVocabulary() {
+  const known = new Set(Object.keys(INJURY_VOCABULARY));
+  const bad = [];
+  ALL_KNOWN.forEach((ex) => {
+    (ex.contraindications || []).forEach((id) => {
+      if (!known.has(id)) bad.push(`${ex.id} -> "${id}"`);
+    });
+  });
+  if (bad.length) {
+    console.error("INJURY_VOCABULARY mismatch — these contraindications reference an unknown injury id and will never match anything:", bad);
+  }
+  return bad;
+}
+
+/* Reverse direction: any injuryProfile.injuries[] entry whose id ISN'T in
+   the vocabulary can't be matched by any exercise's contraindications
+   either — surfaced in InjuryProfileCard rather than only asserted here. */
+function unknownInjuryIds(injuryProfile) {
+  const known = new Set(Object.keys(INJURY_VOCABULARY));
+  return (injuryProfile && injuryProfile.injuries || []).filter((inj) => !known.has(inj.id));
+}
 
 /* ===== Injury profile (protected, clinician-defined data) =====
    recoveringMode gates exercise selection (Gate 2, Task 4) and NEVER auto-lifts
@@ -490,175 +533,245 @@ BONUS_EX.forEach((b) => { if (!EX_BY_ID[b.id]) { ALL_KNOWN.push(b); EX_BY_ID[b.i
    either way (belt squat, cable pull-through), the conservative/deeper value
    is used rather than omitting the key — "deny by default" for an unknown
    depth means treating it as unbounded, not as compliant.
-   contraindications: reserved for risks independent of measurable depth
-   (currently none of the 74 need this beyond the two cases below) — depth
-   risk is handled by romProfile + Gate 2's limit comparison instead of
-   guessing a contraindication per squat variant.
+   contraindications: reserved for risks independent of measurable depth —
+   depth risk is handled by romProfile + Gate 2's limit comparison instead of
+   guessing a contraindication per squat variant. Ids used here must exist in
+   INJURY_VOCABULARY (validateContraindicationVocabulary() asserts this at
+   load).
    pool: reuses the existing `cat` field (same taxonomy the swap picker
    already filters on) EXCEPT "delts" is split into delts_lateral /
    delts_rear — Reverse Pec-Deck and a Lateral Raise are mechanically
    unrelated for gating even though the generator currently lumps them
    together as one muscle group.
+   tagSource: how each entry's verdict was actually arrived at — 74/75
+   tagged is not the same claim as 74/75 verified, and this is what lets
+   TaggingCoverageCard tell the two apart instead of implying they're equal.
+     - "descriptive": a mechanical fact, or a value read directly off the
+       exercise's own stated name (e.g. rdl's "(mid-shin range)",
+       pinsquat's "(above parallel)") — no risk-verdict inference involved.
+     - "from_app_caution": the safety VERDICT (contraindicated or not, or
+       "treated as compliant") was inferred from an existing INDIRECT in-app
+       signal — caution/why text, a vague depth-labeled name like
+       "(pain-free depth)", or "this is what the live program already
+       prescribes safely today" — not a directly stated value.
+     - "conservative_default": no in-app signal existed either way; the
+       more-restrictive value was chosen rather than guessing safe.
+     - "clinician_reviewed": unused today (clinicianReviewed is false) —
+       defined for when one actually is signed off.
 
-   Two deliberate, flagged judgment calls (not silently resolved):
-   - goblet (Goblet / Box Squat) is tagged verbatim from this build's own
-     spec example: romProfile-compliant (above_parallel) AND still
-     contraindicated for hip_labrum. A box squat has no HARD mechanical
-     depth stop the way pinsquat's safety pins do — a self-monitored limit
-     under fatigue is not the same guarantee. legpress/hacksquat/smithsquat
-     are treated as the current designated-safe options instead (matches
-     what the live program actually prescribes today).
-   - bbrow (Bent-Over Barbell Row) is tagged contraindicated for
-     prox_hamstring_tendinosis directly from its own existing `caution` /
-     `why` text already in LIBRARY_EXT — not a new judgment, just encoded.
-   trapdl (Trap-Bar Deadlift) similarly already carries its own
-   `caution: "Only with PT clearance"` in LIBRARY — encoded the same way.
+   goblet / boxsquat split: "Goblet / Box Squat" was originally one entry,
+   tagged verbatim from this build's own spec example (romProfile-compliant
+   AND still contraindicated). That conflated two movements with different
+   risk profiles under one id — a goblet squat is self-limited (no external
+   stop), a box squat is externally limited (the box IS a hard mechanical
+   stop, the same enforcement category as pinsquat's safety pins). Split
+   into two ids; only the self-limited variant keeps the contraindication.
+   See the migration this required in App's load effect and
+   GobletBoxSquatMigrationPrompt — existing logged sessions under the old
+   combined "goblet" id are ambiguous and needed a one-time user decision,
+   not a guess (this lift has +20% progress over 7 weeks with no logged
+   pain — silently mis-tagging it contraindicated would have Gate 2 remove
+   a movement that's been running successfully). Also corrected axial_load
+   off of both while splitting: a goblet/box-squat hold is anterior
+   (front-rack), not through the spine — that attribute was only ever there
+   because it was copied verbatim from the spec's illustrative example, and
+   splitting the entry was the right moment to fix a mechanical inaccuracy
+   noticed along the way, flagged here rather than left in place.
 
-   None of the 74 carry the forbidden attribute itself
+   bbrow (Bent-Over Barbell Row) and trapdl (Trap-Bar Deadlift) are tagged
+   contraindicated directly from their own existing `caution` / `why` text
+   already in LIBRARY / LIBRARY_EXT — not a new judgment, just encoded.
+
+   None of the 75 carry the forbidden attribute itself
    (loaded_deep_hip_flexion) — accurately: nothing in the current library is
    actually described as a full/ATG-depth loaded movement. That forbidden
    entry exists as a forward-looking net for future/untagged additions, not
    because something here needs it — worth knowing so its zero hit rate
-   today isn't mistaken for the tag being unused/dead. */
+   today isn't mistaken for the tag being unused/dead. Task 4's test suite
+   carries two synthetic fixtures to exercise this path anyway — see
+   TASK-1-FIXES-REVIEW.txt. */
 const EXERCISE_ATTRS = {
   // ---- hpress (horizontal press / chest) ----
-  bench:        { attributes: ["horizontal_press", "free_weight"], romProfile: {}, contraindications: [], pool: "hpress" },
-  incdb:        { attributes: ["horizontal_press", "free_weight"], romProfile: {}, contraindications: [], pool: "hpress" },
-  machpress:    { attributes: ["horizontal_press", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpress" },
-  dips:         { attributes: ["horizontal_press", "bodyweight", "assisted"], romProfile: {}, contraindications: [], pool: "hpress" },
-  dbbench:      { attributes: ["horizontal_press", "free_weight"], romProfile: {}, contraindications: [], pool: "hpress" },
-  inclinebar:   { attributes: ["horizontal_press", "free_weight"], romProfile: {}, contraindications: [], pool: "hpress" },
-  pecdeck:      { attributes: ["horizontal_press", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpress" },
-  bonus_cablefly: { attributes: ["horizontal_press", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpress" },
+  bench:        { attributes: ["horizontal_press", "free_weight"], romProfile: {}, contraindications: [], pool: "hpress", tagSource: "descriptive" },
+  incdb:        { attributes: ["horizontal_press", "free_weight"], romProfile: {}, contraindications: [], pool: "hpress", tagSource: "descriptive" },
+  machpress:    { attributes: ["horizontal_press", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpress", tagSource: "descriptive" },
+  dips:         { attributes: ["horizontal_press", "bodyweight", "assisted"], romProfile: {}, contraindications: [], pool: "hpress", tagSource: "descriptive" },
+  dbbench:      { attributes: ["horizontal_press", "free_weight"], romProfile: {}, contraindications: [], pool: "hpress", tagSource: "descriptive" },
+  inclinebar:   { attributes: ["horizontal_press", "free_weight"], romProfile: {}, contraindications: [], pool: "hpress", tagSource: "descriptive" },
+  pecdeck:      { attributes: ["horizontal_press", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpress", tagSource: "descriptive" },
+  bonus_cablefly: { attributes: ["horizontal_press", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpress", tagSource: "descriptive" },
 
   // ---- vpress (overhead press / shoulders) ----
-  dbohp:        { attributes: ["vertical_press", "free_weight"], romProfile: {}, contraindications: [], pool: "vpress" },
-  ohp:          { attributes: ["vertical_press", "free_weight"], romProfile: {}, contraindications: [], pool: "vpress" },
-  machohp:      { attributes: ["vertical_press", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpress" },
-  arnold:       { attributes: ["vertical_press", "free_weight", "rotational"], romProfile: {}, contraindications: [], pool: "vpress" },
-  landminepress: { attributes: ["vertical_press", "free_weight"], romProfile: {}, contraindications: [], pool: "vpress" },
+  dbohp:        { attributes: ["vertical_press", "free_weight"], romProfile: {}, contraindications: [], pool: "vpress", tagSource: "descriptive" },
+  ohp:          { attributes: ["vertical_press", "free_weight"], romProfile: {}, contraindications: [], pool: "vpress", tagSource: "descriptive" },
+  machohp:      { attributes: ["vertical_press", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpress", tagSource: "descriptive" },
+  arnold:       { attributes: ["vertical_press", "free_weight", "rotational"], romProfile: {}, contraindications: [], pool: "vpress", tagSource: "descriptive" },
+  landminepress: { attributes: ["vertical_press", "free_weight"], romProfile: {}, contraindications: [], pool: "vpress", tagSource: "descriptive" },
 
   // ---- hpull (row / back) ----
-  csrow:        { attributes: ["horizontal_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull" },
-  cablerow:     { attributes: ["horizontal_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull" },
-  dbrow:        { attributes: ["horizontal_pull", "free_weight", "unilateral"], romProfile: {}, contraindications: [], pool: "hpull" },
-  machrow:      { attributes: ["horizontal_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull" },
-  tbarrow:      { attributes: ["horizontal_pull", "free_weight", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull" },
-  sealrow:      { attributes: ["horizontal_pull", "free_weight", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull" },
-  invrow:       { attributes: ["horizontal_pull", "bodyweight"], romProfile: {}, contraindications: [], pool: "hpull" },
-  meadows:      { attributes: ["horizontal_pull", "free_weight", "unilateral", "hip_hinge"], romProfile: {}, contraindications: [], pool: "hpull" },
-  bbrow:        { attributes: ["horizontal_pull", "free_weight", "hip_hinge"], romProfile: {}, contraindications: ["prox_hamstring_tendinosis"], pool: "hpull" },
+  csrow:        { attributes: ["horizontal_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull", tagSource: "descriptive" },
+  cablerow:     { attributes: ["horizontal_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull", tagSource: "descriptive" },
+  dbrow:        { attributes: ["horizontal_pull", "free_weight", "unilateral"], romProfile: {}, contraindications: [], pool: "hpull", tagSource: "descriptive" },
+  machrow:      { attributes: ["horizontal_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull", tagSource: "descriptive" },
+  tbarrow:      { attributes: ["horizontal_pull", "free_weight", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull", tagSource: "descriptive" },
+  sealrow:      { attributes: ["horizontal_pull", "free_weight", "machine_supported"], romProfile: {}, contraindications: [], pool: "hpull", tagSource: "descriptive" },
+  invrow:       { attributes: ["horizontal_pull", "bodyweight"], romProfile: {}, contraindications: [], pool: "hpull", tagSource: "descriptive" },
+  meadows:      { attributes: ["horizontal_pull", "free_weight", "unilateral", "hip_hinge"], romProfile: {}, contraindications: [], pool: "hpull", tagSource: "descriptive" },
+  bbrow:        { attributes: ["horizontal_pull", "free_weight", "hip_hinge"], romProfile: {}, contraindications: ["prox_hamstring_tendinosis"], pool: "hpull", tagSource: "from_app_caution" },
 
   // ---- vpull (pulldown / pull-up / back) ----
-  latpd:        { attributes: ["vertical_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpull" },
-  pullup:       { attributes: ["vertical_pull", "bodyweight", "assisted"], romProfile: {}, contraindications: [], pool: "vpull" },
-  nlatpd:       { attributes: ["vertical_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpull" },
-  chinup:       { attributes: ["vertical_pull", "bodyweight", "elbow_flexion"], romProfile: {}, contraindications: [], pool: "vpull" },
-  wideLatpd:    { attributes: ["vertical_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpull" },
-  bonus_pullover: { attributes: ["vertical_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpull" },
+  latpd:        { attributes: ["vertical_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpull", tagSource: "descriptive" },
+  pullup:       { attributes: ["vertical_pull", "bodyweight", "assisted"], romProfile: {}, contraindications: [], pool: "vpull", tagSource: "descriptive" },
+  nlatpd:       { attributes: ["vertical_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpull", tagSource: "descriptive" },
+  chinup:       { attributes: ["vertical_pull", "bodyweight", "elbow_flexion"], romProfile: {}, contraindications: [], pool: "vpull", tagSource: "descriptive" },
+  wideLatpd:    { attributes: ["vertical_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpull", tagSource: "descriptive" },
+  bonus_pullover: { attributes: ["vertical_pull", "machine_supported"], romProfile: {}, contraindications: [], pool: "vpull", tagSource: "descriptive" },
 
   // ---- biceps (arms) ----
-  curl:         { attributes: ["elbow_flexion", "free_weight"], romProfile: {}, contraindications: [], pool: "biceps" },
-  hammer:       { attributes: ["elbow_flexion", "free_weight"], romProfile: {}, contraindications: [], pool: "biceps" },
-  ezcurl:       { attributes: ["elbow_flexion", "free_weight"], romProfile: {}, contraindications: [], pool: "biceps" },
-  inclinecurl:  { attributes: ["elbow_flexion", "free_weight"], romProfile: {}, contraindications: [], pool: "biceps" },
-  cablecurl:    { attributes: ["elbow_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "biceps" },
-  bonus_preacher: { attributes: ["elbow_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "biceps" },
-  bonus_dbhammer: { attributes: ["elbow_flexion", "free_weight", "unilateral"], romProfile: {}, contraindications: [], pool: "biceps" },
+  curl:         { attributes: ["elbow_flexion", "free_weight"], romProfile: {}, contraindications: [], pool: "biceps", tagSource: "descriptive" },
+  hammer:       { attributes: ["elbow_flexion", "free_weight"], romProfile: {}, contraindications: [], pool: "biceps", tagSource: "descriptive" },
+  ezcurl:       { attributes: ["elbow_flexion", "free_weight"], romProfile: {}, contraindications: [], pool: "biceps", tagSource: "descriptive" },
+  inclinecurl:  { attributes: ["elbow_flexion", "free_weight"], romProfile: {}, contraindications: [], pool: "biceps", tagSource: "descriptive" },
+  cablecurl:    { attributes: ["elbow_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "biceps", tagSource: "descriptive" },
+  bonus_preacher: { attributes: ["elbow_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "biceps", tagSource: "descriptive" },
+  bonus_dbhammer: { attributes: ["elbow_flexion", "free_weight", "unilateral"], romProfile: {}, contraindications: [], pool: "biceps", tagSource: "descriptive" },
 
   // ---- triceps (arms) ----
-  pressdn:      { attributes: ["elbow_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "triceps" },
-  skull:        { attributes: ["elbow_extension", "free_weight"], romProfile: {}, contraindications: [], pool: "triceps" },
-  ohte:         { attributes: ["elbow_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "triceps" },
-  jmpress:      { attributes: ["elbow_extension", "free_weight", "horizontal_press"], romProfile: {}, contraindications: [], pool: "triceps" },
-  ohdbext:      { attributes: ["elbow_extension", "free_weight"], romProfile: {}, contraindications: [], pool: "triceps" },
-  bonus_ohtri:  { attributes: ["elbow_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "triceps" },
+  pressdn:      { attributes: ["elbow_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "triceps", tagSource: "descriptive" },
+  skull:        { attributes: ["elbow_extension", "free_weight"], romProfile: {}, contraindications: [], pool: "triceps", tagSource: "descriptive" },
+  ohte:         { attributes: ["elbow_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "triceps", tagSource: "descriptive" },
+  jmpress:      { attributes: ["elbow_extension", "free_weight", "horizontal_press"], romProfile: {}, contraindications: [], pool: "triceps", tagSource: "descriptive" },
+  ohdbext:      { attributes: ["elbow_extension", "free_weight"], romProfile: {}, contraindications: [], pool: "triceps", tagSource: "descriptive" },
+  bonus_ohtri:  { attributes: ["elbow_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "triceps", tagSource: "descriptive" },
 
   // ---- delts, split lateral vs rear (pool deviates from bare `cat`) ----
-  latraise:       { attributes: ["lateral_delt_isolation", "free_weight"], romProfile: {}, contraindications: [], pool: "delts_lateral" },
-  cablelat:       { attributes: ["lateral_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_lateral" },
-  lean_lat:       { attributes: ["lateral_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_lateral" },
-  machlat:        { attributes: ["lateral_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_lateral" },
-  bonus_sidelat:  { attributes: ["lateral_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_lateral" },
-  bonus_dbpress:  { attributes: ["lateral_delt_isolation", "free_weight"], romProfile: {}, contraindications: [], pool: "delts_lateral" },
-  reardelt:       { attributes: ["rear_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_rear" },
-  bonus_reardelt: { attributes: ["rear_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_rear" },
+  latraise:       { attributes: ["lateral_delt_isolation", "free_weight"], romProfile: {}, contraindications: [], pool: "delts_lateral", tagSource: "descriptive" },
+  cablelat:       { attributes: ["lateral_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_lateral", tagSource: "descriptive" },
+  lean_lat:       { attributes: ["lateral_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_lateral", tagSource: "descriptive" },
+  machlat:        { attributes: ["lateral_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_lateral", tagSource: "descriptive" },
+  bonus_sidelat:  { attributes: ["lateral_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_lateral", tagSource: "descriptive" },
+  bonus_dbpress:  { attributes: ["lateral_delt_isolation", "free_weight"], romProfile: {}, contraindications: [], pool: "delts_lateral", tagSource: "descriptive" },
+  reardelt:       { attributes: ["rear_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_rear", tagSource: "descriptive" },
+  bonus_reardelt: { attributes: ["rear_delt_isolation", "machine_supported"], romProfile: {}, contraindications: [], pool: "delts_rear", tagSource: "descriptive" },
 
   // ---- squat (the critical category for the hip labrum constraint) ----
-  // legpress/hacksquat: named "(pain-free depth)", basedOn-linked, and are
-  // what the live program already prescribes as the safe squat pattern in
-  // 2 of 3 templates today — squatDepth omitted (not on the free-squat
-  // depth scale; behaviorally/machine managed), not contraindicated.
-  legpress:     { attributes: ["knee_dominant", "loaded_hip_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "squat" },
-  hacksquat:    { attributes: ["knee_dominant", "loaded_hip_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "squat" },
-  // pinsquat: the ONE exercise with a hard mechanical depth stop
-  // (movementConstraints.limited names it directly: enforce:"safety_pins").
-  pinsquat:     { attributes: ["knee_dominant", "loaded_hip_flexion", "axial_load", "free_weight"], romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "squat" },
-  // smithsquat: name says "(limited depth)", basedOn pinsquat directly.
-  smithsquat:   { attributes: ["knee_dominant", "loaded_hip_flexion", "axial_load", "machine_supported"], romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "squat" },
-  // goblet: see the flagged judgment call in the comment above this table —
-  // tagged verbatim from this build's own spec example.
-  goblet:       { attributes: ["loaded_hip_flexion", "axial_load", "knee_dominant"], romProfile: { hipFlexionMax: "90", squatDepth: "above_parallel" }, contraindications: ["hip_labrum"], pool: "squat" },
+  // legpress/hacksquat: named "(pain-free depth)" — a behavioral label, not
+  // a stated value — and are what the live program already prescribes as
+  // the safe squat pattern in 2 of 3 templates today. squatDepth omitted
+  // (not on the free-squat depth scale; behaviorally/machine managed).
+  legpress:     { attributes: ["knee_dominant", "loaded_hip_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "squat", tagSource: "from_app_caution" },
+  hacksquat:    { attributes: ["knee_dominant", "loaded_hip_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "squat", tagSource: "from_app_caution" },
+  // pinsquat: name directly STATES "(above parallel)", and
+  // movementConstraints.limited names this exact mechanism (enforce:
+  // "safety_pins") — a direct transcription, not an inference.
+  pinsquat:     { attributes: ["knee_dominant", "loaded_hip_flexion", "axial_load", "free_weight"], romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "squat", tagSource: "descriptive" },
+  // smithsquat: "(limited depth)" is vague like legpress's label, but
+  // basedOn:pinsquat chains the above_parallel value through an inference,
+  // not a direct statement.
+  smithsquat:   { attributes: ["knee_dominant", "loaded_hip_flexion", "axial_load", "machine_supported"], romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "squat", tagSource: "from_app_caution" },
+  // goblet: self-limited (no external stop) — see the split rationale in
+  // the comment above this table. No in-app signal either way; the
+  // conservative/deeper depth is used and the contraindication kept,
+  // rather than guessing safe for a self-monitored limit.
+  goblet:       { attributes: ["loaded_hip_flexion", "knee_dominant"], romProfile: { squatDepth: "below_parallel" }, contraindications: ["hip_labrum"], pool: "squat", tagSource: "conservative_default" },
+  // boxsquat: externally limited — the box is a hard mechanical stop, the
+  // same enforcement category as pinsquat's safety pins. A mechanical fact
+  // about the equipment, not an inference about safety.
+  boxsquat:     { attributes: ["loaded_hip_flexion", "knee_dominant"], romProfile: { squatDepth: "above_parallel", enforce: "box" }, contraindications: [], pool: "squat", tagSource: "descriptive" },
   // beltsquat: no depth-limiting name signal and not currently prescribed
   // anywhere live — conservative/deeper value rather than omitting the key.
-  beltsquat:    { attributes: ["knee_dominant", "loaded_hip_flexion"], romProfile: { squatDepth: "below_parallel" }, contraindications: [], pool: "squat" },
+  beltsquat:    { attributes: ["knee_dominant", "loaded_hip_flexion"], romProfile: { squatDepth: "below_parallel" }, contraindications: [], pool: "squat", tagSource: "conservative_default" },
 
   // ---- quad ----
-  legext:       { attributes: ["knee_dominant", "machine_supported"], romProfile: {}, contraindications: [], pool: "quad" },
-  bss:          { attributes: ["knee_dominant", "loaded_hip_flexion", "unilateral", "free_weight"], romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "quad" },
-  sissy:        { attributes: ["knee_dominant", "loaded_hip_flexion", "bodyweight"], romProfile: { squatDepth: "below_parallel" }, contraindications: [], pool: "quad" },
-  sledpush:     { attributes: ["knee_dominant", "concentric_only", "free_weight"], romProfile: {}, contraindications: [], pool: "quad" },
-  bonus_walkinglunge: { attributes: ["knee_dominant", "loaded_hip_flexion", "unilateral", "free_weight"], romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "quad" },
+  legext:       { attributes: ["knee_dominant", "machine_supported"], romProfile: {}, contraindications: [], pool: "quad", tagSource: "descriptive" },
+  bss:          { attributes: ["knee_dominant", "loaded_hip_flexion", "unilateral", "free_weight"], romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "quad", tagSource: "descriptive" },
+  sissy:        { attributes: ["knee_dominant", "loaded_hip_flexion", "bodyweight"], romProfile: { squatDepth: "below_parallel" }, contraindications: [], pool: "quad", tagSource: "descriptive" },
+  sledpush:     { attributes: ["knee_dominant", "concentric_only", "free_weight"], romProfile: {}, contraindications: [], pool: "quad", tagSource: "descriptive" },
+  // bonus_walkinglunge: "(pain-free ROM)" is a behavioral label like
+  // legpress's, not a stated value — above_parallel is inferred, not read
+  // directly off the name.
+  bonus_walkinglunge: { attributes: ["knee_dominant", "loaded_hip_flexion", "unilateral", "free_weight"], romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "quad", tagSource: "from_app_caution" },
 
   // ---- hinge (the other critical category — prox_hamstring_tendinosis) ----
-  // rdl: name states its own ROM — matches movementConstraints.limited's
-  // hinge_rom maxValue exactly.
-  rdl:          { attributes: ["hip_hinge", "posterior_chain_load", "free_weight"], romProfile: { hingeRom: "mid_shin" }, contraindications: [], pool: "hinge" },
+  // rdl: name directly states its own ROM — matches movementConstraints.
+  // limited's hinge_rom maxValue exactly. A transcription, not an inference.
+  rdl:          { attributes: ["hip_hinge", "posterior_chain_load", "free_weight"], romProfile: { hingeRom: "mid_shin" }, contraindications: [], pool: "hinge", tagSource: "descriptive" },
   // trapdl: already carries its own caution text in LIBRARY — encoded, not
   // a new judgment.
-  trapdl:       { attributes: ["hip_hinge", "posterior_chain_load", "axial_load", "free_weight"], romProfile: { hingeRom: "below_knee" }, contraindications: ["prox_hamstring_tendinosis"], pool: "hinge" },
+  trapdl:       { attributes: ["hip_hinge", "posterior_chain_load", "axial_load", "free_weight"], romProfile: { hingeRom: "below_knee" }, contraindications: ["prox_hamstring_tendinosis"], pool: "hinge", tagSource: "from_app_caution" },
   // pullthrough: no explicit ROM signal in its name — conservative/deeper
   // value rather than assuming it matches RDL's stated range.
-  pullthrough:  { attributes: ["hip_hinge", "posterior_chain_load", "machine_supported"], romProfile: { hingeRom: "below_knee" }, contraindications: [], pool: "hinge" },
+  pullthrough:  { attributes: ["hip_hinge", "posterior_chain_load", "machine_supported"], romProfile: { hingeRom: "below_knee" }, contraindications: [], pool: "hinge", tagSource: "conservative_default" },
   // backext: fixed-pad hip extension, not a free hinge — hingeRom omitted,
   // it isn't on that scale.
-  backext:      { attributes: ["hip_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "hinge" },
+  backext:      { attributes: ["hip_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "hinge", tagSource: "descriptive" },
 
   // ---- glute (hip extension — a different, generally SAFER pattern than
   // hip flexion for this profile; research corpus r03 favors loaded hip
   // extension for hamstring tendinosis) ----
-  hipthrust:    { attributes: ["hip_extension", "free_weight"], romProfile: {}, contraindications: [], pool: "glute" },
-  kasglute:     { attributes: ["hip_extension", "free_weight"], romProfile: {}, contraindications: [], pool: "glute" },
-  reversehyper: { attributes: ["hip_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "glute" },
+  hipthrust:    { attributes: ["hip_extension", "free_weight"], romProfile: {}, contraindications: [], pool: "glute", tagSource: "descriptive" },
+  kasglute:     { attributes: ["hip_extension", "free_weight"], romProfile: {}, contraindications: [], pool: "glute", tagSource: "descriptive" },
+  reversehyper: { attributes: ["hip_extension", "machine_supported"], romProfile: {}, contraindications: [], pool: "glute", tagSource: "descriptive" },
 
   // ---- ham (loaded knee flexion — hip stays extended/neutral, NOT the
   // flexion+extension combination the research corpus flags as risky) ----
-  legcurl:      { attributes: ["knee_flexion_loaded", "machine_supported"], romProfile: {}, contraindications: [], pool: "ham" },
-  lyingcurl:    { attributes: ["knee_flexion_loaded", "machine_supported"], romProfile: {}, contraindications: [], pool: "ham" },
+  legcurl:      { attributes: ["knee_flexion_loaded", "machine_supported"], romProfile: {}, contraindications: [], pool: "ham", tagSource: "descriptive" },
+  lyingcurl:    { attributes: ["knee_flexion_loaded", "machine_supported"], romProfile: {}, contraindications: [], pool: "ham", tagSource: "descriptive" },
 
   // ---- calf ----
-  calf:         { attributes: ["calf_raise", "machine_supported"], romProfile: {}, contraindications: [], pool: "calf" },
-  seatedcalf:   { attributes: ["calf_raise", "machine_supported"], romProfile: {}, contraindications: [], pool: "calf" },
+  calf:         { attributes: ["calf_raise", "machine_supported"], romProfile: {}, contraindications: [], pool: "calf", tagSource: "descriptive" },
+  seatedcalf:   { attributes: ["calf_raise", "machine_supported"], romProfile: {}, contraindications: [], pool: "calf", tagSource: "descriptive" },
 
   // ---- core ----
-  cablecrunch:  { attributes: ["core_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "core" },
+  cablecrunch:  { attributes: ["core_flexion", "machine_supported"], romProfile: {}, contraindications: [], pool: "core", tagSource: "descriptive" },
   // kneeraise: real (bodyweight) hip flexion, but moderate/controlled, not
   // end-range — tagged loaded_hip_flexion, not the forbidden
   // loaded_deep_hip_flexion.
-  kneeraise:    { attributes: ["core_flexion", "loaded_hip_flexion", "bodyweight"], romProfile: {}, contraindications: [], pool: "core" },
-  abwheel:      { attributes: ["core_flexion", "anti_extension", "bodyweight"], romProfile: {}, contraindications: [], pool: "core" },
+  kneeraise:    { attributes: ["core_flexion", "loaded_hip_flexion", "bodyweight"], romProfile: {}, contraindications: [], pool: "core", tagSource: "descriptive" },
+  abwheel:      { attributes: ["core_flexion", "anti_extension", "bodyweight"], romProfile: {}, contraindications: [], pool: "core", tagSource: "descriptive" },
 };
 Object.entries(EXERCISE_ATTRS).forEach(([id, attrs]) => { if (EX_BY_ID[id]) Object.assign(EX_BY_ID[id], attrs); });
+validateContraindicationVocabulary();
+
+/* Task 1 item 5: machohp, cablelat, skull, ohte and ezcurl are declared in
+   both D and LIBRARY. _dedupe (above) silently keeps whichever appears
+   first when building ALL_KNOWN — today that's harmless because the two
+   declarations are identical, but a silent pick is a landmine if they're
+   ever edited independently and drift apart. Assert they match instead of
+   trusting that; logs loudly rather than silently picking a winner. */
+function assertDuplicateDeclarationsMatch() {
+  const compareFields = ["name", "cat", "start", "inc", "perHand", "assistable"];
+  const mismatches = [];
+  LIBRARY.forEach((libEx) => {
+    const dEx = D[libEx.id];
+    if (!dEx) return;
+    compareFields.forEach((f) => {
+      if (JSON.stringify(dEx[f]) !== JSON.stringify(libEx[f])) {
+        mismatches.push(`${libEx.id}.${f}: D has ${JSON.stringify(dEx[f])}, LIBRARY has ${JSON.stringify(libEx[f])}`);
+      }
+    });
+    if (JSON.stringify(dEx.basedOn || null) !== JSON.stringify(libEx.basedOn || null)) {
+      mismatches.push(`${libEx.id}.basedOn: D has ${JSON.stringify(dEx.basedOn)}, LIBRARY has ${JSON.stringify(libEx.basedOn)}`);
+    }
+  });
+  if (mismatches.length) {
+    console.error("D/LIBRARY duplicate declarations diverge — ALL_KNOWN silently picked one (the D/PROGRAM_EXERCISES version) without anyone deciding that was correct:", mismatches);
+  }
+  return mismatches;
+}
+assertDuplicateDeclarationsMatch();
 
 /* An exercise counts as tagged only if every field Gate 2 (Task 4) reads is
    actually present — a partially-tagged exercise is exactly as unsafe as an
    untagged one. */
+const TAG_SOURCES = ["descriptive", "from_app_caution", "conservative_default", "clinician_reviewed"];
 function isExerciseTagged(ex) {
   return !!ex
     && Array.isArray(ex.attributes)
     && ex.romProfile !== undefined && ex.romProfile !== null && typeof ex.romProfile === "object"
     && Array.isArray(ex.contraindications)
-    && typeof ex.pool === "string" && ex.pool.length > 0;
+    && typeof ex.pool === "string" && ex.pool.length > 0
+    && TAG_SOURCES.includes(ex.tagSource);
 }
 
 /* Coverage report for the Settings view (Task 1 requirement) — every
@@ -666,6 +779,13 @@ function isExerciseTagged(ex) {
    than discovering a gap only when recoveringMode silently denies it. */
 function exerciseTaggingGaps() {
   return ALL_KNOWN.filter((ex) => !isExerciseTagged(ex));
+}
+
+/* 74/75 tagged is not the same claim as 74/75 verified — this is what lets
+   the coverage card say which tags are guesses rather than implying every
+   tagged exercise carries equal confidence. */
+function conservativeDefaultExercises() {
+  return ALL_KNOWN.filter((ex) => ex.tagSource === "conservative_default");
 }
 
 function emphasisMult(cat, focus) {
@@ -1406,8 +1526,25 @@ function App() {
           };
           injuryProfileHistory = [...injuryProfileHistory, { at, device: "migration", profile: migratedInjuryProfile }].slice(-50);
         }
+        // goblet/box-squat split (Task 1 item 1): "goblet" used to mean the
+        // combined "Goblet / Box Squat" entry. Historical sessions logged
+        // under that id are ambiguous now that the two are separate
+        // exercises with different risk profiles (self-limited vs an
+        // external stop) — default to boxsquat (matches what "Lower B" now
+        // prescribes) but ask, once, via GobletBoxSquatMigrationPrompt,
+        // rather than silently guessing for a lift with real logged
+        // history. Not folded into the injury-profile migrating flag above
+        // — the two are independent events with independent triggers.
+        let gobletBoxSquatMigration = found.gobletBoxSquatMigration || null;
+        let sessions = found.sessions || [];
+        const migratingGoblet = sessions.some((s) => s.exerciseId === "goblet") && !gobletBoxSquatMigration;
+        if (migratingGoblet) {
+          sessions = sessions.map((s) => (s.exerciseId === "goblet" ? { ...s, exerciseId: "boxsquat" } : s));
+          gobletBoxSquatMigration = { at: new Date().toISOString(), resolved: false, defaultedTo: "boxsquat" };
+        }
         const stamped = {
           ...DEFAULT_DATA, ...found,
+          sessions,
           swaps: found.swaps || {},
           nutrition: { ...DEFAULT_NUTRITION, ...(found.nutrition || {}) },
           focus: { ...DEFAULT_FOCUS, ...(found.focus || {}) },
@@ -1416,11 +1553,12 @@ function App() {
           injuryProfile: migratedInjuryProfile,
           injuryProfileHistory,
           injuryProfileMigration: migrationNotice,
+          gobletBoxSquatMigration,
         };
         setData(stamped);
-        // Persist the migration itself immediately — it must not depend on the
-        // user happening to trigger some other write before it becomes durable.
-        if (migrating) {
+        // Persist either migration immediately — neither should depend on the
+        // user happening to trigger some other write before becoming durable.
+        if (migrating || migratingGoblet) {
           try { await window.storage.set(STORAGE_KEY, JSON.stringify({ ...stamped, _updatedAt: new Date().toISOString() })); } catch (e) { /* saved in memory at least */ }
         }
       }
@@ -1582,6 +1720,7 @@ function WorkoutFlow({ data, persist }) {
   return (
     <div>
       <InjuryMigrationNotice data={data} persist={persist} />
+      <GobletBoxSquatMigrationPrompt data={data} persist={persist} />
       <PendingPainRetroPrompts data={data} persist={persist} />
       {!injuryProfile.clinicianReviewed && <ClinicianReviewNotice />}
       {!day
@@ -2229,6 +2368,44 @@ function InjuryMigrationNotice({ data, persist }) {
   );
 }
 
+/* One-time, resolvable prompt after the goblet/boxsquat split (Task 1 item
+   1). Historical sessions logged under the old combined "goblet" id were
+   defaulted to boxsquat (see App's load effect) — this asks rather than
+   silently guessing, since the lift has real logged progress. "No" rewrites
+   the migrated sessions back to goblet AND swaps the live program slot
+   (data.swaps.boxsquat = "goblet") so future sessions log under the right
+   id too, reusing the existing swap mechanism rather than new plumbing. */
+function GobletBoxSquatMigrationPrompt({ data, persist }) {
+  const migration = data.gobletBoxSquatMigration;
+  if (!migration || migration.resolved) return null;
+
+  const confirmBox = () => persist({ ...data, gobletBoxSquatMigration: { ...migration, resolved: true } });
+  const correctToGoblet = () => {
+    const sessions = data.sessions.map((s) => (s.exerciseId === "boxsquat" ? { ...s, exerciseId: "goblet" } : s));
+    persist({
+      ...data,
+      sessions,
+      swaps: { ...data.swaps, boxsquat: "goblet" },
+      gobletBoxSquatMigration: { ...migration, resolved: true, defaultedTo: "goblet" },
+    });
+  };
+
+  return (
+    <div style={{ ...S.card, background: "#EAF3FF" }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: C.blue }}>Which squat have you been doing?</div>
+      <div style={{ fontSize: 12.5, color: "#3A3A3C", marginTop: 6, lineHeight: 1.45 }}>
+        "Goblet / Box Squat" is now two separate exercises with different safety tags — self-limited
+        (no box) vs. externally stopped (a box). Your logged history was assumed to be Box Squat so
+        nothing else changes for now, but this needs your confirmation.
+      </div>
+      <div style={{ ...S.row, marginTop: 10, gap: 8 }}>
+        <button style={{ ...S.pillBtn(), flex: 1 }} onClick={confirmBox}>Yes, Box Squat</button>
+        <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} onClick={correctToGoblet}>No, it was Goblet (no box)</button>
+      </div>
+    </div>
+  );
+}
+
 /* Surfaces delayed-onset pain answers pending across ALL lifts (see
    findAllPendingPainRetros) — rendered once, at the top of the Workout tab,
    rather than gated on reopening any one specific exercise. */
@@ -2312,14 +2489,34 @@ function InjuryProfileCard({ data, persist }) {
   });
   const updateInjury = (idx, patch) => save({ ...profile, injuries: profile.injuries.map((inj, i) => (i === idx ? { ...inj, ...patch } : inj)) });
   const removeInjury = (idx) => save({ ...profile, injuries: profile.injuries.filter((_, i) => i !== idx) });
-  const addInjury = () => save({
-    ...profile,
-    injuries: [...profile.injuries, { id: `injury_${Date.now()}`, label: "", side: null, status: "recovering", since: null }],
-  });
+  // Defaults to the first vocabulary entry not already in use — keeps new
+  // injuries inside the closed set that contraindications can actually
+  // match, rather than a free-typed id nothing is tagged against.
+  const addInjury = () => {
+    const used = new Set(profile.injuries.map((i) => i.id));
+    const nextVocabId = Object.keys(INJURY_VOCABULARY).find((id) => !used.has(id));
+    const id = nextVocabId || `custom_${Date.now()}`;
+    save({
+      ...profile,
+      injuries: [...profile.injuries, { id, label: INJURY_VOCABULARY[id] || "", side: null, status: "recovering", since: null }],
+    });
+  };
+  // A select changes id AND label together, keeping them in lock-step with
+  // the vocabulary; "Other" keeps a free-typed label but a non-colliding
+  // custom id, visibly unmatched against any exercise's contraindications.
+  const setInjuryVocab = (idx, val) => {
+    if (val === "__other__") {
+      const inj = profile.injuries[idx];
+      updateInjury(idx, { id: INJURY_VOCABULARY[inj.id] ? `custom_${Date.now()}` : inj.id });
+    } else {
+      updateInjury(idx, { id: val, label: INJURY_VOCABULARY[val] });
+    }
+  };
 
   const history = [...(data.injuryProfileHistory || [])].sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 8);
   const mc = profile.movementConstraints || DEFAULT_INJURY_PROFILE.movementConstraints;
   const reportingGaps = painReportingGaps(data.sessions, profile);
+  const unknownIds = unknownInjuryIds(profile);
 
   return (
     <div style={{ ...S.card, background: "#F7F7FA" }}>
@@ -2362,12 +2559,34 @@ function InjuryProfileCard({ data, persist }) {
           <div style={{ fontSize: 12, fontWeight: 700, color: C.sub, textTransform: "uppercase", letterSpacing: 0.4, marginTop: 18, marginBottom: 8 }}>
             Injuries
           </div>
+          {unknownIds.length > 0 && (
+            <div style={{ background: "#FFF1E5", borderRadius: 12, padding: "10px 12px", marginBottom: 8 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: C.orange }}>Unrecognized injury id</div>
+              <div style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>
+                {unknownIds.map((inj) => inj.label || inj.id).join(", ")} — not in the known vocabulary, so no
+                exercise's contraindications can currently match it. Re-pick from the list below, or leave as
+                "Other" if it's genuinely new (nothing is tagged against it yet).
+              </div>
+            </div>
+          )}
           {profile.injuries.map((inj, i) => (
             <div key={inj.id || i} style={{ background: "#FFF", border: `1px solid ${C.line}`, borderRadius: 12, padding: 10, marginBottom: 8 }}>
-              <input
-                style={{ ...S.input, marginBottom: 6 }} placeholder="Injury (e.g. Hip labral tear)"
-                value={inj.label || ""} onChange={(e) => updateInjury(i, { label: e.target.value })}
-              />
+              <select
+                style={{ ...S.input, marginBottom: 6 }}
+                value={INJURY_VOCABULARY[inj.id] ? inj.id : "__other__"}
+                onChange={(e) => setInjuryVocab(i, e.target.value)}
+              >
+                {Object.entries(INJURY_VOCABULARY).map(([id, label]) => (
+                  <option key={id} value={id}>{label}</option>
+                ))}
+                <option value="__other__">Other (not yet tagged in the library)</option>
+              </select>
+              {!INJURY_VOCABULARY[inj.id] && (
+                <input
+                  style={{ ...S.input, marginBottom: 6 }} placeholder="Describe the injury"
+                  value={inj.label || ""} onChange={(e) => updateInjury(i, { label: e.target.value })}
+                />
+              )}
               <div style={{ ...S.row, gap: 6 }}>
                 <select style={{ ...S.input, flex: 1 }} value={inj.side || ""} onChange={(e) => updateInjury(i, { side: e.target.value || null })}>
                   <option value="">No side</option>
@@ -2447,6 +2666,7 @@ function InjuryProfileCard({ data, persist }) {
    alternates are added. */
 function TaggingCoverageCard() {
   const gaps = exerciseTaggingGaps();
+  const conservative = conservativeDefaultExercises();
   const total = ALL_KNOWN.length;
   return (
     <div style={{ ...S.card, background: "#F7F7FA" }}>
@@ -2468,6 +2688,18 @@ function TaggingCoverageCard() {
               {ex.name}
             </div>
           ))}
+        </div>
+      )}
+      {conservative.length > 0 && (
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.line}` }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.orange }}>
+            {conservative.length} tagged on an unverified conservative default, not a fact
+          </div>
+          <div style={{ fontSize: 12, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
+            "Tagged" isn't the same as "verified" — these had no existing in-app or clinical
+            signal either way, so the more-restrictive value was used rather than a guess at safe:{" "}
+            {conservative.map((ex) => ex.name).join(", ")}.
+          </div>
         </div>
       )}
     </div>

@@ -45,6 +45,7 @@ const REVIEWED_READERS = [
   "painReportingGaps",
   "applyCoachGates",
   "askCoachLLM",
+  "unknownInjuryIds",
 ];
 
 // Always checked regardless of its parameter list — the actual parser entry
