@@ -861,12 +861,7 @@ function fitDayToTime(list, sessionMin) {
 }
 
 function dayFittedMinutes(day, data) {
-  const f = data.focus || DEFAULT_FOCUS;
-  const p = getProgram(data);
-  const list = [
-    ...day.exercises.map((s) => resolveSlot(s, data.swaps, f)),
-    ...bonusForDay(day, f, p),
-  ];
+  const list = resolveDayExercises(day, data).map((e) => e.ex);
   return fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60).minutes;
 }
 
@@ -967,14 +962,10 @@ function phaseInfo(data) {
 
 /* Live weekly-set tally per muscle group across the whole program + bonuses. */
 function weeklySetsByGroup(data) {
-  const focus = data.focus || DEFAULT_FOCUS;
   const program = getProgram(data);
   const t = {};
   program.forEach((day) => {
-    const list = [
-      ...day.exercises.map((slot) => resolveSlot(slot, data.swaps, focus)),
-      ...bonusForDay(day, focus, program),
-    ];
+    const list = resolveDayExercises(day, data).map((e) => e.ex);
     const fitted = fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60).list;
     fitted.forEach((ex) => {
       const g = CAT_TO_GROUP[ex.cat];
@@ -1424,6 +1415,37 @@ function resolveSlot(slot, swaps, focus) {
   base.baseSets = baseSets;
   base.focusBoost = focus ? (LEVEL_RANK[focus[CAT_TO_GROUP[base.cat]] ?? "normal"] >= 2) : false;
   return base;
+}
+
+/* Single source of truth for "what does this day actually contain right
+   now" — generator slots (through any active swap, focus-adjusted) plus
+   focus-driven bonus lifts. Every caller that needs a day's exercise list
+   (DayPage's render, the weekly volume tally, the time-budget estimate,
+   the focus-effect summary) goes through this one function so they can
+   never compute a different answer from one another — the exact gap that
+   let Gate 6's tally (weeklySetsByGroup) drift from what DayPage actually
+   renders once prescriptions entered the picture (Task 2 handoff note,
+   items 1-2 in DEFERRED-TESTS.md).
+   Returns {slot, ex} pairs: `slot` is what a swap picker needs (the
+   original program slot for a generator exercise, or the bonus exercise
+   object itself, since a bonus lift has no separate "slot" — see
+   bonusForDay) — `ex` is the resolved, focus-adjusted exercise to render
+   or count.
+   Deliberately excludes DayPicker.lastDone: that check only needs raw
+   generator-slot ids (not bonus lifts, not focus-adjusted sets) to answer
+   "have I touched this day's core lifts recently" — folding bonus lifts in
+   would silently widen what counts as "done", a behavior change this
+   function is not meant to make. Left as its own narrower one-liner.
+   No reconciliation with data.plan.prescriptions yet — that lands as its
+   own change on top of this (Task 2), once this consolidation is proven
+   behavior-neutral by scripts/check-day-resolution.js. */
+function resolveDayExercises(day, data) {
+  const focus = data.focus || DEFAULT_FOCUS;
+  const program = getProgram(data);
+  return [
+    ...day.exercises.map((s) => ({ slot: s, ex: resolveSlot(s, data.swaps, focus) })),
+    ...bonusForDay(day, focus, program).map((b) => ({ slot: b, ex: b })),
+  ];
 }
 
 /* Working weight = heaviest weight used in the most recent session of a lift */
@@ -2447,18 +2469,20 @@ function DayPicker({ data, onPick, persist }) {
 /* Summary of Focus effects on a given day: which muscles are emphasized here,
    how many sets were added vs base, and how many bonus lifts were injected. */
 function dayFocusSummary(day, data) {
-  const focus = data.focus || DEFAULT_FOCUS;
-  let added = 0, groups = new Set();
-  day.exercises.forEach((slot) => {
-    const ex = resolveSlot(slot, data.swaps, focus);
+  let added = 0, bonusCount = 0;
+  const groups = new Set();
+  resolveDayExercises(day, data).forEach(({ ex }) => {
     const g = CAT_TO_GROUP[ex.cat];
+    if (ex.isBonus) {
+      bonusCount++;
+      if (g) groups.add(MUSCLE_GROUPS[g]?.name);
+      return;
+    }
     const delta = (ex.sets || 0) - (ex.baseSets || ex.sets || 0);
     if (delta > 0 && g) { added += delta; groups.add(MUSCLE_GROUPS[g]?.name); }
     if (delta < 0 && g) { groups.add(MUSCLE_GROUPS[g]?.name); }
   });
-  const bonus = bonusForDay(day, focus, getProgram(data));
-  bonus.forEach((b) => { const g = CAT_TO_GROUP[b.cat]; if (g) groups.add(MUSCLE_GROUPS[g]?.name); });
-  return { added, bonusCount: bonus.length, groups: [...groups] };
+  return { added, bonusCount, groups: [...groups] };
 }
 
 function DayPage({ day, data, persist, onBack }) {
@@ -2482,12 +2506,7 @@ function DayPage({ day, data, persist, onBack }) {
       </header>
 
       {(() => {
-        const focusObj = data.focus || DEFAULT_FOCUS;
-        const program = getProgram(data);
-        const entries = [
-          ...day.exercises.map((s) => ({ slot: s, ex: resolveSlot(s, data.swaps, focusObj) })),
-          ...bonusForDay(day, focusObj, program).map((b) => ({ slot: b, ex: b })),
-        ];
+        const entries = resolveDayExercises(day, data);
         const isDeload = deloadActive(data);
         const pool = entries.map((e) => isDeload
           ? { ...e.ex, sets: Math.max(isCompound(e.ex) ? 2 : 1, Math.round(e.ex.sets * 0.6)) }
