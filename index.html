@@ -1384,6 +1384,328 @@ function trendPct(series) {
   return { pct: ((last - first) / first) * 100, weeks: recent.length - 1 };
 }
 
+/* ===== Safety gates 1-8 (Task 4) =====
+   Every gate is a pure function over (prescription, ctx) — a gate has no
+   idea whether its prescription arrived via Task 2's `prescriptions` array
+   or Task 6's `days` array; if a gate needed to know its caller, the
+   boundary would be wrong. Gate 2 takes no bypass parameter anywhere,
+   ever, and is reused verbatim as Gate 9 once Task 6 exists.
+
+   Per-prescription gate contract:
+     { reject: false }                     — passes unchanged
+     { reject: false, value, note }        — passes, prescription modified
+                                              (load/etc.), reason surfaced
+     { reject: true, gate, reason }        — whole prescription dropped
+
+   ctx = { injuryProfile, sessions, weeklyGroupSets, weeklyGroupSetCaps,
+           sessionMin, deloadActive, escalatingCats }
+   Gates 6-8 are inherently multi-prescription concerns (a volume cap, a
+   session-length trim, and a deload override all only make sense across
+   the whole accepted set) and are applied in applyGatedPrescriptions,
+   not as isolated per-item gates like 1-5. */
+
+const SQUAT_DEPTH_ORDER = ["above_parallel", "parallel", "below_parallel"];
+const HINGE_ROM_ORDER = ["mid_shin", "below_knee", "floor"];
+/* Ordinal comparison for the two romProfile dimensions
+   movementConstraints.limited currently constrains. Returns false (does
+   not exceed) for values on no recognized scale — an exercise's romProfile
+   simply not carrying a given key means that dimension doesn't apply to
+   its mechanics (e.g. leg press has no squatDepth — it isn't on the
+   free-squat depth scale at all), which is a Task 1 tagging decision, not
+   this gate's to relitigate. */
+function exceedsDepthLimit(value, maxValue) {
+  for (const order of [SQUAT_DEPTH_ORDER, HINGE_ROM_ORDER]) {
+    const vi = order.indexOf(value), mi = order.indexOf(maxValue);
+    if (vi !== -1 && mi !== -1) return vi > mi;
+  }
+  return false;
+}
+
+/* Gate 1 — unknown exerciseId. */
+function gate1UnknownId(prescription) {
+  if (!EX_BY_ID[prescription.exerciseId]) {
+    return { reject: true, gate: 1, reason: `Unknown exercise id "${prescription.exerciseId}" — not in the library.` };
+  }
+  return { reject: false };
+}
+
+/* Gate 2 — the injury gate. Not overridable by a pasted plan under any
+   circumstance: no bypass flag, no confirmation dialog, and — structurally
+   — no parameter through which one could even be threaded. injuryProfile
+   is destructured directly in the signature (not read off an opaque ctx
+   blob) so this function stays visible to
+   scripts/check-write-isolation.js's discovery scan, per Task 1's stated
+   convention. */
+function gate2Injury(prescription, { injuryProfile }) {
+  if (!injuryProfile || !injuryProfile.recoveringMode) return { reject: false };
+  const ex = EX_BY_ID[prescription.exerciseId];
+  if (!ex) return { reject: false }; // Gate 1 already reports unknown ids
+  if (!isExerciseTagged(ex)) {
+    return { reject: true, gate: 2, reason: `"${ex.name}" is untagged — denied by default while recovering (untagged means unknown, and unknown near this injury means no).` };
+  }
+  const mc = injuryProfile.movementConstraints || DEFAULT_INJURY_PROFILE.movementConstraints;
+  const forbiddenHit = ex.attributes.find((a) => (mc.forbidden || []).includes(a));
+  if (forbiddenHit) {
+    return { reject: true, gate: 2, reason: `"${ex.name}" carries attribute "${forbiddenHit}", which is forbidden while recovering.` };
+  }
+  for (const lim of (mc.limited || [])) {
+    const key = lim.attribute === "squat_depth" ? "squatDepth" : lim.attribute === "hinge_rom" ? "hingeRom" : lim.attribute;
+    const value = ex.romProfile && ex.romProfile[key];
+    if (value != null && exceedsDepthLimit(value, lim.maxValue)) {
+      return { reject: true, gate: 2, reason: `"${ex.name}"'s ${lim.attribute} (${value}) exceeds the ${lim.maxValue} limit while recovering.` };
+    }
+  }
+  // Not in the spec's own illustrative gate-logic pseudocode (which only
+  // shows the attributes/romProfile checks) — but the exercise schema
+  // explicitly carries a `contraindications` field, Task 1's own worked
+  // example populates it, and the goblet/boxsquat split depends entirely
+  // on it being enforced (not just documentation). Without this check,
+  // every contraindications tag from Task 1 (bbrow, trapdl, goblet) is
+  // inert data. Only an active (non-resolved) injury counts.
+  const activeInjuryIds = new Set((injuryProfile.injuries || []).filter((inj) => inj.status !== "resolved").map((inj) => inj.id));
+  const ciHit = (ex.contraindications || []).find((id) => activeInjuryIds.has(id));
+  if (ciHit) {
+    const label = (INJURY_VOCABULARY && INJURY_VOCABULARY[ciHit]) || ciHit;
+    return { reject: true, gate: 2, reason: `"${ex.name}" is contraindicated for ${label}, which is active while recovering.` };
+  }
+  return { reject: false };
+}
+
+/* Gate 3 — load sanity. Falls back to recommend()'s own safe-load
+   computation rather than duplicating that logic — recommend() already IS
+   "what's the safe load for this lift given its logged history." */
+/* recommend() reads ex.repMin/ex.repMax to judge rep-range performance
+   (belowMin/allTop) — those only exist on a slot()-merged exercise object,
+   never on the bare EX_BY_ID entry a gate looks up by exerciseId. Calling
+   recommend() with the bare entry silently breaks that logic (repMin/
+   repMax undefined -> every rep-range comparison is false). Merge the
+   prescription's own target rep range in first, the same way Insights and
+   ExerciseCard already do before calling recommend() elsewhere. */
+function exerciseForRecommend(ex, prescription) {
+  return { ...ex, repMin: prescription.repMin ?? ex.repMin, repMax: prescription.repMax ?? ex.repMax };
+}
+
+function gate3LoadSanity(prescription, ctx) {
+  if (prescription.load == null) return { reject: false }; // omitted => recommend() drives it, nothing to sanity-check
+  const ex = EX_BY_ID[prescription.exerciseId];
+  if (!ex) return { reject: false };
+  if (ctx.escalatingCats && ctx.escalatingCats.has(ex.cat)) {
+    return { reject: false, note: `Auto-adjustment suppressed for "${ex.name}" — escalating pain pattern on this movement (see Gate 5). Consult your treating clinician.` };
+  }
+  const lastW = lastWorkingWeight(ctx.sessions, prescription.exerciseId);
+  if (lastW == null) return { reject: false }; // no logged history to sanity-check against yet
+  const ceiling = lastW * 1.15;
+  if (prescription.load > ceiling) {
+    const rec = recommend(exerciseForRecommend(ex, prescription), ctx.sessions, ctx.deloadActive);
+    return {
+      reject: false,
+      value: { ...prescription, load: rec.weight, loadUnverified: true },
+      note: `"${ex.name}" prescribed at ${prescription.load} lb is more than 15% above your last logged ${lastW} lb — falling back to ${rec.weight} lb.`,
+    };
+  }
+  return { reject: false };
+}
+
+/* Gate 4 — pain rule. injuryProfile destructured directly in the
+   signature for the same check-write-isolation.js visibility reason as
+   Gate 2 — ...ctx recovers the rest (sessions, escalatingCats, deloadActive). */
+function gate4PainRule(prescription, { injuryProfile, ...ctx }) {
+  const ex = EX_BY_ID[prescription.exerciseId];
+  if (!ex) return { reject: false };
+  if (ctx.escalatingCats && ctx.escalatingCats.has(ex.cat)) {
+    return { reject: false, note: `Auto-adjustment suppressed for "${ex.name}" — escalating pain pattern on this movement (see Gate 5). Consult your treating clinician.` };
+  }
+  const last = lastSessionFor(ctx.sessions, prescription.exerciseId);
+  if (!last) return { reject: false };
+  // "during OR within 24h after" — both live on the same session row.
+  // Neither being set means unknown, not zero; Math.max with a -1 floor
+  // keeps an unanswered field from masquerading as "no pain reported."
+  const painValue = Math.max(last.pain ?? -1, last.painRetro ?? -1);
+  const rule = (injuryProfile && injuryProfile.movementConstraints && injuryProfile.movementConstraints.painRule) || DEFAULT_INJURY_PROFILE.movementConstraints.painRule;
+  if (painValue > rule.threshold) {
+    const baseline = prescription.load ?? recommend(exerciseForRecommend(ex, prescription), ctx.sessions, ctx.deloadActive).weight;
+    const reduced = round5(baseline * (1 - rule.value / 100));
+    return {
+      reject: false,
+      value: { ...prescription, load: reduced, painRuleApplied: true },
+      note: `"${ex.name}" logged pain ${painValue}/10 last session (over the ${rule.threshold}/10 threshold) — load forced to ${reduced} lb (${rule.value}% reduction), regardless of the prescription.`,
+    };
+  }
+  return { reject: false };
+}
+
+/* Gate 5 — pain escalation. This doesn't reject the prescription (the
+   movement can still be trained) — it flags the pattern as escalating so
+   Gates 3/4 stop auto-adjusting it (checked via ctx.escalatingCats, built
+   once per batch by isPainEscalating below) and surfaces a persistent
+   clinician-consult prompt (PainEscalationNotice). The app enforces
+   rules; it does not assess whether an injury is worsening — that
+   assessment is the clinician's, this just stops pretending an algorithm
+   should keep auto-correcting through it. */
+function gate5PainEscalation(prescription, ctx) {
+  const ex = EX_BY_ID[prescription.exerciseId];
+  if (!ex || !ctx.escalatingCats || !ctx.escalatingCats.has(ex.cat)) return { reject: false };
+  return {
+    reject: false,
+    note: `Pain escalation detected on the ${CAT_NAMES[ex.cat] || ex.cat} pattern — see the persistent clinician-consult prompt.`,
+  };
+}
+
+/* Escalation check backing Gate 5: pain >3/10 in >=2 of the last 4 logged
+   sessions for a movement pattern (grouped by `cat`, the same grouping the
+   swap picker already uses), OR baseline pain trending upward across that
+   window. The spec doesn't define "trending upward" precisely — this is a
+   stated, not the only defensible, definition: among the ANSWERED
+   (non-null, non-dismissed) pain values in the 4-session window, at least
+   3 must exist (fewer is noise, not a trend), and the most recent must be
+   >=2 points above the oldest. Dismissed/pending entries are excluded
+   entirely, never treated as 0 — see findAllPendingPainRetros. */
+function isPainEscalating(sessions, cat) {
+  const hist = (sessions || [])
+    .filter((s) => (EX_BY_ID[s.exerciseId] || {}).cat === cat)
+    .sort((a, b) => (a.date < b.date ? 1 : -1))
+    .slice(0, 4);
+  const painOf = (s) => { const v = Math.max(s.pain ?? -1, s.painRetro ?? -1); return v >= 0 ? v : null; };
+  const answered = hist.map(painOf).filter((v) => v != null);
+  if (hist.length >= 4 && answered.filter((v) => v > 3).length >= 2) return true;
+  if (answered.length >= 3 && answered[0] - answered[answered.length - 1] >= 2) return true;
+  return false;
+}
+
+/* Gate 7 — duration. Trims the lowest-priority sets first (mirrors
+   fitDayToTime's own heuristic: protect compounds, drop non-compound
+   isolation work last) rather than rejecting the whole plan. Task 2 is
+   what makes trimPriority itself configurable via sessionRules — this is
+   the same sane built-in default fitDayToTime already uses, applied to a
+   flat prescriptions list instead of a day's exercise list. */
+function gate7DurationTrim(prescriptions, sessionMin) {
+  const budget = Math.max(20, (sessionMin || 60) - 8) * 60;
+  const items = prescriptions.map((p) => ({ ...p, sets: p.sets || 3 }));
+  const exOf = (p) => EX_BY_ID[p.exerciseId];
+  const dur = (p) => p.sets * (40 + restFor(exOf(p)).sec);
+  const total = () => items.reduce((a, p) => a + dur(p), 0);
+  const minSets = (p) => (isCompound(exOf(p)) ? 2 : 1);
+  let trimmedCount = 0;
+  const dropped = [];
+  let guard = 200;
+  while (total() > budget && guard-- > 0) {
+    const cands = items.filter((p) => p.sets > minSets(p));
+    if (cands.length) {
+      cands.sort((a, b) => (isCompound(exOf(a)) ? 1 : 0) - (isCompound(exOf(b)) ? 1 : 0) || items.indexOf(b) - items.indexOf(a));
+      cands[0].sets -= 1;
+      trimmedCount++;
+      continue;
+    }
+    let idx = -1;
+    for (let i = items.length - 1; i >= 0; i--) { if (!isCompound(exOf(items[i]))) { idx = i; break; } }
+    if (idx === -1) break;
+    dropped.push((exOf(items[idx]) || {}).name || items[idx].exerciseId);
+    items.splice(idx, 1);
+  }
+  return { list: items, trimmedCount, dropped };
+}
+
+/* Gate 8 — deload overrides all prescriptions, unconditionally: ~60% sets
+   (never below the same per-movement floor fitDayToTime uses), ~90% load.
+   Matches the existing deload conventions in DayPage/recommend() rather
+   than inventing a second deload scaling rule. */
+function gate8DeloadOverride(prescription) {
+  const ex = EX_BY_ID[prescription.exerciseId];
+  const baseSets = prescription.sets || 3;
+  const deloadSets = Math.max(isCompound(ex) ? 2 : 1, Math.round(baseSets * 0.6));
+  const patch = { ...prescription, sets: deloadSets, deloadApplied: true };
+  if (prescription.load != null) patch.load = round5(prescription.load * 0.9);
+  return patch;
+}
+
+/* Runs gates 1-5 for a single prescription in order; short-circuits on the
+   first outright rejection (1 or 2 — 3/4/5 only ever modify-and-continue,
+   never reject outright, so there's nothing to short-circuit past them). */
+function runPrescriptionGates(prescription, ctx) {
+  const g1 = gate1UnknownId(prescription);
+  if (g1.reject) return { accepted: false, gate: g1.gate, reason: g1.reason };
+
+  const g2 = gate2Injury(prescription, ctx);
+  if (g2.reject) return { accepted: false, gate: g2.gate, reason: g2.reason };
+
+  let value = prescription;
+  const notes = [];
+
+  const g3 = gate3LoadSanity(value, ctx);
+  if (g3.value) value = g3.value;
+  if (g3.note) notes.push({ gate: 3, note: g3.note });
+
+  const g4 = gate4PainRule(value, ctx);
+  if (g4.value) value = g4.value;
+  if (g4.note) notes.push({ gate: 4, note: g4.note });
+
+  const g5 = gate5PainEscalation(value, ctx);
+  if (g5.note) notes.push({ gate: 5, note: g5.note });
+
+  return { accepted: true, value, notes };
+}
+
+/* Batch entry point: gates 1-5 per prescription, then 6 (volume, needs a
+   running tally across the batch), then 7 (duration, needs the whole
+   survivor set), then 8 (deload, overrides everything that's left). This
+   is the one place that knows about a LIST of prescriptions — the gates
+   themselves stay single-item and caller-agnostic. */
+function applyGatedPrescriptions(prescriptions, ctx) {
+  const rejections = [];
+  const notes = [];
+  const runningGroupSets = { ...(ctx.weeklyGroupSets || {}) };
+  const survivors = [];
+
+  prescriptions.forEach((p) => {
+    const result = runPrescriptionGates(p, ctx);
+    if (!result.accepted) {
+      rejections.push({ exerciseId: p.exerciseId, gate: result.gate, reason: result.reason });
+      return;
+    }
+    const ex = EX_BY_ID[result.value.exerciseId];
+    const group = CAT_TO_GROUP[ex.cat];
+    const addedSets = result.value.sets || 3;
+    const current = (group && runningGroupSets[group]) || 0;
+    const cap = group ? ((ctx.weeklyGroupSetCaps && ctx.weeklyGroupSetCaps[group]) ?? (MUSCLE_GROUPS[group] && MUSCLE_GROUPS[group].mav)) : null;
+    if (group && cap != null && current + addedSets > cap) {
+      rejections.push({
+        exerciseId: result.value.exerciseId, gate: 6,
+        reason: `"${ex.name}" would push ${(MUSCLE_GROUPS[group] || {}).name || group} to ${current + addedSets} weekly sets, above the ${cap}-set cap.`,
+      });
+      return;
+    }
+    if (group) runningGroupSets[group] = current + addedSets;
+    (result.notes || []).forEach((n) => notes.push({ exerciseId: result.value.exerciseId, ...n }));
+    survivors.push(result.value);
+  });
+
+  const trimmed = gate7DurationTrim(survivors, ctx.sessionMin);
+  if (trimmed.trimmedCount > 0 || trimmed.dropped.length > 0) {
+    notes.push({ gate: 7, note: `Fitted to your ${ctx.sessionMin || 60}-minute session: trimmed ${trimmed.trimmedCount} set${trimmed.trimmedCount !== 1 ? "s" : ""}${trimmed.dropped.length ? `, dropped ${trimmed.dropped.join(", ")}` : ""}.` });
+  }
+
+  const final = ctx.deloadActive ? trimmed.list.map(gate8DeloadOverride) : trimmed.list;
+  if (ctx.deloadActive) notes.push({ gate: 8, note: "Deload week active — sets and loads overridden regardless of the prescription." });
+
+  return { accepted: final, rejections, notes };
+}
+
+/* Assembles the read-only ctx every gate above operates over. Not itself
+   gate logic — just packaging — so it isn't in
+   scripts/check-write-isolation.js's discovery scan; nothing here decides
+   accept/reject. */
+function buildGateContext(data, plan) {
+  return {
+    injuryProfile: deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE),
+    sessions: data.sessions || [],
+    weeklyGroupSets: weeklySetsByGroup(data),
+    weeklyGroupSetCaps: (plan && plan.sessionRules && plan.sessionRules.weeklyGroupSetCaps) || {},
+    sessionMin: (plan && plan.sessionMin) || (data.plan && data.plan.sessionMin) || 60,
+    deloadActive: deloadActive(data),
+    escalatingCats: new Set(Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat))),
+  };
+}
+
 
 /* Rest recommendations: heavier compounds recover better with 2–3 min
    (rest-interval literature favors >=2 min for hypertrophy on big lifts);
@@ -1722,6 +2044,7 @@ function WorkoutFlow({ data, persist }) {
       <InjuryMigrationNotice data={data} persist={persist} />
       <GobletBoxSquatMigrationPrompt data={data} persist={persist} />
       <PendingPainRetroPrompts data={data} persist={persist} />
+      <PainEscalationNotice data={data} />
       {!injuryProfile.clinicianReviewed && <ClinicianReviewNotice />}
       {!day
         ? <DayPicker data={data} onPick={setDayId} persist={persist} />
@@ -2461,6 +2784,25 @@ function ClinicianReviewNotice({ compact }) {
   );
 }
 
+/* Gate 5's persistent clinician-consult prompt. Non-dismissable by design —
+   the spec is explicit that the app enforces rules, it does not assess
+   whether an injury is worsening, so this doesn't go away until the
+   underlying pattern (isPainEscalating) actually stops matching. */
+function PainEscalationNotice({ data }) {
+  const cats = Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat));
+  if (cats.length === 0) return null;
+  return (
+    <div style={{ ...S.card, background: "#FDECEC", display: "flex", gap: 10, alignItems: "flex-start" }}>
+      <Flame size={18} color={C.red} style={{ marginTop: 1, flexShrink: 0 }} />
+      <div style={{ fontSize: 12.5, color: "#3A3A3C", lineHeight: 1.45 }}>
+        <b style={{ color: C.red }}>Consult your treating clinician:</b> pain above 3/10 has recurred on the{" "}
+        {cats.map((c) => CAT_NAMES[c] || c).join(", ")} pattern. Auto-adjustment is suppressed for these movements —
+        this app enforces load/volume rules, it does not assess whether an injury is worsening.
+      </div>
+    </div>
+  );
+}
+
 /* The only place injuryProfile is ever written. `save` is a plain closure
    variable, never assigned to a module-level binding — the plan parser and
    gate pipeline (extractPlanJson, applyCoachGates, and Task 4's gate runner)
@@ -3093,11 +3435,21 @@ function coachMetrics(data) {
   };
 }
 
-function applyCoachGates(rec, metrics, injuryProfile) {
+function applyCoachGates(rec, metrics, injuryProfile, data) {
   // Frozen at the parser/gate path boundary — see deepFreeze. This is the
   // actual entry point a pasted plan's data flows through today.
   injuryProfile = deepFreeze(injuryProfile || DEFAULT_INJURY_PROFILE);
   const gated = { ...rec, gates: [] };
+  // `rec` is arbitrary parsed JSON from a pasted LLM reply — the blind
+  // spread above would otherwise carry through ANY key it contains,
+  // including one named injuryProfile. Nothing downstream currently pulls
+  // gated.injuryProfile back out into `data` (persist() calls pick fields
+  // off `gated` individually), so this was not exploitable today — but
+  // that safety was accidental, not structural, and a future persist()
+  // that spread ...gated directly would have smuggled it straight through.
+  // Delete it explicitly so "the parser has no write path to injuryProfile"
+  // holds regardless of how downstream code evolves.
+  delete gated.injuryProfile;
   // Job (b) only — specialization timing. Job (a), movement safety, is Gate 2
   // (Task 4) and reads injuryProfile.recoveringMode directly; it is never
   // folded into this override, and this override never touches recoveringMode.
@@ -3115,6 +3467,18 @@ function applyCoachGates(rec, metrics, injuryProfile) {
   const cd = Number(gated.calorieDelta) || 0;
   gated.calorieDelta = Math.max(-300, Math.min(300, cd));
   if (![45, 60, 75].includes(gated.sessionMin)) gated.sessionMin = (metrics.currentPlan && metrics.currentPlan.sessionMin) || 60;
+
+  // Task 2's per-exercise `prescriptions` array, gated through Gates 1-8.
+  // Optional and backward compatible — a legacy four-field plan block has
+  // no `prescriptions` key at all, so this is skipped entirely and the
+  // four-field path above applies exactly as it always has.
+  if (Array.isArray(rec.prescriptions) && rec.prescriptions.length && data) {
+    const ctx = buildGateContext(data, gated);
+    const result = applyGatedPrescriptions(rec.prescriptions, ctx);
+    gated.prescriptions = result.accepted;
+    gated.prescriptionRejections = result.rejections;
+    gated.prescriptionNotes = result.notes;
+  }
   return gated;
 }
 
@@ -3213,14 +3577,24 @@ function CoachCard({ data, persist }) {
     try {
       const raw = extractPlanJson(pasted);
       const metrics = coachMetrics(data);
-      const gated = applyCoachGates(raw, metrics, injuryProfile);
+      const gated = applyCoachGates(raw, metrics, injuryProfile, data);
       setResult({ ...gated, assessment: gated.assessment || "Plan applied from pasted Claude reply.", pushback: gated.pushback || [], nutritionNote: gated.nutritionNote || "See Claude's reply for the reasoning.", nextCheckIn: gated.nextCheckIn || "Re-run a check-in in 2\u20134 weeks with fresh logs." });
       persist({
         ...data,
         goalProfile: currentProfile(),
-        plan: { ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: todayISO() },
+        plan: {
+          ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: todayISO(),
+          // Gated, accepted prescriptions are stored as-is \u2014 merging them
+          // into what the generator actually renders per day is Task 2's
+          // wiring, not this gate pipeline's job.
+          prescriptions: gated.prescriptions || undefined,
+        },
         focus: gated.focus,
-        coachNote: { assessment: "Applied from pasted Claude plan.", gates: gated.gates, calorieDelta: gated.calorieDelta, at: new Date().toISOString() },
+        coachNote: {
+          assessment: "Applied from pasted Claude plan.", gates: gated.gates, calorieDelta: gated.calorieDelta,
+          prescriptionRejections: gated.prescriptionRejections || [], prescriptionNotes: gated.prescriptionNotes || [],
+          at: new Date().toISOString(),
+        },
       });
       setApplied(true);
       setPasted("");
@@ -3241,7 +3615,7 @@ function CoachCard({ data, persist }) {
       const profile = { text: goalText.trim(), updatedAt: new Date().toISOString() };
       const metrics = coachMetrics(data);
       const raw = await askCoachLLM(key, metrics, profile, injuryProfile);
-      const gated = applyCoachGates(raw, metrics, injuryProfile);
+      const gated = applyCoachGates(raw, metrics, injuryProfile, data);
       setResult(gated);
       // save the goal profile immediately (plan applies only on user confirmation)
       persist({ ...data, goalProfile: profile });
@@ -3345,6 +3719,24 @@ function CoachCard({ data, persist }) {
               <div style={{ fontWeight: 700, fontSize: 13, color: C.orange }}>Safety gate applied</div>
               {result.gates.map((g, i) => (
                 <div key={i} style={{ fontSize: 13, color: "#3A3A3C", marginTop: 4, lineHeight: 1.5 }}>{g}</div>
+              ))}
+            </div>
+          )}
+          {result.prescriptionRejections && result.prescriptionRejections.length > 0 && (
+            <div style={{ background: "#FDECEC", borderRadius: 12, padding: 12, marginBottom: 10 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, color: C.red }}>Prescriptions rejected</div>
+              {result.prescriptionRejections.map((r, i) => (
+                <div key={i} style={{ fontSize: 13, color: "#3A3A3C", marginTop: 4, lineHeight: 1.5 }}>
+                  Gate {r.gate} — {r.reason}
+                </div>
+              ))}
+            </div>
+          )}
+          {result.prescriptionNotes && result.prescriptionNotes.length > 0 && (
+            <div style={{ background: "#FFF7EC", borderRadius: 12, padding: 12, marginBottom: 10 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, color: C.orange }}>Prescriptions adjusted</div>
+              {result.prescriptionNotes.map((n, i) => (
+                <div key={i} style={{ fontSize: 13, color: "#3A3A3C", marginTop: 4, lineHeight: 1.5 }}>{n.note}</div>
               ))}
             </div>
           )}

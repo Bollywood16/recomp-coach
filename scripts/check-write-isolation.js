@@ -46,6 +46,8 @@ const REVIEWED_READERS = [
   "applyCoachGates",
   "askCoachLLM",
   "unknownInjuryIds",
+  "gate2Injury",
+  "gate4PainRule",
 ];
 
 // Always checked regardless of its parameter list — the actual parser entry
@@ -145,6 +147,20 @@ REVIEWED_READERS.forEach((name) => {
     failures.push(`${name} references injuryProfile as a write target — the parser/gate path must be read-only.`);
   }
 });
+
+// 5. applyCoachGates spreads `rec` — arbitrary parsed JSON from a pasted
+// LLM reply — into `gated`. That blind spread would otherwise carry
+// through a key named injuryProfile if one were present in the parsed
+// JSON; nothing downstream happening to not read it back out is an
+// accident of the current persist() call shapes, not a guarantee. Assert
+// the explicit scrub is still there rather than trusting that accident to
+// hold forever.
+{
+  const fn = extractFunctionBody("applyCoachGates");
+  if (fn && !/delete\s+gated\.injuryProfile/.test(fn.body)) {
+    failures.push("applyCoachGates no longer scrubs gated.injuryProfile after spreading `rec` — a pasted plan's parsed JSON could carry an injuryProfile key straight through if a future persist() call ever spreads ...gated directly.");
+  }
+}
 
 if (failures.length) {
   console.error("WRITE-ISOLATION CHECK FAILED:\n" + failures.map((f) => " - " + f).join("\n"));
