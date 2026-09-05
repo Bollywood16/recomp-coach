@@ -3821,7 +3821,58 @@ function coachMetrics(data) {
 // versioning) is dropped and reported as an ignored field, never silently
 // carried through on the chance nothing downstream reads it back out.
 // check-write-isolation.js asserts injuryProfile is never in this list.
-const KNOWN_PLAN_KEYS = ["template", "focus", "sessionMin", "calorieDelta", "prescriptions", "pushback", "assessment", "nutritionNote", "nextCheckIn"];
+const KNOWN_PLAN_KEYS = ["template", "focus", "sessionMin", "calorieDelta", "prescriptions", "sessionRules", "pushback", "assessment", "nutritionNote", "nextCheckIn"];
+
+/* sessionRules persists differently from prescriptions on purpose
+ * (TASK-2-RECONCILIATION-PROPOSAL.txt, condition C). A `prescriptions`
+ * array is a full snapshot each paste — wholesale replacement is correct.
+ * weeklyGroupSetCaps is a standing, safety-adjacent limit, not a
+ * per-paste instruction: a lightweight checkin-tier paste has no reason
+ * to restate caps it isn't touching, and silently reverting a
+ * previously-tightened cap just because this paste omitted sessionRules
+ * would be actively bad. So: merge, not replace. A key present in the new
+ * paste always wins (the model can still loosen/tighten anything); a key
+ * absent falls through to whatever was already stored. weeklyGroupSetCaps
+ * merges per-group specifically — a new cap for "shoulders" must not
+ * erase an existing cap for "legs". Explicitly clearing a cap back to "no
+ * cap" isn't supported by this shape; no test case calls for it, and it's
+ * addable later without disturbing this. */
+function mergeSessionRules(existing, incoming) {
+  if (!incoming) return existing || undefined;
+  const merged = { ...(existing || {}) };
+  ["maxSetsPerMovement", "orderByFocus", "trimPriority"].forEach((k) => {
+    if (incoming[k] !== undefined) merged[k] = incoming[k];
+  });
+  if (incoming.weeklyGroupSetCaps) {
+    merged.weeklyGroupSetCaps = { ...((existing && existing.weeklyGroupSetCaps) || {}), ...incoming.weeklyGroupSetCaps };
+  }
+  return merged;
+}
+
+/* The "loud, not a line item" half of condition C: since omission causes
+ * no change under merge semantics, there's nothing to announce on
+ * omission — what's loud instead is an explicit note whenever a merge
+ * actually changes a stored value, surfaced the same way every other
+ * coach-gate note is (gated.gates, rendered in the apply-result UI). */
+function describeSessionRulesChange(oldRules, newRules) {
+  const notes = [];
+  const oldCaps = (oldRules && oldRules.weeklyGroupSetCaps) || {};
+  const newCaps = (newRules && newRules.weeklyGroupSetCaps) || {};
+  Object.keys(newCaps).forEach((g) => {
+    if (oldCaps[g] !== newCaps[g]) {
+      const name = (MUSCLE_GROUPS[g] && MUSCLE_GROUPS[g].name) || g;
+      notes.push(`${name} weekly cap ${oldCaps[g] != null ? oldCaps[g] : "default"} → ${newCaps[g]}`);
+    }
+  });
+  ["maxSetsPerMovement", "trimPriority", "orderByFocus"].forEach((k) => {
+    const ov = oldRules && oldRules[k];
+    const nv = newRules && newRules[k];
+    if (nv !== undefined && JSON.stringify(ov) !== JSON.stringify(nv)) {
+      notes.push(`${k}: ${JSON.stringify(ov ?? "default")} → ${JSON.stringify(nv)}`);
+    }
+  });
+  return notes;
+}
 
 function applyCoachGates(rec, metrics, injuryProfile, data) {
   // Frozen at the parser/gate path boundary — see deepFreeze. This is the
@@ -3850,6 +3901,18 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
   const cd = Number(gated.calorieDelta) || 0;
   gated.calorieDelta = Math.max(-300, Math.min(300, cd));
   if (![45, 60, 75].includes(gated.sessionMin)) gated.sessionMin = (metrics.currentPlan && metrics.currentPlan.sessionMin) || 60;
+
+  // sessionRules: merge onto whatever was already stored (see
+  // mergeSessionRules above for why this isn't a wholesale replace like
+  // prescriptions is), BEFORE the prescription gates below run — Gate 6
+  // needs the final merged weeklyGroupSetCaps, not just this paste's own.
+  const priorSessionRules = data && data.plan && data.plan.sessionRules;
+  const mergedSessionRules = mergeSessionRules(priorSessionRules, rec.sessionRules);
+  if (rec.sessionRules) {
+    const changes = describeSessionRulesChange(priorSessionRules, mergedSessionRules);
+    if (changes.length) gated.gates.push(`Session rules updated: ${changes.join("; ")}.`);
+  }
+  gated.sessionRules = mergedSessionRules;
 
   // Task 2's per-exercise `prescriptions` array, gated through Gates 1-8.
   // Optional and backward compatible — a legacy four-field plan block has
@@ -3981,6 +4044,12 @@ function CoachCard({ data, persist }) {
           // into what the generator actually renders per day is Task 2's
           // wiring, not this gate pipeline's job.
           prescriptions: gated.prescriptions || undefined,
+          // Already merged with whatever was stored before (applyCoachGates
+          // / mergeSessionRules) \u2014 wholesale-assigning gated.sessionRules
+          // here is correct, not a contradiction of the merge-not-replace
+          // design: gated.sessionRules IS the merge result, carried forward
+          // unchanged when this paste didn't touch it at all.
+          sessionRules: gated.sessionRules || undefined,
         },
         focus: gated.focus,
         coachNote: {

@@ -368,11 +368,49 @@ COMMIT 1 — shared resolver refactor (DONE)
   the CDN-loaded Babel standalone exactly as before.
 
 ================================================================================
+COMMIT 2 — sessionRules wiring (DONE)
+================================================================================
+- sessionRules added to KNOWN_PLAN_KEYS (was silently dropped as an
+  "ignored field" before this — every cap in this build had been inert
+  since Task 4, per the user's own note on how that gap was introduced).
+- New mergeSessionRules(existing, incoming) and describeSessionRulesChange
+  (existing, incoming), both next to KNOWN_PLAN_KEYS. Merge semantics per
+  condition C: top-level keys (maxSetsPerMovement/orderByFocus/
+  trimPriority) overwrite when present in the incoming paste; absent
+  falls through to what was stored. weeklyGroupSetCaps merges per-group
+  specifically — a new cap for one group never erases an existing cap for
+  another.
+  applyCoachGates now merges onto data.plan.sessionRules BEFORE the
+  prescription-gating block runs (buildGateContext(data, gated) needs the
+  final merged caps, not just this paste's own), and always sets
+  gated.sessionRules to the merge result — carried forward unchanged, not
+  left undefined, when this paste didn't touch it at all — so applyPasted's
+  persist call (`plan: {..., sessionRules: gated.sessionRules}`) can never
+  clobber a stored value with undefined by omission.
+- A merge that actually changes a stored value pushes a specific note onto
+  gated.gates ("Session rules updated: Shoulders weekly cap default → 24."
+  style), rendered through the same "Safety gate applied" UI every other
+  coach-gate note already uses. A no-op (omitted, or re-pasting an
+  identical value) produces no note — the "loud on change, silent on
+  no-op" resolution to condition C.
+- New scripts/check-session-rules.js (wired into npm test): 15 assertions
+  — ignored-field regression gone, omission-carries-forward with no note,
+  per-group merge (one group's new cap doesn't erase another's), explicit
+  re-specification overwrites, changed values produce a named note,
+  identical re-pastes produce none, plus direct unit coverage on the two
+  new helpers.
+- Live headless-browser check: seeded an existing {legs: 18,
+  maxSetsPerMovement: 4} via localStorage, pasted a plan whose sessionRules
+  only mentioned shoulders, applied it — UI showed exactly "Session rules
+  updated: Shoulders weekly cap default → 24.", and the stored plan ended
+  up with legs, maxSetsPerMovement, AND the new shoulders cap all present
+  together. Zero console errors.
+- npm test: all three scripts pass (write-isolation, day-resolution,
+  session-rules).
+
+================================================================================
 NEXT
 ================================================================================
-Commit 2: sessionRules wiring (KNOWN_PLAN_KEYS, storage with merge
-semantics per condition C, buildGateContext reads from
-data.plan.sessionRules on every call, not just the in-flight one).
 Commit 3: reconciliation itself — REPLACE/ADD semantics, gate-side tally
 subtraction, dayKey required + rejection gate, within-batch collision
 rejection (array order, named in the message), Q1's ambiguous-match
