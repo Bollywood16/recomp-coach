@@ -1,3 +1,54 @@
+# Handoff note (end of 2026-09-05 session)
+
+**Done:** Tasks 0 (injuryProfile as protected, structured data), 1
+(exercise attribute tagging, 75/75 coverage), 4 (safety gates 1-8), 5
+(coach brief export — tiered checkin/full payload, checkin-scope
+enforcement, uncapped injury/pain data). All signed off, all committed on
+`task-0-injury-profile`. Review files in the repo root (`TASK-N-*.txt`)
+are the detailed record per task; this note is just the pointer.
+
+**Next:** Task 2 (per-exercise prescriptions / sessionRules — the
+generator-side half of what Task 4's gates already validate). Three
+specific things Task 2 must address, beyond its own stated scope:
+
+1. **Render-time prescription reconciliation (architecture note owed from
+   Task 4).** `applyPasted` in `index.html` already stores gated
+   `prescriptions` onto `data.plan.prescriptions`, with a comment
+   admitting "merging them into what the generator actually renders per
+   day is Task 2's wiring, not this gate pipeline's job." That wiring
+   doesn't exist yet. The render pipeline (`getProgram(data)` ->
+   `PROGRAMS[template]` -> `resolveSlot`/swaps/focus-driven bonus lifts)
+   computes each day's exercises today with zero awareness that
+   `data.plan.prescriptions` exists. Task 2 has to decide the semantics,
+   not just wire plumbing: does a stored prescription for an exerciseId
+   that's ALREADY in the generator's output for that day REPLACE that
+   slot (its sets/reps/load override the generator's own), or does it ADD
+   a new entry alongside whatever the generator already produces? This
+   isn't cosmetic — it's the direct cause of item 2 below, and
+   `weeklySetsByGroup(data)` (which Gate 6's running tally starts from)
+   is computed from the CURRENT rendered program, so whatever semantics
+   Task 2 picks has to keep that baseline calculation honest rather than
+   double-counting.
+
+2. **Gate 6's legs-cap headroom limitation.** `defaultGroupCap(group,
+   weeklyGroupSets) = max(MUSCLE_GROUPS[group].mav, current baseline)` —
+   correct in that it's never stricter than what the app already
+   prescribes unprompted, but for a group already at/above its own mav
+   (legs: baseline ~26 sets vs. mav 20), there's currently zero headroom
+   for anything new in that group, because the running tally also starts
+   from the full baseline with no way to say "this prescription replaces
+   part of that baseline, don't double-count it." Same root cause as
+   item 1 above — fixing the reconciliation there fixes this too, not two
+   separate problems.
+
+3. **Deferred test 2** (from the table below): 6 sets prescribed on a
+   single movement with `maxSetsPerMovement: 4` -> capped, overflow spawns
+   a second movement from the same pool. Needs `sessionRules.
+   maxSetsPerMovement` + pool-splitting logic, both Task 2's job. Per the
+   standing rule below, Task 2 isn't done until this passes.
+
+---
+
 # Deferred tests
 
 The build spec's required test suite (`RECOMP-COACH-BUILD.md`) lists 10 test
