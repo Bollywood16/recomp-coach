@@ -1081,12 +1081,10 @@ const RESEARCH_CORPUS = [
     param:"supplementation", source:"Rawson & Volek 2003; Lanhers et al. 2017 meta-analysis" },
 ];
 
-/* Ranks (never filters or truncates) the research corpus by relevance to
-   the user's current phase — specific findings (injury, current template,
-   stall) sort first. Used to be filter-then-slice(0,8), sending only a
-   subset; the brief must send the full corpus ("all N entries, not a
-   subset" — Task 5/7), so this only reorders it now. */
-function researchForPhase(data) {
+/* Shared phase-tag computation backing both research functions below —
+   extracted so "which tags apply right now" is computed once, identically,
+   whether the corpus is being filtered (check-in) or just ranked (full). */
+function researchPhaseTags(data) {
   const plan = (data.plan && data.plan.template) || "balanced";
   const weeks = trainingWeeks(data.sessions || []);
   const isReentry = weeks < 6;
@@ -1099,29 +1097,101 @@ function researchForPhase(data) {
   if (isStalled) tags.add("stalled");
   tags.add(plan);
   if (weeks >= 6 && !isDeloading && !isStalled) tags.add("building");
-  const specificity = (r) => {
-    if (r.phase.some((p) => ["reentry", "injury_recovery", "deload", "stalled"].includes(p) && tags.has(p))) return 0;
-    if (r.phase.some((p) => ["superhero", "upperFocus", "maintain"].includes(p) && tags.has(p))) return 1;
-    if (r.phase.includes("building") && tags.has("building")) return 2;
-    if (r.phase.some((p) => tags.has(p))) return 3;
-    return 4;
-  };
-  return [...RESEARCH_CORPUS].sort((a, b) => specificity(a) - specificity(b));
+  return tags;
+}
+function researchSpecificity(r, tags) {
+  if (r.phase.some((p) => ["reentry", "injury_recovery", "deload", "stalled"].includes(p) && tags.has(p))) return 0;
+  if (r.phase.some((p) => ["superhero", "upperFocus", "maintain"].includes(p) && tags.has(p))) return 1;
+  if (r.phase.includes("building") && tags.has("building")) return 2;
+  if (r.phase.some((p) => tags.has(p))) return 3;
+  return 4;
+}
+/* Full corpus, ranked (never filtered or truncated) by relevance to the
+   user's current phase — for the "full" brief tier. Task 6/7 day-
+   authorship isn't built yet, but a model designing complete sessions will
+   need the whole evidence base, not a curated slice, once it is. */
+function researchRankedFull(data) {
+  const tags = researchPhaseTags(data);
+  return [...RESEARCH_CORPUS].sort((a, b) => researchSpecificity(a, tags) - researchSpecificity(b, tags));
+}
+/* Curated subset for the "checkin" tier — today's only real use case
+   (recommending template/focus/sessionMin/calorieDelta, optionally simple
+   prescriptions). A routine check-in doesn't need the full evidence base
+   to justify a template recommendation. Capped at 3 (this app's pre-
+   Task-5 behavior capped at 8; tightened further as part of getting the
+   checkin tier back under the 7500-char threshold — see buildCoachBrief). */
+function researchForCheckIn(data) {
+  const tags = researchPhaseTags(data);
+  return researchRankedFull(data).filter((r) => r.phase.some((p) => tags.has(p))).slice(0, 2);
+}
+
+/* Check-in tier's exercise scope: whatever the user's CURRENT program
+   actually contains (every day, resolved through active swaps and any
+   focus-driven bonus lifts), plus up to CHECKIN_ALTERNATES_PER_POOL
+   same-pool alternates for each, ranked the same way the swap picker in
+   ExerciseCard already ranks them (`rank`, 1 = best swap first).
+
+   Measured against the real balanced program: an UNCAPPED pool expansion
+   ("every same-pool exercise") pulled in 73 of 75 — the default program
+   already touches nearly every pool, so that barely scoped anything.
+   Even capped at 1 alternate/pool, the checkin brief still ran ~11.7K
+   chars, well over the 7500-char threshold. Set to 0: check-in's actual
+   job (recommend template/focus/sessionMin/calorieDelta, optionally
+   simple per-exercise overrides on EXISTING exercises) doesn't need
+   substitution candidates at all — proposing a SWAP is closer to an
+   authoring decision than a routine check-in one. Bump this back up (and
+   accept the size cost — see the character counts in buildCoachBrief's
+   own comment) if check-in ever needs to reason about swaps directly. */
+const CHECKIN_ALTERNATES_PER_POOL = 0;
+function checkInExerciseIds(data) {
+  const program = getProgram(data);
+  const focus = data.focus || DEFAULT_FOCUS;
+  const currentIds = new Set();
+  program.forEach((day) => {
+    day.exercises.forEach((slot) => currentIds.add(resolveSlot(slot, data.swaps, focus).id));
+    bonusForDay(day, focus, program).forEach((b) => currentIds.add(b.id));
+  });
+  const scoped = new Set(currentIds);
+  const poolsSeen = new Set();
+  currentIds.forEach((id) => {
+    const ex = EX_BY_ID[id];
+    if (!ex || !ex.pool || poolsSeen.has(ex.pool)) return;
+    poolsSeen.add(ex.pool);
+    ALL_KNOWN
+      .filter((a) => a.pool === ex.pool && !currentIds.has(a.id))
+      .sort((a, b) => (a.rank || 4) - (b.rank || 4))
+      .slice(0, CHECKIN_ALTERNATES_PER_POOL)
+      .forEach((a) => scoped.add(a.id));
+  });
+  return scoped;
+}
+function checkInExerciseLibrary(data) {
+  const ids = checkInExerciseIds(data);
+  return ALL_KNOWN.filter((ex) => ids.has(ex.id));
 }
 
 /* ===== Coach brief builder =====
    Assembles the export prompt following Anthropic prompt-engineering practice:
    role first, data in XML-tagged sections before instructions, explicit
    constraints, numbered tasks, and a strict output contract (one fenced JSON
-   block) so the reply can be pasted back and applied through the safety gates. */
-/* The full tagged library the model may select from (Task 5/7 requirement:
-   the model must be able to constraint-check its own selections before
-   proposing them, against the same attribute/romProfile/contraindications
-   data Gate 2 itself reads). Sends all of ALL_KNOWN — no subset — with
-   empty romProfile/contraindications omitted per-entry to keep the payload
-   a bit leaner without dropping any exercise or any field that has content. */
-function exerciseLibraryForBrief() {
-  return ALL_KNOWN.map((ex) => {
+   block) so the reply can be pasted back and applied through the safety gates.
+
+   Two tiers, chosen by the `tier` param ("checkin", the default, or
+   "full"): sending the full 75-exercise library and full research corpus
+   made the brief 20-25K characters — routinely over the 7500-char "Open in
+   Claude" URL threshold, and a copy-paste chore on a phone either way. The
+   free path this app exists around was the thing that broke. "checkin" is
+   today's only real use case (recommend template/focus/sessionMin/
+   calorieDelta, optionally simple prescriptions) and scopes the library to
+   the user's current program + pool alternates, and the research to a
+   curated phase-relevant subset — both already existed at roughly this
+   scope before Task 5 widened them unconditionally. "full" is for Task 6/7
+   day-authorship (not built yet) and sends everything; kept working and
+   measured now so it's not a rebuild later. Training data (lifts, pain,
+   sessions) is uncapped in BOTH tiers regardless — the lifts-truncation
+   bug this task fixed does not come back for a tiering reason. */
+function exerciseLibraryEntries(exercises) {
+  return exercises.map((ex) => {
     const entry = { id: ex.id, name: ex.name, group: CAT_TO_GROUP[ex.cat] || ex.cat, tagSource: ex.tagSource || "untagged" };
     if (ex.attributes && ex.attributes.length) entry.attributes = ex.attributes;
     if (ex.romProfile && Object.keys(ex.romProfile).length) entry.romProfile = ex.romProfile;
@@ -1129,10 +1199,56 @@ function exerciseLibraryForBrief() {
     return entry;
   });
 }
+const TAG_SOURCE_CODE = { descriptive: "D", from_app_caution: "C", conservative_default: "G", clinician_reviewed: "R", untagged: "U" };
+/* Compact pipe-delimited encoding instead of JSON — the library is the
+   bulk of the brief's size, and repeated JSON keys ("id":,"name":,
+   "group":...) across dozens of entries cost real characters for zero
+   information the model needs. Fixed column positions (empty fields stay
+   blank between pipes, never omitted) so the legend below is enough to
+   parse it without ambiguity. */
+/* includeTags=false (checkin tier): the model is working from an already
+   gate-compliant live program, not selecting/authoring new exercises, so a
+   bare id|name list is enough to reference a valid id — the full tag
+   payload is reserved for the "full" tier, where actual exercise-selection
+   reasoning happens and tag-based self-constraint-checking earns its
+   weight in characters. */
+function formatExerciseLibraryCompact(exercises, includeTags) {
+  if (!includeTags) {
+    return exercises.map((ex) => `${ex.id}|${ex.name.replace(/\s*\([^)]*\)\s*$/, "")}`).join("\n");
+  }
+  return exerciseLibraryEntries(exercises).map((e) => {
+    const attrs = (e.attributes || []).join(",");
+    const rom = e.romProfile ? Object.entries(e.romProfile).map(([k, v]) => `${k}=${v}`).join(",") : "";
+    const ci = (e.contraindications || []).join(",");
+    const code = TAG_SOURCE_CODE[e.tagSource] || "U";
+    // Trailing parenthetical qualifiers in a name ("...(above parallel)",
+    // "...(no box, self-limited)") restate what romProfile/attributes
+    // already say structurally in this same row — dropped here only (not
+    // from ex.name itself, which stays intact everywhere else in the app).
+    const name = e.name.replace(/\s*\([^)]*\)\s*$/, "");
+    return `${e.id}|${name}|${e.group}|${code}|${attrs}|${rom}|${ci}`;
+  }).join("\n");
+}
+const EXERCISE_LIBRARY_LEGEND = `Cols (pipe-delim, blank=none): id|name|group|tagSource|attributes|romProfile|contraindications
+tagSource: D=descriptive fact, C=from_app_caution, G=conservative_default(UNVERIFIED GUESS - trust less), R=clinician_reviewed
+attributes/contraindications: comma-separated. romProfile: key=value, comma-separated.`;
+const EXERCISE_LIBRARY_LEGEND_CHECKIN = "Cols: id|name (pipe-delim).";
 
-function buildCoachBrief(data, goalProfile) {
-  const m = coachMetrics(data); // m.lifts is sent in full — no truncation (see failure #5 in the build spec: slice(-14) silently dropped foundational lifts declared early in ALL_KNOWN, regardless of training recency)
-  const research = researchForPhase(data); // full corpus, ranked by relevance — see researchForPhase
+/* Same compact-encoding technique applied to training_metrics.lifts — the
+   content is never truncated (every logged lift is still sent, in both
+   tiers; that's the bug this task fixed), only the ENCODING is leaner:
+   repeated JSON keys ("id":,"name":,"weeksLogged":...) per lift cost real
+   characters for no benefit once a legend states the column order once. */
+const TRAINING_METRICS_LIFTS_LEGEND = "lifts cols (pipe-delim): id|name|group|weeksLogged|latestE1|trendPct|stalled";
+function formatLiftsCompact(lifts) {
+  return (lifts || []).map((l) => `${l.id}|${l.name}|${l.group}|${l.weeksLogged}|${l.latestE1 ?? ""}|${l.trendPct ?? ""}|${l.stalled}`).join("\n");
+}
+
+function buildCoachBrief(data, goalProfile, tier) {
+  const isFullTier = tier === "full";
+  const m = coachMetrics(data); // m.lifts is sent in full in BOTH tiers — no truncation (see failure #5 in the build spec: slice(-14) silently dropped foundational lifts declared early in ALL_KNOWN, regardless of training recency)
+  const research = isFullTier ? researchRankedFull(data) : researchForCheckIn(data);
+  const libraryExercises = isFullTier ? ALL_KNOWN : checkInExerciseLibrary(data);
   const injuryProfile = deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE);
   const specUnlocked = isSpecializationUnlocked(injuryProfile, m);
   const gateLine = injuryProfile.recoveringMode && !specUnlocked
@@ -1143,11 +1259,13 @@ function buildCoachBrief(data, goalProfile) {
   const escalatingCats = Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold));
   const escalationLine = escalatingCats.length
     ? `PAIN ESCALATION ACTIVE on: ${escalatingCats.map((c) => CAT_NAMES[c] || c).join(", ")}. No load or set increase is permitted on these movement patterns until the pattern clears (3 consecutive logged sessions with answered pain at or below ${threshold}/10) — any progression you propose there will be capped or rejected by the app's gates regardless of what you recommend, so don't propose it.`
-    : "No pain-escalation pattern currently active.";
+    : "No pain escalation active.";
 
-  const library = exerciseLibraryForBrief();
+  const librarySectionIntro = isFullTier
+    ? `Full library: ${libraryExercises.length} exercises, tagged to match Gate 2. Constraint-check selections against the tags before proposing; if nothing fits, say so — never substitute or invent an unverifiable exercise.`
+    : `Live-program exercises (${libraryExercises.length} of ${ALL_KNOWN.length} total), id|name only — already gate-compliant as prescribed. exerciseId must come from this list; ask for the full tagged library to propose something new.`;
 
-  return `You are an evidence-based hypertrophy and body-recomposition coach reviewing real training data. Every number in <training_metrics> was computed deterministically from logged sessions — never invent, round, or adjust figures. Be direct: where the user's goals conflict with their constraints or the research, say so plainly rather than accommodating.
+  return `You are an evidence-based hypertrophy/recomposition coach reviewing real training data. Every <training_metrics> number is computed from logged sessions — never invent, round, or adjust them. Be direct: where goals conflict with constraints or research, say so.
 
 <goal_profile>
 ${goalProfile.text || "(not stated yet)"}
@@ -1156,59 +1274,56 @@ ${goalProfile.text || "(not stated yet)"}
 <constraints>
 ${gateLine}
 ${escalationLine}
-This injuryProfile record is authoritative and not yours to modify — any plan you propose is checked
-against it by the app's gates before it can apply, and a plan that conflicts is rejected outright:
+injuryProfile (authoritative, not yours to modify — a conflicting plan is rejected outright):
 ${JSON.stringify(injuryProfile)}
 </constraints>
 
 <exercise_library>
-Every exercise you may select from or substitute, tagged with the same movement attributes, romProfile,
-and contraindications the app's own safety gates check against. Use these tags to constraint-check your
-own selections before proposing them. tagSource explains how confident each tag is: "descriptive" is a
-mechanical fact or a value read directly off the exercise's own name; "from_app_caution" was inferred from
-an existing in-app signal (a caution note, or what the app already prescribes safely today); a
-"conservative_default" tag is an UNVERIFIED GUESS — no clinical or in-app signal existed either way, so
-treat it with less confidence than the other two, not the same. If no exercise here is compatible with
-what a slot needs, say so and leave it out — do not substitute or invent an exercise you cannot verify
-against these tags.
-${JSON.stringify(library)}
+${librarySectionIntro}
+${isFullTier ? EXERCISE_LIBRARY_LEGEND : EXERCISE_LIBRARY_LEGEND_CHECKIN}
+${formatExerciseLibraryCompact(libraryExercises, isFullTier)}
 </exercise_library>
 
 <training_metrics>
-${JSON.stringify(m)}
+${JSON.stringify({ ...m, lifts: undefined })}
+${TRAINING_METRICS_LIFTS_LEGEND}
+${formatLiftsCompact(m.lifts)}
 </training_metrics>
 
 <set_quality>
-Recent per-set detail for the most recently trained lifts (weight x reps, in set order), with logged pain
-where present — "pain during" is same-session, "pain 24h after" is the delayed-onset answer for that same
-session. Inter-set rep decay beyond ~30-40%, or sets landing under the prescribed rep minimum, means the
-load is too heavy for the prescribed set count — the fix is a load reduction or back-off sets, not
-repeating the weight. Pain above ${threshold}/10 on a lift's last session forces a load reduction
-regardless of what you propose (Gate 4) — check here before recommending a load increase.
-${(data.sessions || []).slice(-8).map((s) => {
+Recent sets (weight x reps) with pain ("during"=same-session, "24h after"=delayed-onset). Rep decay >30-40%
+or under-range reps = load too heavy, don't repeat it. Pain >${threshold}/10 last session forces a
+reduction regardless of your proposal (Gate 4).
+${(data.sessions || []).slice(-5).map((s) => {
     const setsStr = s.sets.map((x) => `${x.w || "BW"}x${x.r}`).join(", ");
-    const painParts = [];
-    if (s.pain != null) painParts.push(`pain during: ${s.pain}/10`);
-    if (s.painRetro != null) painParts.push(`pain 24h after: ${s.painRetro}/10`);
-    const painStr = painParts.length ? ` (${painParts.join(", ")})` : "";
-    return `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: ${setsStr}${painStr}`;
+    // Always state both pain fields explicitly, in one of three states each
+    // (answered / dismissed / not yet asked) — never silently omit them.
+    // A dismissed or not-yet-asked entry must not read as "no pain
+    // reported" the way an absent clause would (see Task 4 review item 1:
+    // dismissed/unanswered pain is UNKNOWN, never zero, and that has to
+    // hold here too or the model will infer confidence the data doesn't
+    // support).
+    const duringStr = s.pain != null ? `${s.pain}/10` : "not logged";
+    const afterStr = s.painRetro != null ? `${s.painRetro}/10` : (s.painRetroDismissed === true ? "dismissed" : "not yet asked");
+    return `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: ${setsStr} (pain during: ${duringStr}, pain 24h after: ${afterStr})`;
   }).join("\n") || "(no sessions logged yet)"}
 </set_quality>
 
 <research_context>
-All ${RESEARCH_CORPUS.length} entries from the embedded research corpus, ranked by relevance to the
-user's current phase (most relevant first) — not a subset. Where this corpus doesn't cover a question,
-say so rather than asserting.
+${isFullTier
+    ? `All ${RESEARCH_CORPUS.length} corpus entries, ranked by phase relevance (most relevant first) — not a subset.`
+    : `${research.length} of ${RESEARCH_CORPUS.length} corpus entries, most relevant to your current phase. Ask for the full corpus if this doesn't cover it.`}
+Where uncovered, say so rather than asserting.
 ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 </research_context>
 
 <instructions>
-1. Assess progress against the stated goal using the actual numbers — name specific lifts and their trends.
-2. Review <set_quality> for load-selection errors: flag any lift where reps collapse across sets or fall below the range, and state the corrected load (down, not up) or a back-off scheme. Progression is bidirectional — recommend reducing where the data says so.
-3. Push back explicitly on every conflict between the user's desires and their constraints or the research above. Cite research_context sources when they drive a decision.
-4. Recommend a plan. You may reply with the coarse four-field schema (template/focus/sessionMin/calorieDelta), OR, optionally, add a \`prescriptions\` array of per-exercise overrides (each: exerciseId — must be an id from <exercise_library> — dayKey, order, sets, repMin, repMax, load, restSec; any field you omit falls back to the app's own generator/load logic) and an optional \`sessionRules\` object (maxSetsPerMovement, orderByFocus, trimPriority, weeklyGroupSetCaps). Every exerciseId you reference must come from <exercise_library> — if nothing there fits what a slot needs, leave it out and explain why rather than substituting or inventing one you cannot verify against its tags. Also give: template ("balanced" | "upperFocus" | "superhero"); focus for each of shoulders, arms, chest, back, legs, core (each "maintain" | "normal" | "emphasize" | "specialize", with at most 2 groups at emphasize or above); sessionMin (45 | 60 | 75); calorieDelta (integer between -300 and +300 relative to the current target); and what to watch before the next check-in.
-5. Keep the narrative under 300 words.
-6. End your reply with exactly one fenced \`\`\`json code block containing ONLY the plan object (no comments) — either the four-field shape, or the same four fields plus \`prescriptions\`/\`sessionRules\`. The app parses this block and applies your plan through its safety gates; Gate 2's injury constraints are never overridable regardless of what you propose.
+1. Assess progress vs. goal with the real numbers — name lifts/trends.
+2. Check <set_quality>: flag collapsing/under-range reps, prescribe the fix (lower load or a back-off, never a repeat) — reduce where warranted, not just increase.
+3. Push back on goal-vs-constraint/research conflicts; cite sources.
+4. Recommend: template ("balanced"|"upperFocus"|"superhero"); focus/group (shoulders/arms/chest/back/legs/core: maintain|normal|emphasize|specialize, max 2 emphasize+); sessionMin (45|60|75); calorieDelta (-300..300); next to watch. Optional \`prescriptions\`(exerciseId,dayKey,order,sets,repMin,repMax,load,restSec) + \`sessionRules\`(maxSetsPerMovement,orderByFocus,trimPriority,weeklyGroupSetCaps).
+5. Under 300 words.
+6. End with one \`\`\`json block: plan object only, optionally + prescriptions/sessionRules. Gated on apply; injury constraints aren't overridable.
 </instructions>`;
 }
 
@@ -2742,7 +2857,7 @@ function SyncCard({ data, sbUser, syncStatus, onSignedIn, onSignedOut }) {
                 Change Supabase settings
               </button>
               <div style={{ fontSize: 12, color: C.sub, marginTop: 8, lineHeight: 1.45 }}>
-                First sign-in pushes your existing {data.sessions.length} sessions to the cloud — nothing is lost.
+                First sign-in pushes your existing {data.sessions.length} log entries to the cloud — nothing is lost.
               </div>
             </div>
           )}
@@ -2801,7 +2916,7 @@ function BackupCard({ data, persist }) {
           injuryProfileHistory: incoming.injuryProfileHistory || data.injuryProfileHistory || [],
         };
         persist(merged);
-        flash(`Restored ${merged.sessions.length} sessions and ${merged.weights.length} weigh-ins.`);
+        flash(`Restored ${merged.sessions.length} log entries and ${merged.weights.length} weigh-ins.`);
       } catch (e) {
         flash("Couldn't read that file — make sure it's a Recomp Coach backup.");
       }
@@ -2825,7 +2940,7 @@ function BackupCard({ data, persist }) {
         </label>
       </div>
       <div style={{ fontSize: 12, color: C.sub, marginTop: 10, lineHeight: 1.4 }}>
-        {data.sessions.length} sessions · {data.weights.length} weigh-ins currently stored.
+        {data.sessions.length} log entries · {data.weights.length} weigh-ins currently stored.
       </div>
       {msg && (
         <div style={{ marginTop: 10, fontSize: 13, fontWeight: 600, color: C.green }}>{msg}</div>
@@ -3722,6 +3837,7 @@ function CoachCard({ data, persist }) {
   const [applied, setApplied] = useState(false);
   const [pasted, setPasted] = useState("");
   const [copyMsg, setCopyMsg] = useState("");
+  const [authoring, setAuthoring] = useState(false);
   const weeks = trainingWeeks(data.sessions || []);
   const UNLOCK_WEEKS = 3;
   const unlocked = weeks >= UNLOCK_WEEKS;
@@ -3737,7 +3853,7 @@ function CoachCard({ data, persist }) {
     setErr("");
     const profile = currentProfile();
     persist({ ...data, goalProfile: profile });
-    const brief = buildCoachBrief(data, profile);
+    const brief = buildCoachBrief(data, profile, authoring ? "full" : "checkin");
     try {
       await navigator.clipboard.writeText(brief);
       setCopyMsg("Copied — paste it into any Claude chat.");
@@ -3757,7 +3873,7 @@ function CoachCard({ data, persist }) {
     setErr("");
     const profile = currentProfile();
     persist({ ...data, goalProfile: profile });
-    const brief = buildCoachBrief(data, profile);
+    const brief = buildCoachBrief(data, profile, authoring ? "full" : "checkin");
     const url = "https://claude.ai/new?q=" + encodeURIComponent(brief);
     if (url.length > 7500) {
       // Pre-existing race, surfaced by Task 5's much larger payload (the
@@ -3889,7 +4005,11 @@ function CoachCard({ data, persist }) {
         </div>
       ) : (
         <>
-          <div style={{ ...S.row, marginTop: 12 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, fontSize: 13, color: C.text }}>
+            <input type="checkbox" checked={authoring} onChange={(e) => setAuthoring(e.target.checked)} />
+            Authoring a new day (send the full tagged exercise library + research corpus, not just the check-in summary)
+          </label>
+          <div style={{ ...S.row, marginTop: 10 }}>
             <button style={{ ...S.pillBtn(), flex: 1 }} onClick={copyBrief}>Copy coach prompt</button>
             <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} onClick={openInClaude}>Open in Claude</button>
           </div>
@@ -3897,7 +4017,9 @@ function CoachCard({ data, persist }) {
           <div style={{ fontSize: 12, color: C.sub, marginTop: 8, lineHeight: 1.45 }}>
             Free path: the app packages your metrics, injury constraints, and the relevant research into a
             structured brief. Paste it into Claude, then paste Claude's reply below — the plan applies through
-            the same safety gates.
+            the same safety gates. {authoring
+              ? "Full mode: complete tagged library and full research corpus — this is large and \"Open in Claude\" will likely fall back to copy-to-clipboard."
+              : "Check-in mode: your live program's exercises and the most relevant research only, kept small enough for a one-tap link."}
           </div>
           <textarea
             style={{ ...S.input, minHeight: 60, resize: "vertical", marginTop: 10 }}
