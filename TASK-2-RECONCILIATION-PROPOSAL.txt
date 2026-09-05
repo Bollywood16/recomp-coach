@@ -564,8 +564,126 @@ COMMIT 3 — reconciliation itself (DONE)
   session-rules, prescription-reconciliation).
 
 ================================================================================
+COMMIT 4 — maxSetsPerMovement + pool-splitting (DONE)
+================================================================================
+
+Scope and constraints given for this commit, addressed in order:
+
+1. Deferred test 2 is the acceptance criterion (6 sets, maxSetsPerMovement
+   4 -> capped, overflow spawns a second movement from the pool). PASSED —
+   scripts/check-pool-splitting.js, point 1.
+
+2. Pool selection deterministic and explainable, stated rule, surfaced with
+   a note. Rule: sort candidates by `rank` ascending (the SAME field the
+   swap picker and checkin pool-alternates already use to judge substitute
+   quality — reusing it rather than inventing a second ranking system),
+   default rank 4 for untagged entries (matching every other `rank || 4`
+   site in this file), tie-broken by the exercise's own display name.
+   Never ALL_KNOWN declaration order. The chosen movement's name and pool
+   are stated in the note attached to the returned list. Verified this is
+   load-bearing, not just present: reverted the sort to plain declaration
+   order, reran — wrong candidates were picked in both the rank test
+   (curl instead of inclinecurl) and the tie-break test (legpress instead
+   of the correct fallback after goblet's rejection, via declaration
+   order reaching legpress before ever trying goblet), restored, reran
+   clean.
+
+3. Every spawned movement runs the full gate stack; Gate 2 fires exactly
+   as on a prescribed movement, same implementation. Implemented via
+   direct calls to gate1UnknownId/gate2Injury (not a reimplementation).
+   Verified with a REAL, non-synthetic contraindication (goblet/
+   hip_labrum — the actual reason this app's goblet/box-squat split
+   exists): constructed a scenario where goblet is the alphabetically-
+   first remaining candidate, confirmed it's skipped and the next
+   candidate (hacksquat) is spawned instead. Verified this is load-
+   bearing: reverted the gate-2 call, reran — goblet got spawned despite
+   the active injury, restored, reran clean. Gates 1b (checkin scope) and
+   6 (weekly group cap) are deliberately NOT re-run for a pool spawn —
+   both are about bounding what a PASTED PLAN may do; a pool spawn is the
+   app's own internal structural choice, exactly like bonusForDay already
+   draws from ALL_KNOWN with no checkin-scope restriction, and
+   defaultGroupCap already exempts the app's own unprompted output from
+   Gate 6. Gates 3/4/5 don't apply either — they act on an explicitly
+   prescribed load, and a spawned movement carries none.
+
+4. No valid pool-mate -> capped, not exceeded, reported. PASSED —
+   scripts/check-pool-splitting.js, point 4 (every real squat-pool member
+   pinned as already-present; result: capped at 4, nothing spawned, exact
+   "no valid alternative in the squat pool" reason).
+
+5. delts_lateral / delts_rear split respected. PASSED — a lateral-raise
+   (delts_lateral) overflow spawns a delts_lateral alternative, never the
+   already-present delts_rear movement, and the note names delts_lateral
+   specifically as the pool searched.
+
+6. maxSetsPerMovement applies to generator output, not just prescriptions
+   — flagged as the point most likely under-scoped, and it was the one
+   requiring the most design work. Reproduced the build's own originating
+   bug EXACTLY as it originally happened (arms: "specialize" via the Focus
+   tab, zero prescriptions, zero sessionRules ever configured) and
+   confirmed it no longer stacks 6 sets: capAndSplitMovement runs inside
+   resolveDayExercises itself (the single source of truth from commit 1),
+   as the LAST step over the fully generator+bonus+prescription-
+   reconciled list, so it catches overflow regardless of origin. A new
+   DEFAULT_MAX_SETS_PER_MOVEMENT (4 — the one number this spec's own
+   worked example and deferred test 2 both anchor on) applies whenever no
+   real sessionRules.maxSetsPerMovement exists, the same role
+   defaultGroupCap already plays for Gate 6 — so the fix holds even for a
+   user who has never pasted a coach plan at all. Verified live in a
+   browser: switched to Upper Focus, set Arms to Specialize via the Focus
+   tab only, opened Delts & Arms — EZ-Bar Curl showed capped at 4 (was 6),
+   Incline DB Curl spawned for the remaining 2, zero console errors.
+
+REAL BUG FOUND AND FIXED WHILE VERIFYING THIS (not hypothetical, not in
+the original scope, but a direct consequence of testing point 6 for
+real): the SAME live-browser run that confirmed the cap fix also showed
+"2 x - at 15 lb/hand" for the spawned Incline DB Curl — a blank rep
+range. Root cause: 37 of 75 ALL_KNOWN exercises (LIBRARY/LIBRARY_EXT
+alternates never used as a slot() argument in any PROGRAMS day) carry no
+repMin/repMax at all; resolveSlot's swap path never hits this because it
+deliberately keeps the ORIGINAL SLOT's rep range on a swap. Both places
+this app can pull one of these 37 in directly — capAndSplitMovement's
+spawn construction, and commit 3's prescription-ADD branch in
+resolveDayExercises (an existing, already-committed gap this investigation
+surfaced) — needed a fallback. Fixed with a three-tier fallback: the
+candidate's own native range, then (for a pool spawn specifically) the
+overflowing exercise's own range (matching resolveSlot's swap precedent),
+then a new DEFAULT_REP_RANGE (8-12, an ordinary hypertrophy range with no
+safety significance — repMin/repMax are display/progression-target sugar
+here, not something any gate keys on). Both call sites got regression
+tests, both verified against a deliberately reverted fix (confirmed the
+exact "undefined-undefined" failure before restoring).
+
+Also updated for real, intentional behavior change (not drift):
+scripts/check-day-resolution.js's REFERENCE_* functions now also run the
+real capAndSplitMovement — its specialize-tier scenarios legitimately
+produce different (correct, lower) numbers now, which IS this commit's
+fix, not a regression in the day-resolution consolidation itself. The
+file's header comment and closing log line were updated to describe its
+now-accurate role: proving the four consolidated call sites agree with
+each other and with the real capping/splitting logic, not proving
+byte-identity with a frozen pre-Task-2 snapshot forever.
+scripts/check-prescription-reconciliation.js's REPLACE test (item 1) now
+raises sessionRules.maxSetsPerMovement so it keeps testing REPLACE
+mechanics in isolation from capping, which is what it was already meant
+to test.
+
+scripts/check-pool-splitting.js: 28 assertions (deferred test 2 itself,
+rank ordering, the name tie-break discriminated from declaration order,
+Gate 2 firing on a spawned candidate with a real contraindication, the
+no-valid-alternative fallback, an untagged-pool synthetic edge case, the
+delts_lateral/delts_rear split, generator-only enforcement reproducing
+the original bug exactly, a real sessionRules override actually changing
+the cap end-to-end, and the rep-range fallback). npm test: all five
+scripts pass (write-isolation, day-resolution, session-rules,
+prescription-reconciliation, pool-splitting) — 175 assertions total
+across the whole Task 2 test suite.
+
+DEFERRED-TESTS.md updated: deferred test 2 marked Passed, full commit-4
+record added to the handoff section.
+
+================================================================================
 NEXT
 ================================================================================
-Commit 3 complete. Stopping here per instruction — commit 4
-(maxSetsPerMovement + pool-splitting, deferred test 2) gets its own review
-round before starting.
+Commit 4 complete. Stopping here per instruction. Task 3 (set schemes —
+back-off and drop sets) is next.

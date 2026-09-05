@@ -372,6 +372,38 @@ const EMPHASIS_LEVELS = [
 ];
 const DEFAULT_FOCUS = { shoulders: "normal", arms: "normal", chest: "normal", back: "normal", legs: "normal", core: "normal" };
 const DEFAULT_PLAN = { template: "balanced", sessionMin: 60, templateSince: null };
+/* Task 2 commit 4. The build's own originating bug (arms: "specialize"
+   stacking 6 sets on EZ-Bar Curl) happens purely through Focus-tab
+   emphasis scaling — no coach paste, no sessionRules, involved at all.
+   A cap that only activates once a plan explicitly sets sessionRules.
+   maxSetsPerMovement would leave that exact bug live for every user who's
+   never pasted a plan. This is the generator's own default, analogous to
+   defaultGroupCap's role for Gate 6: applies unless a real sessionRules.
+   maxSetsPerMovement overrides it. 4 is not an arbitrary pick — it's the
+   one number this build's own spec ever anchors on for this field (the
+   worked JSON example, and deferred test 2, both use 4), so using
+   anything else as "the" default would need its own separate
+   justification this spec never provides. */
+const DEFAULT_MAX_SETS_PER_MOVEMENT = 4;
+/* Task 2 commit 4 fix, discovered live (not hypothetical — reproduced in
+   a real browser run): 37 of 75 ALL_KNOWN exercises carry no repMin/
+   repMax at all — they're LIBRARY/LIBRARY_EXT alternates never used as a
+   slot() argument in any PROGRAMS day, which is the only place a rep
+   range gets attached today. resolveSlot's swap path never hits this
+   (it deliberately keeps the SLOT's own repMin/repMax on swap — "the
+   day's structure is preserved"), so it went unnoticed until a pool
+   spawn or a prescription ADD pulls one of these 37 in directly with no
+   override of its own: the rendered set line showed "4 x – at 35 lb" —
+   a blank rep range, live, in the actual UI. Used as the last-resort
+   fallback (after the exercise's own native range, then — for a pool
+   spawn specifically — the overflowing exercise's own range, which is
+   the more contextually correct fallback per the swap precedent above)
+   in both resolveDayExercises' prescription-ADD branch and
+   capAndSplitMovement's spawn construction. 8-12 is an ordinary,
+   defensible middle-of-the-road hypertrophy range, not a load-bearing
+   safety value — repMin/repMax are display/progression-target sugar
+   here, not something a gate keys on. */
+const DEFAULT_REP_RANGE = { min: 8, max: 12 };
 const getProgram = (data) => PROGRAMS[(data.plan && data.plan.template) || "balanced"] || PROGRAMS.balanced;
 
 /* ===== Injury vocabulary (closed set) =====
@@ -1451,6 +1483,99 @@ function resolveSlot(slot, swaps, focus) {
    this is only a fallback for state drifting via a NEW swap made after
    that (rare, user-deliberate, and fails toward the generator's own
    already-approved output rather than toward doubling volume). */
+/* Task 2 commit 4 — maxSetsPerMovement + pool-splitting. Deferred test 2's
+ * acceptance criterion, and the fix for the build's originating bug
+ * (failure #1: 6 sets stacked on EZ-Bar Curl). Given a fully-resolved
+ * {slot, ex} list (generator + bonus + prescription-reconciled — this
+ * runs LAST, over whatever any of those produced, so it catches overflow
+ * regardless of origin per point 6), any entry over the cap is trimmed to
+ * it; the overflow is redistributed onto a spawned same-pool alternative
+ * rather than dropped or left stacked.
+ *
+ * Deterministic, explainable candidate order (point 2) — never
+ * declaration order in ALL_KNOWN/LIBRARY_EXT: sort candidates by `rank`
+ * ascending (the SAME field the swap picker and checkin pool-alternates
+ * already use to judge substitute quality — reusing it here instead of
+ * inventing a second ranking system), defaulting untagged-rank entries to
+ * 4 (matching every other `rank || 4` site in this file), tie-broken by
+ * the exercise's own display name so two equally-ranked (or both
+ * default-ranked) candidates still resolve the same way every time. The
+ * FIRST candidate in that order to pass Gate 1 and Gate 2 — the SAME gate
+ * functions a pasted prescription runs through, called directly, not a
+ * separate reimplementation (point 3) — is the one spawned.
+ *
+ * Deliberately NOT re-run here: Gate 1b (checkin scope) — that gate
+ * exists to bound what a PASTED PLAN may reference; a pool spawn is the
+ * app's own internal structural choice, exactly like bonusForDay already
+ * draws from ALL_KNOWN/LIBRARY_EXT with no checkin-scope restriction.
+ * Gate 6 (weekly group cap) — defaultGroupCap already exempts the app's
+ * own unprompted structural output from Gate 6 (see its comment); a pool
+ * split is that same kind of choice, not a new one this function invents,
+ * and re-checking it here would risk exactly the double-counting Gate 6's
+ * own fix in commit 3 was written to prevent. Gates 3/4/5 (load sanity /
+ * pain rule / escalation) — all three act on an explicitly prescribed
+ * LOAD; a spawned movement carries none (weight comes from recommend() at
+ * render time same as any generator exercise), so there is nothing for
+ * them to check.
+ *
+ * If no candidate passes (point 4): capped, not spawned, and said so —
+ * under-dosing is recoverable, silently exceeding a cap is the bug this
+ * whole mechanism exists to prevent. Never persisted (like bonusForDay's
+ * bonus lifts, not like Gate 7's trim): recomputed fresh from whatever
+ * the day's list looks like right now, so a spawned entry can never drift
+ * from the state of the thing it's covering for. */
+function capAndSplitMovement(list, maxSetsPerMovement, injuryProfile) {
+  const cap = maxSetsPerMovement ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
+  const out = [...list];
+  const notes = [];
+  list.forEach((entry) => {
+    const ex = entry.ex;
+    if (!ex.sets || ex.sets <= cap) return;
+    const overflow = ex.sets - cap;
+    const idx = out.indexOf(entry);
+    out[idx] = { slot: entry.slot, ex: { ...ex, sets: cap, cappedFrom: ex.sets } };
+    const plural = (n) => `${n} set${n === 1 ? "" : "s"}`;
+
+    if (!ex.pool) {
+      notes.push({ exerciseId: ex.id, gate: "maxSetsPerMovement",
+        note: `"${ex.name}" capped at ${cap} sets (${plural(overflow)} over) — untagged pool, no alternative could be searched for. ${plural(overflow)} of intended volume dropped.` });
+      return;
+    }
+    const currentIds = new Set(out.map((e) => e.ex.id));
+    const candidates = ALL_KNOWN
+      .filter((a) => a.pool === ex.pool && a.id !== ex.id && !currentIds.has(a.id))
+      .sort((a, b) => (a.rank || 4) - (b.rank || 4) || a.name.localeCompare(b.name));
+    let spawned = null;
+    for (const cand of candidates) {
+      if (gate1UnknownId({ exerciseId: cand.id }).reject) continue;
+      if (gate2Injury({ exerciseId: cand.id }, { injuryProfile }).reject) continue;
+      spawned = cand;
+      break;
+    }
+    if (!spawned) {
+      notes.push({ exerciseId: ex.id, gate: "maxSetsPerMovement",
+        note: `"${ex.name}" capped at ${cap} sets (${plural(overflow)} over) — no valid alternative in the "${ex.pool}" pool (all candidates contraindicated, untagged, or already in this day). ${plural(overflow)} of intended volume dropped rather than exceeding the cap.` });
+      return;
+    }
+    const spawnedEx = {
+      ...spawned, sets: overflow, baseSets: overflow,
+      // Rep range: prefer the candidate's own (rare among LIBRARY_EXT
+      // alternates — see DEFAULT_REP_RANGE's comment), else inherit the
+      // overflowing exercise's own range (same precedent resolveSlot's
+      // swap already follows: the day's rep-range intent carries over to
+      // whatever fills the volume), else the universal fallback.
+      repMin: spawned.repMin ?? ex.repMin ?? DEFAULT_REP_RANGE.min,
+      repMax: spawned.repMax ?? ex.repMax ?? DEFAULT_REP_RANGE.max,
+      slotId: spawned.id, swapped: false, focusBoost: !!ex.focusBoost,
+      poolSpawned: true, poolSpawnedFrom: ex.id,
+    };
+    out.push({ slot: spawnedEx, ex: spawnedEx });
+    notes.push({ exerciseId: ex.id, gate: "maxSetsPerMovement",
+      note: `"${ex.name}" capped at ${cap} sets (was ${ex.sets}) — spawned "${spawned.name}" for the remaining ${plural(overflow)}: best-ranked available "${ex.pool}" pool alternative, passing all safety gates.` });
+  });
+  return { list: out, notes };
+}
+
 function resolveDayExercises(day, data) {
   const focus = data.focus || DEFAULT_FOCUS;
   const program = getProgram(data);
@@ -1477,7 +1602,8 @@ function resolveDayExercises(day, data) {
       const sets = overrides.sets ?? 3;
       const added = {
         ...base, sets, baseSets: sets,
-        repMin: overrides.repMin ?? base.repMin, repMax: overrides.repMax ?? base.repMax,
+        repMin: overrides.repMin ?? base.repMin ?? DEFAULT_REP_RANGE.min,
+        repMax: overrides.repMax ?? base.repMax ?? DEFAULT_REP_RANGE.max,
         restSec: overrides.restSec, prescribedLoad: overrides.prescribedLoad,
         slotId: base.id, swapped: false, focusBoost: false,
         prescribed: true, prescriptionApplied: "add",
@@ -1485,7 +1611,20 @@ function resolveDayExercises(day, data) {
       list.push({ slot: added, ex: added });
     }
   });
-  return list;
+  // maxSetsPerMovement runs LAST, over the fully generator+bonus+
+  // prescription-reconciled list — see capAndSplitMovement's own comment
+  // for why it has to be here rather than only in the prescription-gate
+  // path. The notes it produces have no natural "apply" moment to surface
+  // through for generator-origin overflow (there's no paste involved at
+  // all), so they're attached to the returned array itself — DayPage
+  // reads `entries.maxSetsNotes` for its banner; every other caller
+  // (weeklySetsByGroup, dayFittedMinutes, dayFocusSummary, lastDone) just
+  // uses the array normally and never looks at this extra property.
+  const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
+  splitList.maxSetsNotes = notes;
+  return splitList;
 }
 
 /* Working weight = heaviest weight used in the most recent session of a lift */
@@ -2750,6 +2889,20 @@ function DayPage({ day, data, persist, onBack }) {
                 </div>
               </div>
             )}
+            {/* Task 2 commit 4: capAndSplitMovement's notes, attached to the
+                resolveDayExercises array itself (see that function's own
+                comment for why) — the only place a generator-driven cap has
+                any UI to surface through at all, since there's no "apply"
+                moment for focus-slider-driven overflow to hook a message
+                into the way a pasted plan's rejections/notes do. */}
+            {(entries.maxSetsNotes || []).map((n, i) => (
+              <div key={i} style={{ ...S.card, background: "#F7F7FA", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <ClipboardList size={18} color={C.sub} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.45 }}>
+                  <b>Per-movement cap:</b> {n.note}
+                </div>
+              </div>
+            ))}
             {fit.list.map((ex) => {
               const entry = entries.find((e) => e.ex.slotId === ex.slotId);
               return (

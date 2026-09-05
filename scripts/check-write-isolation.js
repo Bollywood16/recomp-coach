@@ -48,6 +48,7 @@ const REVIEWED_READERS = [
   "unknownInjuryIds",
   "gate2Injury",
   "gate4PainRule",
+  "capAndSplitMovement",
 ];
 
 // Always checked regardless of its parameter list — the actual parser entry

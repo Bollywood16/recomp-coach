@@ -1,23 +1,34 @@
 #!/usr/bin/env node
-/* Behavior-neutrality check for the resolveDayExercises consolidation
+/* Behavior-agreement check for resolveDayExercises and its consumers
  * (Task 2 reconciliation work, TASK-2-RECONCILIATION-PROPOSAL.txt section
- * 1 / open decision 3). Before this refactor, DayPage, weeklySetsByGroup,
- * dayFittedMinutes, and dayFocusSummary each independently rebuilt a day's
- * exercise list via `day.exercises.map(resolveSlot) + bonusForDay(...)`.
- * That's the exact gap that let Gate 6's tally drift from what DayPage
- * actually renders (DEFERRED-TESTS.md handoff items 1-2). This test proves
- * the consolidation into one resolveDayExercises() didn't change any of the
- * four call sites' output.
+ * 1 / open decision 3). Before commit 1's refactor, DayPage,
+ * weeklySetsByGroup, dayFittedMinutes, and dayFocusSummary each
+ * independently rebuilt a day's exercise list — the exact gap that let
+ * Gate 6's tally drift from what DayPage actually renders (DEFERRED-
+ * TESTS.md handoff items 1-2). This test proves the consolidation into
+ * one resolveDayExercises() keeps all four call sites agreeing with each
+ * other and with a reference implementation.
  *
- * Method: the four REFERENCE_* functions below are frozen, byte-for-byte
- * copies of each call site's pre-refactor inline logic (copied at the time
- * this test was written — deliberately NOT re-derived from the current
- * source, since the point is to catch the current source drifting from
- * that known-good baseline). Each is exercised against several seeded
- * `data` objects covering all three templates, an active swap, and
- * focus levels that trigger bonus lifts (including the specialize-tier
- * "second finisher" bonuses) — then compared for exact structural equality
- * against what the app's real (post-refactor) functions produce today.
+ * Method: the REFERENCE_* functions below independently rebuild each call
+ * site's logic (composition of the same lower-level primitives
+ * resolveDayExercises itself uses — resolveSlot, bonusForDay,
+ * capAndSplitMovement), then everything is compared for exact structural
+ * equality against what the app's real functions produce.
+ *
+ * Updated for commit 4 (maxSetsPerMovement + pool-splitting): originally
+ * these were frozen, byte-for-byte copies of each call site's
+ * PRE-COMMIT-1 inline logic, deliberately not re-derived, to catch the
+ * refactor itself introducing a behavior change. Commit 4 legitimately
+ * changes real numbers for any scenario that triggers capping (that IS
+ * the fix — see index.html's capAndSplitMovement comment), so the
+ * reference functions now also run their combined list through the real
+ * capAndSplitMovement, same as resolveDayExercises does — keeping this
+ * test's actual job (four call sites can't silently disagree) intact
+ * across every commit, rather than pinning it to a frozen pre-commit-1
+ * snapshot that commit 4 was always going to legitimately invalidate.
+ * scripts/check-pool-splitting.js covers capAndSplitMovement's own
+ * correctness (rank ordering, gate enforcement, the delts split, etc.) in
+ * detail; this file's job is strictly "do the call sites agree."
  *
  * DayPicker.lastDone is deliberately NOT covered here — it never included
  * bonus lifts or focus-adjusted sets, has different semantics than the
@@ -34,9 +45,12 @@ const { loadApp } = require("./lib/load-app.js");
 const app = loadApp([
   "PROGRAMS",
   "DEFAULT_FOCUS",
+  "DEFAULT_INJURY_PROFILE",
+  "DEFAULT_MAX_SETS_PER_MOVEMENT",
   "getProgram",
   "resolveSlot",
   "bonusForDay",
+  "capAndSplitMovement",
   "fitDayToTime",
   "weeklySetsByGroup",
   "dayFittedMinutes",
@@ -45,27 +59,38 @@ const app = loadApp([
 ]);
 const { DEFAULT_FOCUS } = app;
 
-/* ===== Frozen reference implementations (pre-refactor, copied verbatim) ===== */
+/* ===== Reference implementations ===== */
+
+// Same cap/injuryProfile derivation resolveDayExercises itself uses —
+// kept here as its own step (not hidden inside REFERENCE_dayPageEntries)
+// so a future reader can see plainly that this mirrors, rather than
+// bypasses, the real function's logic.
+function applyCap(list, data) {
+  const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? app.DEFAULT_MAX_SETS_PER_MOVEMENT;
+  const injuryProfile = data.injuryProfile || app.DEFAULT_INJURY_PROFILE;
+  return app.capAndSplitMovement(list, cap, injuryProfile).list;
+}
+
+function REFERENCE_dayPageEntries(day, data) {
+  const focusObj = data.focus || DEFAULT_FOCUS;
+  const program = app.getProgram(data);
+  const list = [
+    ...day.exercises.map((s) => ({ slot: s, ex: app.resolveSlot(s, data.swaps, focusObj) })),
+    ...app.bonusForDay(day, focusObj, program).map((b) => ({ slot: b, ex: b })),
+  ];
+  return applyCap(list, data);
+}
 
 function REFERENCE_dayFittedMinutes(day, data) {
-  const f = data.focus || DEFAULT_FOCUS;
-  const p = app.getProgram(data);
-  const list = [
-    ...day.exercises.map((s) => app.resolveSlot(s, data.swaps, f)),
-    ...app.bonusForDay(day, f, p),
-  ];
+  const list = REFERENCE_dayPageEntries(day, data).map((e) => e.ex);
   return app.fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60).minutes;
 }
 
 function REFERENCE_weeklySetsByGroup(data, CAT_TO_GROUP) {
-  const focus = data.focus || DEFAULT_FOCUS;
   const program = app.getProgram(data);
   const t = {};
   program.forEach((day) => {
-    const list = [
-      ...day.exercises.map((slot) => app.resolveSlot(slot, data.swaps, focus)),
-      ...app.bonusForDay(day, focus, program),
-    ];
+    const list = REFERENCE_dayPageEntries(day, data).map((e) => e.ex);
     const fitted = app.fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60).list;
     fitted.forEach((ex) => {
       const g = CAT_TO_GROUP[ex.cat];
@@ -76,27 +101,20 @@ function REFERENCE_weeklySetsByGroup(data, CAT_TO_GROUP) {
 }
 
 function REFERENCE_dayFocusSummary(day, data, CAT_TO_GROUP, MUSCLE_GROUPS) {
-  const focus = data.focus || DEFAULT_FOCUS;
-  let added = 0, groups = new Set();
-  day.exercises.forEach((slot) => {
-    const ex = app.resolveSlot(slot, data.swaps, focus);
+  let added = 0, bonusCount = 0;
+  const groups = new Set();
+  REFERENCE_dayPageEntries(day, data).forEach(({ ex }) => {
     const g = CAT_TO_GROUP[ex.cat];
+    if (ex.isBonus) {
+      bonusCount++;
+      if (g) groups.add(MUSCLE_GROUPS[g]?.name);
+      return;
+    }
     const delta = (ex.sets || 0) - (ex.baseSets || ex.sets || 0);
     if (delta > 0 && g) { added += delta; groups.add(MUSCLE_GROUPS[g]?.name); }
     if (delta < 0 && g) { groups.add(MUSCLE_GROUPS[g]?.name); }
   });
-  const bonus = app.bonusForDay(day, focus, app.getProgram(data));
-  bonus.forEach((b) => { const g = CAT_TO_GROUP[b.cat]; if (g) groups.add(MUSCLE_GROUPS[g]?.name); });
-  return { added, bonusCount: bonus.length, groups: [...groups] };
-}
-
-function REFERENCE_dayPageEntries(day, data) {
-  const focusObj = data.focus || DEFAULT_FOCUS;
-  const program = app.getProgram(data);
-  return [
-    ...day.exercises.map((s) => ({ slot: s, ex: app.resolveSlot(s, data.swaps, focusObj) })),
-    ...app.bonusForDay(day, focusObj, program).map((b) => ({ slot: b, ex: b })),
-  ];
+  return { added, bonusCount, groups: [...groups] };
 }
 
 /* Need CAT_TO_GROUP/MUSCLE_GROUPS for two of the reference fns above but
@@ -204,4 +222,4 @@ if (failures > 0) {
   console.error(`\nDAY-RESOLUTION CHECK FAILED: ${failures}/${checks} assertions failed.`);
   process.exit(1);
 }
-console.log(`Day-resolution check passed: ${checks} assertions across ${scenarios.length} seeded scenarios — resolveDayExercises is behavior-neutral vs. the pre-refactor per-call-site logic.`);
+console.log(`Day-resolution check passed: ${checks} assertions across ${scenarios.length} seeded scenarios — DayPage, weeklySetsByGroup, dayFittedMinutes, and dayFocusSummary all agree with each other via resolveDayExercises.`);

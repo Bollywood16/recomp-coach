@@ -49,9 +49,69 @@ reviewed and approved before implementation, per that file's full record):
     "just wire it in" change elsewhere was deliberately NOT made the same
     way), and a `StalePrescriptionsNotice` for prescriptions left inert by
     a template switch.
-- Commit 4 (not started): `sessionRules.maxSetsPerMovement` + pool-
-  splitting overflow logic — deferred test 2 below. Gets its own review
-  round before starting, per instruction.
+- Commit 4 (done): `sessionRules.maxSetsPerMovement` + pool-splitting.
+  Deferred test 2 below now passes. This is the fix for the build's own
+  originating failure #1 (6 sets stacked on EZ-Bar Curl) — reproduced and
+  confirmed fixed with the mechanism that actually caused it: pure
+  Focus-tab emphasis scaling, zero prescriptions, zero sessionRules ever
+  configured (`scripts/check-pool-splitting.js`'s point-6 test; also
+  confirmed live in a real browser). New `capAndSplitMovement`, called
+  from `resolveDayExercises` LAST — after generator, bonus, and
+  prescription reconciliation — so it catches overflow regardless of
+  origin. A default cap of 4 applies even with no `sessionRules` ever
+  pasted (`DEFAULT_MAX_SETS_PER_MOVEMENT`), the same role
+  `defaultGroupCap` already plays for Gate 6; a real
+  `sessionRules.maxSetsPerMovement` overrides it. Candidate order for
+  which pool-mate gets spawned is deterministic: `rank` ascending (the
+  same field the swap picker already uses), tied-broken by name — never
+  `ALL_KNOWN` declaration order, verified by deliberately reverting the
+  sort and confirming the wrong candidate gets picked. Every candidate
+  runs Gate 1 and Gate 2 (the same functions, not a reimplementation)
+  before being chosen; verified against a real, non-synthetic
+  contraindication (goblet/hip_labrum) that the fallback correctly moves
+  to the next candidate rather than spawning something contraindicated —
+  and, with a deliberately reverted gate check, confirmed the test
+  catches exactly that failure. If no candidate survives, the movement is
+  capped with no spawn and a stated reason — never exceeds the cap as a
+  fallback. The delts_lateral/delts_rear split from Task 1 is
+  specifically exercised: a lateral-raise overflow never spawns a
+  rear-delt movement, even with one already present in the same day.
+  Never persisted, same as bonus lifts — recomputed fresh from the
+  day's current state every render, so a spawned entry can never drift
+  from what it's covering for.
+
+  **Real bug found and fixed while verifying this, not hypothetical:** 37
+  of 75 `ALL_KNOWN` exercises (LIBRARY/LIBRARY_EXT alternates never used
+  as a `slot()` argument in any `PROGRAMS` day) carry no `repMin`/
+  `repMax` at all. A live browser run of the exact point-6 scenario above
+  showed "2 × – at 15 lb/hand" for the spawned Incline DB Curl — a blank
+  rep range, visible in the real UI, not caught by any prior test because
+  every earlier test that exercised the ADD path happened to supply an
+  explicit `repMin`/`repMax` override. Fixed in both places this can
+  happen (`resolveDayExercises`'s prescription-ADD branch, from commit 3,
+  and `capAndSplitMovement`'s spawn construction): a spawned entry
+  inherits the overflowing exercise's own rep range first (matching
+  `resolveSlot`'s existing swap precedent), an ADD prescription falls
+  back to the base exercise's own range, and a new
+  `DEFAULT_REP_RANGE` (8-12, an ordinary hypertrophy range — not a
+  safety-relevant value) is the last resort when nothing else has one.
+  Both fixed call sites have regression tests, both verified against a
+  deliberately reverted fix.
+
+  `scripts/check-pool-splitting.js`: 28 assertions. Two more tests
+  updated for real, intentional behavior change rather than a
+  regression: `scripts/check-day-resolution.js`'s reference
+  implementations now also run capping (its specialize-tier scenarios
+  legitimately produce different numbers now — that IS the fix, not a
+  drift); `scripts/check-prescription-reconciliation.js`'s REPLACE test
+  raises its own `sessionRules.maxSetsPerMovement` so it keeps testing
+  REPLACE mechanics in isolation from capping, plus a new assertion for
+  the rep-range fallback. `npm test`: all five scripts pass. Live
+  headless-browser confirmation of the fixed original-bug scenario,
+  banners and rep ranges both correct, zero console errors.
+
+  Full design record and the six scope points from the review round, all
+  addressed, in `TASK-2-RECONCILIATION-PROPOSAL.txt`.
 
 ## Amendment to Task 4's sign-off: Gate 8 is now render-time-only
 
@@ -101,7 +161,7 @@ stay tracked against their owning task rather than quietly dropped.
 
 | # | Test case | Depends on | Owning task | Status |
 |---|-----------|------------|-------------|--------|
-| 2 | 6 sets prescribed on a single movement with `maxSetsPerMovement: 4` → capped; overflow spawns a second movement from the same pool. | `sessionRules.maxSetsPerMovement` + pool-splitting logic | Task 2 | Not started |
+| 2 | 6 sets prescribed on a single movement with `maxSetsPerMovement: 4` → capped; overflow spawns a second movement from the same pool. | `sessionRules.maxSetsPerMovement` + pool-splitting logic | Task 2 | **Passed** — `scripts/check-pool-splitting.js`, see the Task 2 commit 4 section below |
 | 4 | A forbidden-attribute exercise arriving via `days` substitution → Gate 9/2 rejects, original retained. | `days` array schema + Gate 9 (thin wrapper reusing Gates 1-8 per exercise) | Task 6 | Not started |
 | 7 | `estimatedMin` understated by 30% → Gate 10 rejects the day, other days apply. | `days[].estimatedMin` + Gate 10 (recompute-and-compare) | Task 6 | Not started |
 | 8 | A day omitting the `specialize` group entirely → Gate 12 rejects. | `days` schema + focus-group tracking per day + Gate 12 | Task 6 | Not started |

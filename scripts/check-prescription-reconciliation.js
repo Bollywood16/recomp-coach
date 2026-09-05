@@ -42,9 +42,15 @@ function baseData(overrides) {
 }
 const upperA = () => app.PROGRAMS.balanced.find((d) => d.id === "upperA");
 
-/* ===== 1. REPLACE — in place, no double count ===== */
+/* ===== 1. REPLACE — in place, no double count =====
+ * sessionRules.maxSetsPerMovement raised well above 5 here on purpose —
+ * this test is about REPLACE mechanics specifically; commit 4's default
+ * cap (4) would otherwise itself trigger a pool-split on the 5-set
+ * prescription and conflate two different things being tested. Commit
+ * 4's own capping/splitting gets its own dedicated coverage in
+ * scripts/check-pool-splitting.js. */
 {
-  const data = baseData({ plan: { template: "balanced", sessionMin: 60, prescriptions: [
+  const data = baseData({ plan: { template: "balanced", sessionMin: 60, sessionRules: { maxSetsPerMovement: 10 }, prescriptions: [
     { exerciseId: "bench", dayKey: "upperA", sets: 5, load: 100 },
   ] } });
   const list = app.resolveDayExercises(upperA(), data);
@@ -54,7 +60,7 @@ const upperA = () => app.PROGRAMS.balanced.find((d) => d.id === "upperA");
   ok("REPLACE: prescribedLoad set from load", bench.ex.prescribedLoad === 100);
   ok("REPLACE: tagged prescribed/replace", bench.ex.prescribed === true && bench.ex.prescriptionApplied === "replace");
   const groupSets = app.weeklySetsByGroup(data);
-  const baseline = app.weeklySetsByGroup(baseData({ plan: { template: "balanced", sessionMin: 60 } }));
+  const baseline = app.weeklySetsByGroup(baseData({ plan: { template: "balanced", sessionMin: 60, sessionRules: { maxSetsPerMovement: 10 } } }));
   ok("REPLACE: chest tally moved by exactly the delta (+2), not the full new value",
     groupSets.chest - baseline.chest === 2, `baseline ${baseline.chest} -> ${groupSets.chest}`);
 }
@@ -72,6 +78,24 @@ const upperA = () => app.PROGRAMS.balanced.find((d) => d.id === "upperA");
   const baseline = app.weeklySetsByGroup(baseData({ plan: { template: "balanced", sessionMin: 60 } }));
   ok("ADD: chest tally moved by the full added amount (+3)",
     groupSets.chest - baseline.chest === 3, `baseline ${baseline.chest} -> ${groupSets.chest}`);
+}
+
+/* ===== 2b. ADD with no repMin/repMax on EITHER the prescription or the
+ * base exercise -> falls back to DEFAULT_REP_RANGE, never blank. Found
+ * live (not hypothetical): "dips" is one of 37/75 ALL_KNOWN exercises
+ * with no native rep range at all, and the same gap that showed a blank
+ * "4 x – at 35 lb" for a pool-spawned entry (check-pool-splitting.js)
+ * applies here identically — a coach ADD prescription that omits
+ * repMin/repMax for one of these 37 would render the same way. ===== */
+{
+  const data = baseData({ plan: { template: "balanced", sessionMin: 60, prescriptions: [
+    { exerciseId: "dips", dayKey: "upperA", sets: 3 }, // no repMin/repMax
+  ] } });
+  const added = app.resolveDayExercises(upperA(), data).find((e) => e.ex.id === "dips");
+  ok("dips has no native rep range of its own (the exact condition that breaks without a fallback)",
+    app.EX_BY_ID.dips.repMin === undefined && app.EX_BY_ID.dips.repMax === undefined);
+  ok("ADD without any rep range specified anywhere still gets a real, non-blank range",
+    added.ex.repMin === 8 && added.ex.repMax === 12, `${added.ex.repMin}-${added.ex.repMax}`);
 }
 
 /* ===== 3. Ambiguous match at render time — defensive skip, not a guess ===== */
