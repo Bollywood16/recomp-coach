@@ -1122,7 +1122,7 @@ function researchRankedFull(data) {
    checkin tier back under the 7500-char threshold — see buildCoachBrief). */
 function researchForCheckIn(data) {
   const tags = researchPhaseTags(data);
-  return researchRankedFull(data).filter((r) => r.phase.some((p) => tags.has(p))).slice(0, 2);
+  return researchRankedFull(data).filter((r) => r.phase.some((p) => tags.has(p))).slice(0, 1);
 }
 
 /* Check-in tier's exercise scope: whatever the user's CURRENT program
@@ -1244,6 +1244,23 @@ function formatLiftsCompact(lifts) {
   return (lifts || []).map((l) => `${l.id}|${l.name}|${l.group}|${l.weeksLogged}|${l.latestE1 ?? ""}|${l.trendPct ?? ""}|${l.stalled}`).join("\n");
 }
 
+/* Every session carrying a resolved pain signal (an answered value, during
+   or 24h-after, OR an explicit "dismissed" retro) — chronological, NEVER
+   capped or sliced, in either tier, regardless of size pressure. This is
+   the one input to Gate 4/Gate 5's own reasoning (isPainEscalating walks
+   the FULL history, not a snapshot) that the model needs uncompressed to
+   reason the same way the gates will actually decide — unlike set_quality
+   below (a legitimate, non-safety compression target: recent-only is
+   sufficient for rep-decay detection). A session with pain simply never
+   asked yet (still pending, not dismissed) is omitted here — that's a
+   pending in-app prompt, not resolved history; it carries no signal this
+   section needs to report. If including this ever pushes a brief over the
+   URL threshold, the app falls back to clipboard-copy (see openInClaude)
+   -- it never trims this list to fit. */
+function painHistoryEntries(sessions) {
+  return (sessions || []).filter((s) => s.pain != null || s.painRetro != null || s.painRetroDismissed === true);
+}
+
 function buildCoachBrief(data, goalProfile, tier) {
   const isFullTier = tier === "full";
   const m = coachMetrics(data); // m.lifts is sent in full in BOTH tiers — no truncation (see failure #5 in the build spec: slice(-14) silently dropped foundational lifts declared early in ALL_KNOWN, regardless of training recency)
@@ -1252,7 +1269,7 @@ function buildCoachBrief(data, goalProfile, tier) {
   const injuryProfile = deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE);
   const specUnlocked = isSpecializationUnlocked(injuryProfile, m);
   const gateLine = injuryProfile.recoveringMode && !specUnlocked
-    ? `HARD CONSTRAINT: the user is ${m.weeksTraining} logged week(s) into a return from injury. The template MUST be "balanced" until ~8 pain-free logged weeks, regardless of stated goals. If the goal implies otherwise, explain why this constraint wins for now and when it lifts.`
+    ? `HARD CONSTRAINT: ${m.weeksTraining} logged week(s) into return-from-injury. template MUST stay "balanced" until ~8 pain-free weeks, regardless of stated goals — explain why if the goal implies otherwise, and when it lifts.`
     : `Injury status: ${injuryProfile.recoveringMode ? `recovering, ${m.weeksTraining} logged weeks (specialization gate lifts around week 8)` : "not currently in injury recovery"}.`;
 
   const threshold = (injuryProfile.movementConstraints && injuryProfile.movementConstraints.painRule && injuryProfile.movementConstraints.painRule.threshold) ?? 3;
@@ -1263,9 +1280,9 @@ function buildCoachBrief(data, goalProfile, tier) {
 
   const librarySectionIntro = isFullTier
     ? `Full library: ${libraryExercises.length} exercises, tagged to match Gate 2. Constraint-check selections against the tags before proposing; if nothing fits, say so — never substitute or invent an unverifiable exercise.`
-    : `Live-program exercises (${libraryExercises.length} of ${ALL_KNOWN.length} total), id|name only — already gate-compliant as prescribed. exerciseId must come from this list; ask for the full tagged library to propose something new.`;
+    : `Live-program exercises (${libraryExercises.length} of ${ALL_KNOWN.length}), id|name only — already gate-compliant. exerciseId must come from this list (enforced); ask for the full tagged library to propose something new.`;
 
-  return `You are an evidence-based hypertrophy/recomposition coach reviewing real training data. Every <training_metrics> number is computed from logged sessions — never invent, round, or adjust them. Be direct: where goals conflict with constraints or research, say so.
+  return `You are an evidence-based hypertrophy/recomposition coach. <training_metrics> numbers are computed from logged sessions — never invent or adjust them. Be direct: where goals conflict with constraints/research, say so.
 
 <goal_profile>
 ${goalProfile.text || "(not stated yet)"}
@@ -1285,45 +1302,50 @@ ${formatExerciseLibraryCompact(libraryExercises, isFullTier)}
 </exercise_library>
 
 <training_metrics>
-${JSON.stringify({ ...m, lifts: undefined })}
+${JSON.stringify({ ...m, lifts: undefined }, (k, v) => (v === null ? undefined : v))}
 ${TRAINING_METRICS_LIFTS_LEGEND}
 ${formatLiftsCompact(m.lifts)}
 </training_metrics>
 
 <set_quality>
-Recent sets (weight x reps) with pain ("during"=same-session, "24h after"=delayed-onset). Rep decay >30-40%
-or under-range reps = load too heavy, don't repeat it. Pain >${threshold}/10 last session forces a
-reduction regardless of your proposal (Gate 4).
-${(data.sessions || []).slice(-5).map((s) => {
+Recent sets (weight x reps), most recent last. Rep decay >30-40% or under-range = too heavy, don't repeat
+it. Pain is in <pain_history>, not here.
+${(data.sessions || []).slice(-3).map((s) => {
     const setsStr = s.sets.map((x) => `${x.w || "BW"}x${x.r}`).join(", ");
-    // Always state both pain fields explicitly, in one of three states each
-    // (answered / dismissed / not yet asked) — never silently omit them.
-    // A dismissed or not-yet-asked entry must not read as "no pain
-    // reported" the way an absent clause would (see Task 4 review item 1:
-    // dismissed/unanswered pain is UNKNOWN, never zero, and that has to
-    // hold here too or the model will infer confidence the data doesn't
-    // support).
-    const duringStr = s.pain != null ? `${s.pain}/10` : "not logged";
-    const afterStr = s.painRetro != null ? `${s.painRetro}/10` : (s.painRetroDismissed === true ? "dismissed" : "not yet asked");
-    return `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: ${setsStr} (pain during: ${duringStr}, pain 24h after: ${afterStr})`;
+    return `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: ${setsStr}`;
   }).join("\n") || "(no sessions logged yet)"}
 </set_quality>
+
+<pain_history>
+Full history, never trimmed. During=same-session, 24h=delayed-onset. Pain >${threshold}/10 last session
+forces a load cut (Gate 4); escalation state is in <constraints>.
+${painHistoryEntries(data.sessions).map((s) => {
+    // Both pain fields stated explicitly, in one of three states each
+    // (answered / dismissed / not yet asked) — never silently omit them.
+    // A dismissed or not-yet-asked entry must not read as "no pain
+    // reported" the way an absent clause would (Task 4 review item 1:
+    // dismissed/unanswered pain is UNKNOWN, never zero).
+    const duringStr = s.pain != null ? `${s.pain}/10` : "not logged";
+    const afterStr = s.painRetro != null ? `${s.painRetro}/10` : (s.painRetroDismissed === true ? "dismissed" : "not yet asked");
+    return `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: during ${duringStr}, 24h ${afterStr}`;
+  }).join("\n") || "(no pain logged yet)"}
+</pain_history>
 
 <research_context>
 ${isFullTier
     ? `All ${RESEARCH_CORPUS.length} corpus entries, ranked by phase relevance (most relevant first) — not a subset.`
-    : `${research.length} of ${RESEARCH_CORPUS.length} corpus entries, most relevant to your current phase. Ask for the full corpus if this doesn't cover it.`}
-Where uncovered, say so rather than asserting.
+    : `${research.length} of ${RESEARCH_CORPUS.length} corpus entries, most phase-relevant. Ask for the full corpus if this doesn't cover it.`}
+Where uncovered, say so rather than assert.
 ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 </research_context>
 
 <instructions>
 1. Assess progress vs. goal with the real numbers — name lifts/trends.
-2. Check <set_quality>: flag collapsing/under-range reps, prescribe the fix (lower load or a back-off, never a repeat) — reduce where warranted, not just increase.
+2. Check <set_quality>/<pain_history>: flag rep collapse, under-range reps, or forced pain reduction; fix is lower load or a back-off, never a repeat.
 3. Push back on goal-vs-constraint/research conflicts; cite sources.
 4. Recommend: template ("balanced"|"upperFocus"|"superhero"); focus/group (shoulders/arms/chest/back/legs/core: maintain|normal|emphasize|specialize, max 2 emphasize+); sessionMin (45|60|75); calorieDelta (-300..300); next to watch. Optional \`prescriptions\`(exerciseId,dayKey,order,sets,repMin,repMax,load,restSec) + \`sessionRules\`(maxSetsPerMovement,orderByFocus,trimPriority,weeklyGroupSetCaps).
 5. Under 300 words.
-6. End with one \`\`\`json block: plan object only, optionally + prescriptions/sessionRules. Gated on apply; injury constraints aren't overridable.
+6. One \`\`\`json block: plan object, optionally + prescriptions/sessionRules. Gated on apply; injury constraints aren't overridable.
 </instructions>`;
 }
 
@@ -1604,6 +1626,25 @@ function exceedsDepthLimit(value, maxValue) {
 function gate1UnknownId(prescription) {
   if (!EX_BY_ID[prescription.exerciseId]) {
     return { reject: true, gate: 1, reason: `Unknown exercise id "${prescription.exerciseId}" — not in the library.` };
+  }
+  return { reject: false };
+}
+
+/* Gate 1b — checkin-tier scope. The checkin brief tells the model
+   exerciseId must come from the user's current program (it isn't shown
+   attributes/contraindications for anything else), but that's a prompt
+   instruction, not an enforced boundary — nothing stops a pasted plan
+   from naming an id outside that scope, seen or not. ctx.checkinScoped/
+   checkinScopeIds come from buildGateContext, driven by data.briefTier
+   (app-controlled state, set only by CoachCard's own Copy/Open actions —
+   never read off the pasted plan itself, so a pasted plan can't claim
+   "full" to escape this). Caller-agnostic like every other gate here:
+   only reads prescription.exerciseId and ctx. */
+function gate1bCheckinScope(prescription, ctx) {
+  if (!ctx.checkinScoped || !ctx.checkinScopeIds) return { reject: false };
+  if (!ctx.checkinScopeIds.has(prescription.exerciseId)) {
+    const ex = EX_BY_ID[prescription.exerciseId];
+    return { reject: true, gate: 1, reason: `"${ex ? ex.name : prescription.exerciseId}" isn't in your current program — this plan was generated at check-in scope, which can only reference existing program exercises. Ask for the full tagged library to propose something new.` };
   }
   return { reject: false };
 }
@@ -1902,6 +1943,9 @@ function runPrescriptionGates(prescription, ctx) {
   const g1 = gate1UnknownId(prescription);
   if (g1.reject) return { accepted: false, gate: g1.gate, reason: g1.reason };
 
+  const g1b = gate1bCheckinScope(prescription, ctx);
+  if (g1b.reject) return { accepted: false, gate: g1b.gate, reason: g1b.reason };
+
   const g2 = gate2Injury(prescription, ctx);
   if (g2.reject) return { accepted: false, gate: g2.gate, reason: g2.reason };
 
@@ -1975,6 +2019,13 @@ function applyGatedPrescriptions(prescriptions, ctx) {
 function buildGateContext(data, plan) {
   const injuryProfile = deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE);
   const threshold = (injuryProfile.movementConstraints && injuryProfile.movementConstraints.painRule && injuryProfile.movementConstraints.painRule.threshold) ?? 3;
+  // data.briefTier is set only by CoachCard's own Copy/Open actions when a
+  // brief is generated — never read off the pasted plan text, so a pasted
+  // plan can't self-declare "full" to escape checkin scoping (gate1b
+  // above). Absent/unrecognized defaults to scoped (checkin is the
+  // default tier and the more conservative assumption — same fail-safe
+  // pattern as recoveringMode's migration default).
+  const checkinScoped = data.briefTier !== "full";
   return {
     injuryProfile,
     sessions: data.sessions || [],
@@ -1983,6 +2034,8 @@ function buildGateContext(data, plan) {
     sessionMin: (plan && plan.sessionMin) || (data.plan && data.plan.sessionMin) || 60,
     deloadActive: deloadActive(data),
     escalatingCats: new Set(Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold))),
+    checkinScoped,
+    checkinScopeIds: checkinScoped ? checkInExerciseIds(data) : null,
   };
 }
 
@@ -3852,8 +3905,9 @@ function CoachCard({ data, persist }) {
     if (!goalText.trim()) { setErr("Describe your goal first — the brief includes it."); return; }
     setErr("");
     const profile = currentProfile();
-    persist({ ...data, goalProfile: profile });
-    const brief = buildCoachBrief(data, profile, authoring ? "full" : "checkin");
+    const briefTier = authoring ? "full" : "checkin";
+    persist({ ...data, goalProfile: profile, briefTier });
+    const brief = buildCoachBrief(data, profile, briefTier);
     try {
       await navigator.clipboard.writeText(brief);
       setCopyMsg("Copied — paste it into any Claude chat.");
@@ -3872,8 +3926,9 @@ function CoachCard({ data, persist }) {
     if (!goalText.trim()) { setErr("Describe your goal first — the brief includes it."); return; }
     setErr("");
     const profile = currentProfile();
-    persist({ ...data, goalProfile: profile });
-    const brief = buildCoachBrief(data, profile, authoring ? "full" : "checkin");
+    const briefTier = authoring ? "full" : "checkin";
+    persist({ ...data, goalProfile: profile, briefTier });
+    const brief = buildCoachBrief(data, profile, briefTier);
     const url = "https://claude.ai/new?q=" + encodeURIComponent(brief);
     if (url.length > 7500) {
       // Pre-existing race, surfaced by Task 5's much larger payload (the
