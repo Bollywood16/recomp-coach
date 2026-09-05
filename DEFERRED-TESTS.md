@@ -67,13 +67,78 @@ session budget (Gate 7), and deload overriding sets/load unconditionally
 runs (Gate 3 fallback, Gate 2 rejection via a real shipped exercise) with
 zero console errors.
 
+## Fixed in the 2026-09-05 review round (items 1-5)
+
+- **Item 1 — Gate 5 was suppressing Gates 3/4 on escalation, not tightening
+  them.** As first built, an escalating pattern lost its load sanity check
+  and its forced pain-rule reduction entirely — backwards from the intent.
+  Escalation is now a one-way ratchet: Gate 4's reduction is unconditional
+  (nothing suppresses it), Gate 3's ceiling tightens from +15% to "never
+  above last logged" (including when load is omitted and would otherwise
+  progress via `recommend()` at render time), and Gate 5 additionally caps
+  sets at the last logged count. See the ratchet comment directly above
+  `gate3LoadSanity` in index.html — written so it can't be re-inverted
+  without deleting the comment first.
+- **Item 2 — escalation now has a defined, automatic clearance.** 3
+  consecutive sessions on the pattern with an *answered* pain value at or
+  below threshold clears it (`isPainEscalating`); dismissed/unanswered
+  sessions hold the streak, they neither advance nor reset it. Clearance
+  is logged to `injuryProfileHistory` (via `PainEscalationNotice`'s
+  transition-detecting `useEffect`, not inside the pure `isPainEscalating`
+  read). The notice states the clearance condition explicitly.
+- **Item 3 — the "trending upward" heuristic is now pinned down in one
+  place** (the comment above `isPainEscalating`): among the last 4 sessions
+  for a pattern, if >=3 have an answered pain value, escalation triggers
+  when the most recent is >=2 points above the oldest in that window.
+  Explicitly labeled as a chosen heuristic with no clinical basis, biased
+  to over-trigger per instruction.
+- **Item 4 — `applyCoachGates` now picks known keys off `rec` instead of
+  spreading it.** `KNOWN_PLAN_KEYS` is the explicit allowlist; anything
+  else in a pasted plan is dropped and surfaced as an "ignored field"
+  message rather than silently carried through or silently doing nothing.
+  `check-write-isolation.js` asserts both that no `...rec` spread exists
+  and that `injuryProfile` is never in the allowlist.
+- **Item 5 — Gate 6's default cap decided.** When no `sessionRules.
+  weeklyGroupSetCaps` override exists, the default cap is
+  `max(group.mav, current program's baseline for that group)`
+  (`defaultGroupCap`) — never stricter than what the app already
+  prescribes unprompted. Residual limitation, not fixed: a prescription
+  meant to *replace* an exercise the baseline already counts (rather than
+  add to it) is still evaluated as pure addition, since Task 4 has no
+  concept of "this prescription supersedes that generator slot" — that
+  reconciliation is Task 2's job.
+
+## Item 6 — escalation's pattern grouping needs a real taxonomy (not fixed)
+
+Grouping by `cat` (the same field the swap picker uses) is wrong in both
+directions for escalation specifically:
+
+- **Too wide:** pain on any one lift suppresses/tightens every other lift
+  sharing that `cat` — e.g. any squat-cat exercise showing pain tightens
+  every other squat-cat exercise, even unrelated ones.
+- **Too narrow:** a hip labral issue presents across BOTH the squat and
+  hinge cats (loaded hip flexion in one, hip extension/hinge in the
+  other), which this grouping treats as two unrelated patterns — neither
+  alone may reach the 2-of-4 trigger even if the underlying joint is
+  clearly the common thread.
+
+This under-detects exactly the injury this app was built around. Not
+rebuilt now — needs a real pattern taxonomy (hip-dominant, knee-dominant,
+etc.) distinct from `cat`, owned by whichever task next touches the
+escalation gate. Flagged directly in `PainEscalationNotice`'s copy so it's
+not a silent gap to the user either.
+
 ## Also worth knowing (not a defect, not fixed, just observed)
 
-`MUSCLE_GROUPS.legs.mav` is 20, but the `balanced` template's own default
-program already prescribes ~26 leg sets/week with no focus adjustment at
-all. Gate 6 falls back to `mav` as the cap when no `sessionRules.
-weeklyGroupSetCaps` override is given (since Task 2 hasn't wired up real
-per-user caps yet) — meaning, today, Gate 6's *default* cap is stricter
-than the live program's own baseline for legs specifically. Not a Task 4
-bug (Task 2 is what makes this configurable for real), but worth someone's
-attention when Task 2 lands.
+Playwright's `page.evaluate()` cannot reach this app's top-level
+`const`/`let` bindings (EX_BY_ID, ALL_KNOWN, etc.) even though there's no
+ES module wrapper — Babel Standalone transforms and evaluates
+`<script type="text/babel">` content inside a function scope, so top-level
+declarations never land on `window`. Worked around during Task 4 by using
+real shipped exercises for browser-level fixture tests instead of
+injecting synthetic ones. For Task 6, don't fight this: either add a build
+step emitting a pre-transpiled test bundle, or expose a single
+explicitly-named test hook (`window.__RECOMP_TEST_HOOK__`) assigned only
+when a query param is present — and if the hook route is taken,
+`check-write-isolation.js` must assert it provides no write path to
+`injuryProfile`.

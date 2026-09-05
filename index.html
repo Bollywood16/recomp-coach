@@ -30,7 +30,7 @@
 
 <script type="text/babel" data-type="module">
 
-const { useState, useEffect, useMemo } = React;
+const { useState, useEffect, useMemo, useRef } = React;
 const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = Recharts;
 function Dumbbell(props){var size=props.size||24,sw=props.strokeWidth||2;return React.createElement("svg",Object.assign({},props,{width:size,height:size,viewBox:"0 0 24 24",fill:"none",stroke:(props.color||"currentColor"),strokeWidth:sw,strokeLinecap:"round",strokeLinejoin:"round",dangerouslySetInnerHTML:{__html:`<path d="M14.4 14.4 9.6 9.6"/><path d="M18.657 21.485a2 2 0 1 1-2.829-2.828l-1.767 1.768a2 2 0 1 1-2.829-2.829l6.364-6.364a2 2 0 1 1 2.829 2.829l-1.768 1.767a2 2 0 1 1 2.828 2.829z"/><path d="m21.5 21.5-1.4-1.4"/><path d="M3.9 3.9 2.5 2.5"/><path d="M6.404 12.768a2 2 0 1 1-2.829-2.829l1.768-1.767a2 2 0 1 1-2.828-2.829l2.828-2.828a2 2 0 1 1 2.829 2.828l1.767-1.768a2 2 0 1 1 2.829 2.829z"/>`}}));}
 function ClipboardList(props){var size=props.size||24,sw=props.strokeWidth||2;return React.createElement("svg",Object.assign({},props,{width:size,height:size,viewBox:"0 0 24 24",fill:"none",stroke:(props.color||"currentColor"),strokeWidth:sw,strokeLinecap:"round",strokeLinejoin:"round",dangerouslySetInnerHTML:{__html:`<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M12 11h4"/><path d="M12 16h4"/><path d="M8 11h.01"/><path d="M8 16h.01"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>`}}));}
@@ -1485,22 +1485,59 @@ function exerciseForRecommend(ex, prescription) {
   return { ...ex, repMin: prescription.repMin ?? ex.repMin, repMax: prescription.repMax ?? ex.repMax };
 }
 
+/* ESCALATION IS A ONE-WAY RATCHET TOWARD CONSERVATIVE. NEVER THE REVERSE.
+   Gates 3 and 4 exist to protect the user; a pattern showing escalating
+   pain is the worst state that protection could possibly be needed in.
+   Do not re-read "stop auto-adjusting" (Gate 5's spec line) as "stop
+   protecting" — a prior version of this file did exactly that (suppressed
+   Gates 3/4 entirely on escalation) and it was wrong: it removed the load
+   sanity check and the forced pain-rule reduction from the one movement
+   that needed them most. What escalation actually changes:
+     - Gate 4's forced reduction still applies, unconditionally, exactly as
+       it would without escalation — nothing below ever suppresses it.
+     - Gate 3's ceiling TIGHTENS from +15% to "never above last logged" —
+       no progression, not a relaxed check.
+     - Gate 5 additionally caps SETS at the last logged count for that
+       exercise — no added volume either.
+   If you are reading this while changing Gate 3, 4, or 5: escalation may
+   only ever make the result MORE conservative than the non-escalating
+   case would have produced, never less. */
+
 function gate3LoadSanity(prescription, ctx) {
-  if (prescription.load == null) return { reject: false }; // omitted => recommend() drives it, nothing to sanity-check
   const ex = EX_BY_ID[prescription.exerciseId];
   if (!ex) return { reject: false };
-  if (ctx.escalatingCats && ctx.escalatingCats.has(ex.cat)) {
-    return { reject: false, note: `Auto-adjustment suppressed for "${ex.name}" — escalating pain pattern on this movement (see Gate 5). Consult your treating clinician.` };
-  }
   const lastW = lastWorkingWeight(ctx.sessions, prescription.exerciseId);
+  const escalating = ctx.escalatingCats && ctx.escalatingCats.has(ex.cat);
+
+  if (prescription.load == null) {
+    // Omitted load normally means "let recommend() drive it at render
+    // time" — untouched. Escalation must still block an increase that
+    // would otherwise flow through recommend() later, not just one
+    // explicitly prescribed here, or the ratchet has a hole in it.
+    if (escalating && lastW != null) {
+      const rec = recommend(exerciseForRecommend(ex, prescription), ctx.sessions, ctx.deloadActive);
+      if (rec.weight > lastW) {
+        return {
+          reject: false,
+          value: { ...prescription, load: lastW, loadUnverified: true },
+          note: `"${ex.name}" is on an escalating pain pattern — load capped at your last logged ${lastW} lb; no progression until the pattern clears (Gate 5).`,
+        };
+      }
+    }
+    return { reject: false };
+  }
+
   if (lastW == null) return { reject: false }; // no logged history to sanity-check against yet
-  const ceiling = lastW * 1.15;
+  const ceiling = escalating ? lastW : lastW * 1.15;
   if (prescription.load > ceiling) {
     const rec = recommend(exerciseForRecommend(ex, prescription), ctx.sessions, ctx.deloadActive);
+    const fallback = escalating ? Math.min(rec.weight, lastW) : rec.weight;
     return {
       reject: false,
-      value: { ...prescription, load: rec.weight, loadUnverified: true },
-      note: `"${ex.name}" prescribed at ${prescription.load} lb is more than 15% above your last logged ${lastW} lb — falling back to ${rec.weight} lb.`,
+      value: { ...prescription, load: fallback, loadUnverified: true },
+      note: escalating
+        ? `"${ex.name}" prescribed at ${prescription.load} lb, but this pattern is escalating — capped at your last logged ${lastW} lb; no progression until it clears (Gate 5).`
+        : `"${ex.name}" prescribed at ${prescription.load} lb is more than 15% above your last logged ${lastW} lb — falling back to ${rec.weight} lb.`,
     };
   }
   return { reject: false };
@@ -1508,13 +1545,13 @@ function gate3LoadSanity(prescription, ctx) {
 
 /* Gate 4 — pain rule. injuryProfile destructured directly in the
    signature for the same check-write-isolation.js visibility reason as
-   Gate 2 — ...ctx recovers the rest (sessions, escalatingCats, deloadActive). */
+   Gate 2 — ...ctx recovers the rest (sessions, deloadActive). Unconditional:
+   nothing, including escalation, ever suppresses this. Escalation only
+   ever adds MORE restriction on top (Gate 3's tightened ceiling, Gate 5's
+   sets cap) — it never removes this one. */
 function gate4PainRule(prescription, { injuryProfile, ...ctx }) {
   const ex = EX_BY_ID[prescription.exerciseId];
   if (!ex) return { reject: false };
-  if (ctx.escalatingCats && ctx.escalatingCats.has(ex.cat)) {
-    return { reject: false, note: `Auto-adjustment suppressed for "${ex.name}" — escalating pain pattern on this movement (see Gate 5). Consult your treating clinician.` };
-  }
   const last = lastSessionFor(ctx.sessions, prescription.exerciseId);
   if (!last) return { reject: false };
   // "during OR within 24h after" — both live on the same session row.
@@ -1534,42 +1571,84 @@ function gate4PainRule(prescription, { injuryProfile, ...ctx }) {
   return { reject: false };
 }
 
-/* Gate 5 — pain escalation. This doesn't reject the prescription (the
-   movement can still be trained) — it flags the pattern as escalating so
-   Gates 3/4 stop auto-adjusting it (checked via ctx.escalatingCats, built
-   once per batch by isPainEscalating below) and surfaces a persistent
-   clinician-consult prompt (PainEscalationNotice). The app enforces
-   rules; it does not assess whether an injury is worsening — that
-   assessment is the clinician's, this just stops pretending an algorithm
-   should keep auto-correcting through it. */
+/* Gate 5 — pain escalation. Never rejects the prescription outright (the
+   movement can still be trained) — it tightens Gates 3/4 (see the ratchet
+   note above) and additionally caps SETS at the last logged count here, so
+   no volume is added on this pattern either. Surfaces a persistent
+   clinician-consult prompt (PainEscalationNotice) naming the pattern and
+   its clearance condition. The app enforces rules; it does not assess
+   whether an injury is worsening — that assessment is the clinician's. */
 function gate5PainEscalation(prescription, ctx) {
   const ex = EX_BY_ID[prescription.exerciseId];
   if (!ex || !ctx.escalatingCats || !ctx.escalatingCats.has(ex.cat)) return { reject: false };
+  const last = lastSessionFor(ctx.sessions, prescription.exerciseId);
+  const lastSetCount = last ? last.sets.length : null;
+  const requestedSets = prescription.sets || 3;
+  const setsCapped = lastSetCount != null && requestedSets > lastSetCount;
   return {
     reject: false,
-    note: `Pain escalation detected on the ${CAT_NAMES[ex.cat] || ex.cat} pattern — see the persistent clinician-consult prompt.`,
+    value: setsCapped ? { ...prescription, sets: lastSetCount, setsCapped: true } : undefined,
+    note: `Pain escalation on the ${CAT_NAMES[ex.cat] || ex.cat} pattern — no progression in load or sets until this pattern clears (3 consecutive logged sessions with answered pain at or below threshold). See the persistent clinician-consult prompt.${setsCapped ? ` Sets capped at ${lastSetCount}.` : ""}`,
   };
 }
 
-/* Escalation check backing Gate 5: pain >3/10 in >=2 of the last 4 logged
-   sessions for a movement pattern (grouped by `cat`, the same grouping the
-   swap picker already uses), OR baseline pain trending upward across that
-   window. The spec doesn't define "trending upward" precisely — this is a
-   stated, not the only defensible, definition: among the ANSWERED
-   (non-null, non-dismissed) pain values in the 4-session window, at least
-   3 must exist (fewer is noise, not a trend), and the most recent must be
-   >=2 points above the oldest. Dismissed/pending entries are excluded
-   entirely, never treated as 0 — see findAllPendingPainRetros. */
-function isPainEscalating(sessions, cat) {
+/* Escalation trigger AND clearance backing Gate 5, walked across the
+   pattern's full session history in chronological order — "currently
+   escalating" is a question about the sequence since the last trigger,
+   not a snapshot of the last few entries.
+
+   TRIGGER (fires once, sets escalating=true): at any point where the
+   trailing 4-session window has >=4 sessions and >=2 of them logged
+   answered pain over `threshold`, OR — the "trending upward" rule the
+   spec names but does not define, so pin it here precisely as an
+   EXPLICITLY CHOSEN HEURISTIC WITH NO CLINICAL BASIS, deliberately biased
+   to over-trigger rather than under-trigger: among that same trailing
+   4-session window, if at least 3 sessions have an answered pain value,
+   and the most recent answered value is at least 2 points higher than the
+   oldest answered value in the window.
+
+   CLEARANCE (fires once escalating, sets escalating=false): 3 CONSECUTIVE
+   sessions on the pattern with an ANSWERED pain value at or below
+   threshold. Dismissed/unanswered sessions are skipped entirely while
+   escalating — they neither advance nor reset the clean streak, they hold
+   it. An answered value over threshold resets the streak to 0.
+
+   Known limitation (see DEFERRED-TESTS.md): grouping by `cat` is both too
+   wide (any pain on ANY lift sharing a cat suppresses/tightens every other
+   lift in that cat) and too narrow (a hip labral issue presents across
+   BOTH the squat and hinge cats, which this treats as two unrelated
+   patterns, so neither alone may reach the 2-of-4 trigger). Not rebuilt
+   here — flagged in the notice copy and tracked for a real pattern
+   taxonomy (hip-dominant, knee-dominant, etc.) later. */
+function isPainEscalating(sessions, cat, threshold) {
+  const t = threshold ?? 3;
   const hist = (sessions || [])
     .filter((s) => (EX_BY_ID[s.exerciseId] || {}).cat === cat)
-    .sort((a, b) => (a.date < b.date ? 1 : -1))
-    .slice(0, 4);
+    .sort((a, b) => (a.date < b.date ? -1 : 1)); // oldest first
   const painOf = (s) => { const v = Math.max(s.pain ?? -1, s.painRetro ?? -1); return v >= 0 ? v : null; };
-  const answered = hist.map(painOf).filter((v) => v != null);
-  if (hist.length >= 4 && answered.filter((v) => v > 3).length >= 2) return true;
-  if (answered.length >= 3 && answered[0] - answered[answered.length - 1] >= 2) return true;
-  return false;
+  let escalating = false;
+  let cleanStreak = 0;
+  for (let i = 0; i < hist.length; i++) {
+    const window = hist.slice(Math.max(0, i - 3), i + 1);
+    const answeredInWindow = window.map(painOf).filter((v) => v != null);
+    const triggeredByCount = window.length >= 4 && answeredInWindow.filter((v) => v > t).length >= 2;
+    const triggeredByTrend = answeredInWindow.length >= 3 && answeredInWindow[answeredInWindow.length - 1] - answeredInWindow[0] >= 2;
+    if (!escalating && (triggeredByCount || triggeredByTrend)) {
+      escalating = true;
+      cleanStreak = 0;
+    } else if (escalating) {
+      const v = painOf(hist[i]);
+      if (v == null) {
+        // dismissed/unanswered — holds; neither clears nor extends
+      } else if (v <= t) {
+        cleanStreak++;
+        if (cleanStreak >= 3) escalating = false;
+      } else {
+        cleanStreak = 0;
+      }
+    }
+  }
+  return escalating;
 }
 
 /* Gate 7 — duration. Trims the lowest-priority sets first (mirrors
@@ -1618,6 +1697,25 @@ function gate8DeloadOverride(prescription) {
   return patch;
 }
 
+/* Gate 6's default cap, absent a real sessionRules.weeklyGroupSetCaps
+   override (Task 2 hasn't wired that up yet). MUSCLE_GROUPS[group].mav can
+   be lower than what the CURRENT default program already prescribes for
+   that group with zero focus adjustment (legs: mav=20 vs. the balanced
+   template's own ~26) — a gate that rejects the app's own unprompted
+   output trains the user to ignore rejections, so the default cap is never
+   allowed to sit below that baseline.
+   Known residual limitation, not fixed here: this removes the false
+   rejection of the baseline itself, but a prescription that's meant to
+   REPLACE an exercise the baseline already counts (rather than add to it)
+   still gets evaluated as pure addition, since Task 4 has no concept of
+   "this prescription supersedes that generator slot" — that reconciliation
+   is Task 2's job once prescriptions actually wire into day generation. */
+function defaultGroupCap(group, weeklyGroupSets) {
+  const mav = (MUSCLE_GROUPS[group] && MUSCLE_GROUPS[group].mav) || 0;
+  const baseline = (weeklyGroupSets && weeklyGroupSets[group]) || 0;
+  return Math.max(mav, baseline);
+}
+
 /* Runs gates 1-5 for a single prescription in order; short-circuits on the
    first outright rejection (1 or 2 — 3/4/5 only ever modify-and-continue,
    never reject outright, so there's nothing to short-circuit past them). */
@@ -1640,6 +1738,7 @@ function runPrescriptionGates(prescription, ctx) {
   if (g4.note) notes.push({ gate: 4, note: g4.note });
 
   const g5 = gate5PainEscalation(value, ctx);
+  if (g5.value) value = g5.value;
   if (g5.note) notes.push({ gate: 5, note: g5.note });
 
   return { accepted: true, value, notes };
@@ -1666,7 +1765,7 @@ function applyGatedPrescriptions(prescriptions, ctx) {
     const group = CAT_TO_GROUP[ex.cat];
     const addedSets = result.value.sets || 3;
     const current = (group && runningGroupSets[group]) || 0;
-    const cap = group ? ((ctx.weeklyGroupSetCaps && ctx.weeklyGroupSetCaps[group]) ?? (MUSCLE_GROUPS[group] && MUSCLE_GROUPS[group].mav)) : null;
+    const cap = group ? ((ctx.weeklyGroupSetCaps && ctx.weeklyGroupSetCaps[group]) ?? defaultGroupCap(group, ctx.weeklyGroupSets)) : null;
     if (group && cap != null && current + addedSets > cap) {
       rejections.push({
         exerciseId: result.value.exerciseId, gate: 6,
@@ -1695,14 +1794,16 @@ function applyGatedPrescriptions(prescriptions, ctx) {
    scripts/check-write-isolation.js's discovery scan; nothing here decides
    accept/reject. */
 function buildGateContext(data, plan) {
+  const injuryProfile = deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE);
+  const threshold = (injuryProfile.movementConstraints && injuryProfile.movementConstraints.painRule && injuryProfile.movementConstraints.painRule.threshold) ?? 3;
   return {
-    injuryProfile: deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE),
+    injuryProfile,
     sessions: data.sessions || [],
     weeklyGroupSets: weeklySetsByGroup(data),
     weeklyGroupSetCaps: (plan && plan.sessionRules && plan.sessionRules.weeklyGroupSetCaps) || {},
     sessionMin: (plan && plan.sessionMin) || (data.plan && data.plan.sessionMin) || 60,
     deloadActive: deloadActive(data),
-    escalatingCats: new Set(Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat))),
+    escalatingCats: new Set(Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold))),
   };
 }
 
@@ -2044,7 +2145,7 @@ function WorkoutFlow({ data, persist }) {
       <InjuryMigrationNotice data={data} persist={persist} />
       <GobletBoxSquatMigrationPrompt data={data} persist={persist} />
       <PendingPainRetroPrompts data={data} persist={persist} />
-      <PainEscalationNotice data={data} />
+      <PainEscalationNotice data={data} persist={persist} />
       {!injuryProfile.clinicianReviewed && <ClinicianReviewNotice />}
       {!day
         ? <DayPicker data={data} onPick={setDayId} persist={persist} />
@@ -2787,17 +2888,41 @@ function ClinicianReviewNotice({ compact }) {
 /* Gate 5's persistent clinician-consult prompt. Non-dismissable by design —
    the spec is explicit that the app enforces rules, it does not assess
    whether an injury is worsening, so this doesn't go away until the
-   underlying pattern (isPainEscalating) actually stops matching. */
-function PainEscalationNotice({ data }) {
-  const cats = Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat));
+   underlying pattern (isPainEscalating) actually clears on its own
+   (3 consecutive answered, at-or-below-threshold sessions — see
+   isPainEscalating). Clearance is automatic but logged to
+   injuryProfileHistory here, via a plain useEffect comparing this render's
+   escalating set to the previous one — not inside isPainEscalating itself,
+   which stays a pure, side-effect-free read. */
+function PainEscalationNotice({ data, persist }) {
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const threshold = (injuryProfile.movementConstraints && injuryProfile.movementConstraints.painRule && injuryProfile.movementConstraints.painRule.threshold) ?? 3;
+  const cats = Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold));
+  const prevCatsRef = useRef(cats);
+
+  useEffect(() => {
+    const prev = prevCatsRef.current;
+    const cleared = prev.filter((c) => !cats.includes(c));
+    if (cleared.length > 0) {
+      const at = new Date().toISOString();
+      const entries = cleared.map((cat) => ({ at, device: getDeviceId(), profile: null, note: `pain escalation cleared: ${CAT_NAMES[cat] || cat}` }));
+      persist({ ...data, injuryProfileHistory: [...(data.injuryProfileHistory || []), ...entries].slice(-50) });
+    }
+    prevCatsRef.current = cats;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cats.join(",")]);
+
   if (cats.length === 0) return null;
   return (
     <div style={{ ...S.card, background: "#FDECEC", display: "flex", gap: 10, alignItems: "flex-start" }}>
       <Flame size={18} color={C.red} style={{ marginTop: 1, flexShrink: 0 }} />
       <div style={{ fontSize: 12.5, color: "#3A3A3C", lineHeight: 1.45 }}>
-        <b style={{ color: C.red }}>Consult your treating clinician:</b> pain above 3/10 has recurred on the{" "}
-        {cats.map((c) => CAT_NAMES[c] || c).join(", ")} pattern. Auto-adjustment is suppressed for these movements —
-        this app enforces load/volume rules, it does not assess whether an injury is worsening.
+        <b style={{ color: C.red }}>Consult your treating clinician:</b> pain above {threshold}/10 has recurred on
+        the {cats.map((c) => CAT_NAMES[c] || c).join(", ")} pattern. No progression in load or sets is allowed on
+        these movements until it clears — 3 consecutive logged sessions with answered pain at or below {threshold}/10
+        (a dismissed or unanswered session doesn't count either way). This grouping is by movement pattern
+        (e.g. all squat-cat lifts together) and won't catch a pattern spanning two groups, like squat and hinge —
+        this app enforces rules, it does not assess whether an injury is worsening.
       </div>
     </div>
   );
@@ -3435,21 +3560,28 @@ function coachMetrics(data) {
   };
 }
 
+// `rec` is arbitrary parsed JSON from a pasted LLM reply. applyCoachGates
+// used to build `gated` via `{ ...rec, gates: [] }` — a blind spread that
+// would carry through ANY key rec happened to contain, including one
+// named injuryProfile (safe today only because persist() call sites pick
+// fields off `gated` individually, an accident of the current code shape,
+// not a guarantee). PICK known keys instead of spreading: an unrecognized
+// key (injuryProfile, or whatever Task 6 adds — days, splitPattern,
+// versioning) is dropped and reported as an ignored field, never silently
+// carried through on the chance nothing downstream reads it back out.
+// check-write-isolation.js asserts injuryProfile is never in this list.
+const KNOWN_PLAN_KEYS = ["template", "focus", "sessionMin", "calorieDelta", "prescriptions", "pushback", "assessment", "nutritionNote", "nextCheckIn"];
+
 function applyCoachGates(rec, metrics, injuryProfile, data) {
   // Frozen at the parser/gate path boundary — see deepFreeze. This is the
   // actual entry point a pasted plan's data flows through today.
   injuryProfile = deepFreeze(injuryProfile || DEFAULT_INJURY_PROFILE);
-  const gated = { ...rec, gates: [] };
-  // `rec` is arbitrary parsed JSON from a pasted LLM reply — the blind
-  // spread above would otherwise carry through ANY key it contains,
-  // including one named injuryProfile. Nothing downstream currently pulls
-  // gated.injuryProfile back out into `data` (persist() calls pick fields
-  // off `gated` individually), so this was not exploitable today — but
-  // that safety was accidental, not structural, and a future persist()
-  // that spread ...gated directly would have smuggled it straight through.
-  // Delete it explicitly so "the parser has no write path to injuryProfile"
-  // holds regardless of how downstream code evolves.
-  delete gated.injuryProfile;
+  const gated = { gates: [] };
+  KNOWN_PLAN_KEYS.forEach((k) => { if (rec && rec[k] !== undefined) gated[k] = rec[k]; });
+  const ignoredKeys = Object.keys(rec || {}).filter((k) => !KNOWN_PLAN_KEYS.includes(k));
+  if (ignoredKeys.length) {
+    gated.gates.push(`Ignored unrecognized field${ignoredKeys.length > 1 ? "s" : ""} in the pasted plan: ${ignoredKeys.join(", ")}.`);
+  }
   // Job (b) only — specialization timing. Job (a), movement safety, is Gate 2
   // (Task 4) and reads injuryProfile.recoveringMode directly; it is never
   // folded into this override, and this override never touches recoveringMode.

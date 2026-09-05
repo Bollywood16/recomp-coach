@@ -148,17 +148,23 @@ REVIEWED_READERS.forEach((name) => {
   }
 });
 
-// 5. applyCoachGates spreads `rec` — arbitrary parsed JSON from a pasted
-// LLM reply — into `gated`. That blind spread would otherwise carry
-// through a key named injuryProfile if one were present in the parsed
-// JSON; nothing downstream happening to not read it back out is an
-// accident of the current persist() call shapes, not a guarantee. Assert
-// the explicit scrub is still there rather than trusting that accident to
-// hold forever.
+// 5. applyCoachGates must construct `gated` via an explicit allowlist pick
+// over `rec` (arbitrary parsed JSON from a pasted LLM reply) — never a
+// blind `{...rec}` spread — so an unrecognized key (injuryProfile, or
+// whatever Task 6 adds later: days, splitPattern, versioning) is dropped
+// and reported, not silently carried through on the chance nothing
+// downstream reads it back out. Assert both: no spread-of-rec pattern
+// anywhere in the function, and injuryProfile is not in the allowlist.
 {
   const fn = extractFunctionBody("applyCoachGates");
-  if (fn && !/delete\s+gated\.injuryProfile/.test(fn.body)) {
-    failures.push("applyCoachGates no longer scrubs gated.injuryProfile after spreading `rec` — a pasted plan's parsed JSON could carry an injuryProfile key straight through if a future persist() call ever spreads ...gated directly.");
+  if (fn && /\.\.\.\s*rec\b/.test(fn.body)) {
+    failures.push("applyCoachGates spreads `rec` (e.g. `{...rec}`) instead of picking known keys off it — an unrecognized key (injuryProfile, or whatever Task 6 adds) would be silently carried through.");
+  }
+  const keysMatch = src.match(/KNOWN_PLAN_KEYS\s*=\s*\[([^\]]*)\]/);
+  if (!keysMatch) {
+    failures.push("Could not find the KNOWN_PLAN_KEYS allowlist applyCoachGates picks from — has it been renamed?");
+  } else if (/injuryProfile/.test(keysMatch[1])) {
+    failures.push("KNOWN_PLAN_KEYS includes injuryProfile — it must never be a pickable field from a pasted plan.");
   }
 }
 
