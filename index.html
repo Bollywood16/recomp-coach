@@ -1419,33 +1419,73 @@ function resolveSlot(slot, swaps, focus) {
 
 /* Single source of truth for "what does this day actually contain right
    now" — generator slots (through any active swap, focus-adjusted) plus
-   focus-driven bonus lifts. Every caller that needs a day's exercise list
-   (DayPage's render, the weekly volume tally, the time-budget estimate,
-   the focus-effect summary) goes through this one function so they can
-   never compute a different answer from one another — the exact gap that
-   let Gate 6's tally (weeklySetsByGroup) drift from what DayPage actually
-   renders once prescriptions entered the picture (Task 2 handoff note,
-   items 1-2 in DEFERRED-TESTS.md).
+   focus-driven bonus lifts, RECONCILED against any gated prescriptions
+   Task 2's paste-apply pipeline stored for this day. Every caller that
+   needs a day's exercise list (DayPage's render, the weekly volume tally,
+   the time-budget estimate, the focus-effect summary, and — as of Task 2
+   commit 3 — DayPicker.lastDone) goes through this one function so they
+   can never compute a different answer from one another. This is also
+   the exact lookup buildGateContext's ctx.currentSlotFor uses, so the
+   gate-time "does this replace something" decision and the render-time
+   splice-vs-push decision read the same predicate, not two that could
+   drift apart (see applyGatedPrescriptions' tally subtraction and
+   gate1dAmbiguousMatch).
+
    Returns {slot, ex} pairs: `slot` is what a swap picker needs (the
-   original program slot for a generator exercise, or the bonus exercise
-   object itself, since a bonus lift has no separate "slot" — see
-   bonusForDay) — `ex` is the resolved, focus-adjusted exercise to render
-   or count.
-   Deliberately excludes DayPicker.lastDone: that check only needs raw
-   generator-slot ids (not bonus lifts, not focus-adjusted sets) to answer
-   "have I touched this day's core lifts recently" — folding bonus lifts in
-   would silently widen what counts as "done", a behavior change this
-   function is not meant to make. Left as its own narrower one-liner.
-   No reconciliation with data.plan.prescriptions yet — that lands as its
-   own change on top of this (Task 2), once this consolidation is proven
-   behavior-neutral by scripts/check-day-resolution.js. */
+   original program slot for a generator exercise, or the bonus/
+   prescribed exercise object itself, since neither has a separate
+   "slot") — `ex` is the resolved exercise to render or count.
+
+   Reconciliation (Task 2 commit 3, proposal section 2): REPLACE is the
+   default — a prescription whose exerciseId already resolves to
+   something in this day's list overrides that entry's sets/reps/load IN
+   PLACE (same array index — critical for weeklySetsByGroup, whose
+   accumulation loop just sums whatever's in this list once; growing the
+   array here would double-count). A prescription whose exerciseId
+   matches nothing in the day is an ADD — pushed as a new entry. A
+   prescription matching MORE than one entry (only possible via two
+   independently swapped slots converging on the same exercise) is
+   skipped defensively here rather than guessed at — the authoritative
+   reject-with-reason for that case is gate1dAmbiguousMatch, at apply
+   time, against the state that existed when the prescription was gated;
+   this is only a fallback for state drifting via a NEW swap made after
+   that (rare, user-deliberate, and fails toward the generator's own
+   already-approved output rather than toward doubling volume). */
 function resolveDayExercises(day, data) {
   const focus = data.focus || DEFAULT_FOCUS;
   const program = getProgram(data);
-  return [
+  const list = [
     ...day.exercises.map((s) => ({ slot: s, ex: resolveSlot(s, data.swaps, focus) })),
     ...bonusForDay(day, focus, program).map((b) => ({ slot: b, ex: b })),
   ];
+  const prescriptions = ((data.plan && data.plan.prescriptions) || []).filter((p) => p.dayKey === day.id);
+  const OVERRIDE_FIELDS = ["sets", "repMin", "repMax", "restSec"];
+  prescriptions.forEach((p) => {
+    const matchIdx = [];
+    list.forEach((entry, i) => { if (entry.ex.id === p.exerciseId) matchIdx.push(i); });
+    if (matchIdx.length > 1) return; // ambiguous — see comment above, skip defensively
+    const overrides = {};
+    OVERRIDE_FIELDS.forEach((k) => { if (p[k] !== undefined) overrides[k] = p[k]; });
+    if (p.load !== undefined) overrides.prescribedLoad = p.load;
+    if (matchIdx.length === 1) {
+      const i = matchIdx[0];
+      const mergedEx = { ...list[i].ex, ...overrides, prescribed: true, prescriptionApplied: "replace" };
+      list[i] = { slot: list[i].slot, ex: mergedEx };
+    } else {
+      const base = EX_BY_ID[p.exerciseId];
+      if (!base) return; // shouldn't happen — Gate 1 already validated existence at apply time
+      const sets = overrides.sets ?? 3;
+      const added = {
+        ...base, sets, baseSets: sets,
+        repMin: overrides.repMin ?? base.repMin, repMax: overrides.repMax ?? base.repMax,
+        restSec: overrides.restSec, prescribedLoad: overrides.prescribedLoad,
+        slotId: base.id, swapped: false, focusBoost: false,
+        prescribed: true, prescriptionApplied: "add",
+      };
+      list.push({ slot: added, ex: added });
+    }
+  });
+  return list;
 }
 
 /* Working weight = heaviest weight used in the most recent session of a lift */
@@ -1456,8 +1496,25 @@ function lastWorkingWeight(sessions, exId) {
 }
 
 /* Recommendation engine: double progression, plus cross-lift estimation for
-   exercises you haven't logged yet (used when swapping something new in). */
+   exercises you haven't logged yet (used when swapping something new in).
+   ex.prescribedLoad (set by resolveDayExercises's reconciliation when a
+   gated prescription supplied an explicit `load`) takes priority over
+   every other branch below — it's already passed Gate 3/4/5's safety
+   checks against logged history, so there's nothing left for this
+   function's own history-driven logic to add. Checked BEFORE the deload
+   branch, not after: deload still overrides a prescribed load exactly as
+   it overrides everything else here (Gate 8), it just does so at render
+   time now instead of being baked into the stored prescription — see the
+   comment on applyGatedPrescriptions' deload handling for why. Omitting
+   `load` on a prescription (ex.prescribedLoad left unset) means "keep
+   using this engine," unaffected — the normal history-driven path below
+   runs exactly as it does for a plain generator exercise. */
 function recommend(ex, sessions, deload) {
+  if (ex.prescribedLoad != null) {
+    return deload
+      ? { weight: round5(ex.prescribedLoad * 0.9), tag: "Deload", note: `Deload week: ~90% of your coach-prescribed ${ex.prescribedLoad} lb, reduced sets, stop 3-4 reps shy of failure. Recovery is the goal.` }
+      : { weight: ex.prescribedLoad, tag: "Prescribed", note: "From your applied coach plan — verified against your logged history before it was applied." };
+  }
   const hist = sessions
     .filter((s) => s.exerciseId === ex.id)
     .sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -1667,6 +1724,51 @@ function gate1bCheckinScope(prescription, ctx) {
   if (!ctx.checkinScopeIds.has(prescription.exerciseId)) {
     const ex = EX_BY_ID[prescription.exerciseId];
     return { reject: true, gate: 1, reason: `"${ex ? ex.name : prescription.exerciseId}" isn't in your current program — this plan was generated at check-in scope, which can only reference existing program exercises. Ask for the full tagged library to propose something new.` };
+  }
+  return { reject: false };
+}
+
+/* Gate 1c — dayKey required and must name a day the CURRENT template
+ * actually generates (Task 2 commit 3, TASK-2-RECONCILIATION-PROPOSAL.txt
+ * section 2/Q2). dayKey is an identity field, not an omittable override
+ * parameter like sets/repMin/load — without it there's no way to know
+ * which day a REPLACE targets or an ADD lands on. Reject rather than
+ * silently guess or silently drop, same as every other gate here.
+ * ctx.programDayIds comes from buildGateContext (getProgram(data).map(d
+ * => d.id)) — the current template's own day ids, so switching templates
+ * makes a stale dayKey invalid here automatically, not just inert at
+ * render time. */
+function gate1cDayKey(prescription, ctx) {
+  if (!prescription.dayKey) {
+    return { reject: true, gate: 1, reason: `Prescription for "${(EX_BY_ID[prescription.exerciseId] || {}).name || prescription.exerciseId}" is missing dayKey — every prescription must name which day it applies to.` };
+  }
+  if (ctx.programDayIds && !ctx.programDayIds.has(prescription.dayKey)) {
+    const valid = [...ctx.programDayIds].join(", ");
+    return { reject: true, gate: 1, reason: `"${prescription.dayKey}" isn't a day in your current template — valid days are: ${valid}.` };
+  }
+  return { reject: false };
+}
+
+/* Gate 1d — ambiguous match. If the exerciseId this prescription names
+ * already appears MORE THAN ONCE in that day's current rendered output,
+ * there's no way to tell which occurrence it means to override — applying
+ * it to both would double the volume it's trying to control, exactly the
+ * failure this build exists to prevent (Q1, proposal section 3). This is
+ * rare under the static generator alone (verified: no template's day list
+ * repeats an exerciseId) — it only arises when two DIFFERENT slots have
+ * independently been user-swapped to the same replacement exercise.
+ * Reject rather than guess, naming both slot ids so the user can tell
+ * which swap to undo. ctx.currentSlotFor is the same day-resolution
+ * lookup applyGatedPrescriptions' tally subtraction uses — one predicate
+ * answering "what does this match" for both the reject decision here and
+ * the subtract-before-add arithmetic there, so they can't disagree. */
+function gate1dAmbiguousMatch(prescription, ctx) {
+  if (!ctx.currentSlotFor) return { reject: false };
+  const matches = ctx.currentSlotFor(prescription.dayKey, prescription.exerciseId);
+  if (matches.length > 1) {
+    const slotIds = matches.map((m) => m.slot.id).join(", ");
+    const ex = EX_BY_ID[prescription.exerciseId];
+    return { reject: true, gate: 1, reason: `"${ex ? ex.name : prescription.exerciseId}" appears more than once on this day (slots: ${slotIds}) — likely two different exercises independently swapped to the same one. Can't tell which occurrence this prescription means; undo one of the swaps first.` };
   }
   return { reject: false };
 }
@@ -1928,16 +2030,24 @@ function gate7DurationTrim(prescriptions, sessionMin) {
 
 /* Gate 8 — deload overrides all prescriptions, unconditionally: ~60% sets
    (never below the same per-movement floor fitDayToTime uses), ~90% load.
-   Matches the existing deload conventions in DayPage/recommend() rather
-   than inventing a second deload scaling rule. */
-function gate8DeloadOverride(prescription) {
-  const ex = EX_BY_ID[prescription.exerciseId];
-  const baseSets = prescription.sets || 3;
-  const deloadSets = Math.max(isCompound(ex) ? 2 : 1, Math.round(baseSets * 0.6));
-  const patch = { ...prescription, sets: deloadSets, deloadApplied: true };
-  if (prescription.load != null) patch.load = round5(prescription.load * 0.9);
-  return patch;
-}
+   AMENDMENT (Task 2 commit 3, recorded in DEFERRED-TESTS.md): this used to
+   be a function here that mutated a SURVIVING prescription's sets/load
+   before storing it, baking deload scaling into data.plan.prescriptions
+   at apply time. That was wrong once prescriptions actually render
+   (Task 2): deload state can change AFTER a plan was applied (a deload
+   week starting or ending doesn't re-trigger a paste), so a value frozen
+   at apply time goes stale, and — worse — DayPage's own render-time
+   deload scaling (its `isDeload` block) would then scale an
+   already-scaled stored value a second time, silently compounding.
+   Deload scaling is now render-time-only, applied uniformly to every
+   entry resolveDayExercises produces (generator, bonus, AND
+   prescription-reconciled alike) exactly once, by whichever caller
+   already owns that job: DayPage's isDeload block for sets (unchanged —
+   it already applied to every entry, this just means a reconciled entry
+   is no exception), and recommend()'s ex.prescribedLoad branch for load
+   (new — see the comment there). Stored prescriptions therefore always
+   hold RAW values; see scripts/check-prescription-reconciliation.js's
+   assertion that a stored prescription's load is never deload-scaled. */
 
 /* Gate 6's default cap, absent a real sessionRules.weeklyGroupSetCaps
    override (Task 2 hasn't wired that up yet). MUSCLE_GROUPS[group].mav can
@@ -1958,15 +2068,22 @@ function defaultGroupCap(group, weeklyGroupSets) {
   return Math.max(mav, baseline);
 }
 
-/* Runs gates 1-5 for a single prescription in order; short-circuits on the
-   first outright rejection (1 or 2 — 3/4/5 only ever modify-and-continue,
-   never reject outright, so there's nothing to short-circuit past them). */
+/* Runs gates 1/1b/1c/1d/2-5 for a single prescription in order;
+   short-circuits on the first outright rejection (everything in the 1
+   family, plus 2 — 3/4/5 only ever modify-and-continue, never reject
+   outright, so there's nothing to short-circuit past them). */
 function runPrescriptionGates(prescription, ctx) {
   const g1 = gate1UnknownId(prescription);
   if (g1.reject) return { accepted: false, gate: g1.gate, reason: g1.reason };
 
   const g1b = gate1bCheckinScope(prescription, ctx);
   if (g1b.reject) return { accepted: false, gate: g1b.gate, reason: g1b.reason };
+
+  const g1c = gate1cDayKey(prescription, ctx);
+  if (g1c.reject) return { accepted: false, gate: g1c.gate, reason: g1c.reason };
+
+  const g1d = gate1dAmbiguousMatch(prescription, ctx);
+  if (g1d.reject) return { accepted: false, gate: g1d.gate, reason: g1d.reason };
 
   const g2 = gate2Injury(prescription, ctx);
   if (g2.reject) return { accepted: false, gate: g2.gate, reason: g2.reason };
@@ -1999,6 +2116,14 @@ function applyGatedPrescriptions(prescriptions, ctx) {
   const notes = [];
   const runningGroupSets = { ...(ctx.weeklyGroupSets || {}) };
   const survivors = [];
+  // Within-batch collision guard (Task 2 commit 3): two prescriptions in
+  // the SAME paste naming the same (dayKey, exerciseId) pair would each
+  // independently subtract the same baseline slot's sets below — first
+  // one subtracts correctly, second one subtracts again from an already-
+  // adjusted tally. Deterministic first-wins by array order (the order
+  // `prescriptions` arrives in) — the first claims the slot, every later
+  // one targeting the same pair is rejected, naming which one was kept.
+  const claimed = new Map(); // "dayKey::exerciseId" -> the exerciseId's display name
 
   prescriptions.forEach((p) => {
     const result = runPrescriptionGates(p, ctx);
@@ -2007,9 +2132,30 @@ function applyGatedPrescriptions(prescriptions, ctx) {
       return;
     }
     const ex = EX_BY_ID[result.value.exerciseId];
+    const key = `${result.value.dayKey}::${result.value.exerciseId}`;
+    if (claimed.has(key)) {
+      rejections.push({
+        exerciseId: result.value.exerciseId, gate: 1,
+        reason: `A prescription for "${ex.name}" on this day was already applied earlier in this same plan — the first one (in the order Claude's reply listed them) wins; this duplicate is dropped.`,
+      });
+      return;
+    }
     const group = CAT_TO_GROUP[ex.cat];
     const addedSets = result.value.sets || 3;
-    const current = (group && runningGroupSets[group]) || 0;
+    // Reconciliation-aware tally (Task 2 commit 3, closes the legs-cap
+    // headroom gap from DEFERRED-TESTS.md's handoff note): ctx.
+    // currentSlotFor is built from the exact same resolveDayExercises
+    // this prescription will be spliced into at render time — one
+    // predicate answers both "does this replace something" (render) and
+    // "how much do I subtract before adding" (here), so they can't drift
+    // apart. gate1dAmbiguousMatch already rejected the >1-match case
+    // upstream, so this is always 0 (ADD) or 1 (REPLACE) here.
+    const matches = ctx.currentSlotFor ? ctx.currentSlotFor(result.value.dayKey, result.value.exerciseId) : [];
+    const isReplace = matches.length === 1;
+    let current = (group && runningGroupSets[group]) || 0;
+    if (isReplace && group) {
+      current = Math.max(0, current - (matches[0].ex.sets || 0));
+    }
     const cap = group ? ((ctx.weeklyGroupSetCaps && ctx.weeklyGroupSetCaps[group]) ?? defaultGroupCap(group, ctx.weeklyGroupSets)) : null;
     if (group && cap != null && current + addedSets > cap) {
       rejections.push({
@@ -2019,7 +2165,12 @@ function applyGatedPrescriptions(prescriptions, ctx) {
       return;
     }
     if (group) runningGroupSets[group] = current + addedSets;
+    claimed.set(key, ex.name);
     (result.notes || []).forEach((n) => notes.push({ exerciseId: result.value.exerciseId, ...n }));
+    notes.push({
+      exerciseId: result.value.exerciseId, gate: "reconcile",
+      note: isReplace ? `Replaces the existing "${ex.name}" on this day.` : `Adds "${ex.name}" as a new exercise on this day.`,
+    });
     survivors.push(result.value);
   });
 
@@ -2028,8 +2179,13 @@ function applyGatedPrescriptions(prescriptions, ctx) {
     notes.push({ gate: 7, note: `Fitted to your ${ctx.sessionMin || 60}-minute session: trimmed ${trimmed.trimmedCount} set${trimmed.trimmedCount !== 1 ? "s" : ""}${trimmed.dropped.length ? `, dropped ${trimmed.dropped.join(", ")}` : ""}.` });
   }
 
-  const final = ctx.deloadActive ? trimmed.list.map(gate8DeloadOverride) : trimmed.list;
-  if (ctx.deloadActive) notes.push({ gate: 8, note: "Deload week active — sets and loads overridden regardless of the prescription." });
+  // Gate 8: deload no longer mutates what's stored here — see the amended
+  // comment above where gate8DeloadOverride used to be. Still worth
+  // telling the user it's in effect; the actual scaling happens at render
+  // time now (recommend()'s ex.prescribedLoad branch for load, DayPage's
+  // isDeload block for sets), uniformly across every rendered entry.
+  const final = trimmed.list;
+  if (ctx.deloadActive) notes.push({ gate: 8, note: "Deload week active — sets and loads will be scaled down wherever this plan renders, regardless of what's prescribed here." });
 
   return { accepted: final, rejections, notes };
 }
@@ -2048,6 +2204,27 @@ function buildGateContext(data, plan) {
   // default tier and the more conservative assumption — same fail-safe
   // pattern as recoveringMode's migration default).
   const checkinScoped = data.briefTier !== "full";
+  // Reconciliation lookups (Task 2 commit 3): both dayKey validity (Gate
+  // 1c) and "does this exerciseId already exist on this day" (Gate 1d,
+  // and the tally subtraction in applyGatedPrescriptions) need to agree
+  // with what resolveDayExercises will actually splice this batch's
+  // survivors into at render time — so both read through it directly
+  // rather than re-deriving the day's contents their own way. Memoized
+  // per dayKey: several prescriptions in one batch commonly target the
+  // same day. Built from `data` as it stands BEFORE this batch is
+  // applied — that's the correct "current baseline" Gate 6 compares
+  // against; the batch's own survivors are added on top by
+  // applyGatedPrescriptions as they're accepted, not visible here.
+  const program = getProgram(data);
+  const dayCache = {};
+  const currentSlotFor = (dayKey, exerciseId) => {
+    if (!dayKey) return [];
+    if (!(dayKey in dayCache)) {
+      const day = program.find((d) => d.id === dayKey);
+      dayCache[dayKey] = day ? resolveDayExercises(day, data) : [];
+    }
+    return dayCache[dayKey].filter((entry) => entry.ex.id === exerciseId);
+  };
   return {
     injuryProfile,
     sessions: data.sessions || [],
@@ -2058,14 +2235,30 @@ function buildGateContext(data, plan) {
     escalatingCats: new Set(Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold))),
     checkinScoped,
     checkinScopeIds: checkinScoped ? checkInExerciseIds(data) : null,
+    programDayIds: new Set(program.map((d) => d.id)),
+    currentSlotFor,
   };
 }
 
 
+function formatRestSeconds(sec) {
+  if (sec < 60) return `${sec} s`;
+  const min = sec / 60;
+  return `${Number.isInteger(min) ? min : min.toFixed(1)} min`;
+}
+
 /* Rest recommendations: heavier compounds recover better with 2–3 min
    (rest-interval literature favors >=2 min for hypertrophy on big lifts);
-   isolation work is productive at 60–90 s. */
+   isolation work is productive at 60–90 s. ex.restSec (a gated
+   prescription's own restSec, reconciled onto the exercise by
+   resolveDayExercises — Task 2) overrides the category default: a coach
+   explicitly dialing in rest is a deliberate choice, not a generic
+   fallback, and this is the one function both the display text and the
+   duration/trim math (fitDayToTime, gate7DurationTrim, dayDurationMin)
+   read rest from — overriding here is what makes a prescribed restSec
+   visible AND correctly estimated everywhere, not just one of the two. */
 function restFor(ex) {
+  if (ex.restSec != null) return { sec: ex.restSec, label: formatRestSeconds(ex.restSec) };
   if (["squat", "hinge", "glute"].includes(ex.cat)) return { sec: 180, label: "2–3 min" };
   if (["hpress", "vpress", "hpull", "vpull"].includes(ex.cat)) return { sec: 120, label: "~2 min" };
   return { sec: 90, label: "60–90 s" };
@@ -2400,6 +2593,7 @@ function WorkoutFlow({ data, persist }) {
       <GobletBoxSquatMigrationPrompt data={data} persist={persist} />
       <PendingPainRetroPrompts data={data} persist={persist} />
       <PainEscalationNotice data={data} persist={persist} />
+      <StalePrescriptionsNotice data={data} />
       {!injuryProfile.clinicianReviewed && <ClinicianReviewNotice />}
       {!day
         ? <DayPicker data={data} onPick={setDayId} persist={persist} />
@@ -2412,8 +2606,17 @@ function DayPicker({ data, onPick, persist }) {
   const program = getProgram(data);
   const tmpl = TEMPLATES.find((t) => t.key === ((data.plan && data.plan.template) || "balanced"));
 
+  // Task 2 commit 3: now goes through resolveDayExercises (excluding bonus
+  // lifts) rather than a static day.exercises-only list. A prescription can
+  // ADD an exercise that isn't in the generator's own list for this day —
+  // if the user logged THAT exercise, "last done" should reflect it, since
+  // it's genuinely part of what this day is now programmed as. Bonus lifts
+  // stay excluded on purpose (unchanged from before this commit): they're
+  // ambient, focus-slider-driven, and can churn independent of what the
+  // user actually chose to do — not the stable notion of "this day" that a
+  // deliberate, gate-approved coach prescription is.
   const lastDone = (day) => {
-    const ids = day.exercises.map((slot) => resolveSlot(slot, data.swaps).id);
+    const ids = resolveDayExercises(day, data).filter(({ ex }) => !ex.isBonus).map(({ ex }) => ex.id);
     const dates = data.sessions.filter((s) => ids.includes(s.exerciseId)).map((s) => s.date);
     return dates.length ? dates.sort().slice(-1)[0] : null;
   };
@@ -3179,6 +3382,36 @@ function PainEscalationNotice({ data, persist }) {
   );
 }
 
+/* Task 2 commit 3, proposal Q5. dayKey values are template-namespaced
+   (upperA/lowerA... vs ufUpperA/ufArms... vs shPush/shLower...), so
+   switching templates already makes a stored prescription inert with zero
+   extra code — resolveDayExercises just never finds a matching dayKey in
+   the new template's day list. Retained, not deleted (manual template
+   switches at 2335/4286-ish already spread ...plan untouched, and
+   applyPasted's own wholesale-replace only happens on the NEXT paste-
+   apply). What's missing without this notice is visibility: a
+   prescription silently doing nothing looks identical to one that was
+   never gated at all. Purely informational, no persist — nothing here
+   needs to write anything, it just names what's inert and why. */
+function StalePrescriptionsNotice({ data }) {
+  const prescriptions = (data.plan && data.plan.prescriptions) || [];
+  if (!prescriptions.length) return null;
+  const currentDayIds = new Set(getProgram(data).map((d) => d.id));
+  const stale = prescriptions.filter((p) => !currentDayIds.has(p.dayKey));
+  if (!stale.length) return null;
+  const names = [...new Set(stale.map((p) => (EX_BY_ID[p.exerciseId] || {}).name || p.exerciseId))];
+  return (
+    <div style={{ ...S.card, background: "#F7F7FA", display: "flex", gap: 10, alignItems: "flex-start" }}>
+      <ClipboardList size={18} color={C.sub} style={{ marginTop: 1, flexShrink: 0 }} />
+      <div style={{ fontSize: 12.5, color: "#3A3A3C", lineHeight: 1.45 }}>
+        <b>{stale.length} prescription{stale.length !== 1 ? "s" : ""} not applying:</b> {names.join(", ")} — from a
+        coach plan applied under a different template. They're kept, not deleted, but the day{stale.length !== 1 ? "s" : ""} they
+        named don't exist in your current template. Switch back to apply them, or paste a new plan for this one.
+      </div>
+    </div>
+  );
+}
+
 /* The only place injuryProfile is ever written. `save` is a plain closure
    variable, never assigned to a module-level binding — the plan parser and
    gate pipeline (extractPlanJson, applyCoachGates, and Task 4's gate runner)
@@ -3834,9 +4067,15 @@ const KNOWN_PLAN_KEYS = ["template", "focus", "sessionMin", "calorieDelta", "pre
  * paste always wins (the model can still loosen/tighten anything); a key
  * absent falls through to whatever was already stored. weeklyGroupSetCaps
  * merges per-group specifically — a new cap for "shoulders" must not
- * erase an existing cap for "legs". Explicitly clearing a cap back to "no
- * cap" isn't supported by this shape; no test case calls for it, and it's
- * addable later without disturbing this. */
+ * erase an existing cap for "legs".
+ * Explicit removal: a group's cap can be cleared back to "no explicit
+ * cap" (falls through to defaultGroupCap's own baseline-tracking) by
+ * pasting that group's value as JSON `null` — distinguishable from
+ * "absent", which merge treats as "don't touch". The key is deleted from
+ * storage rather than kept as a literal null (Gate 6's own cap lookup
+ * already treats null as nullish via `??`, so this would have worked by
+ * accident even before the delete — deleting it makes the stored shape
+ * clean rather than relying on that). */
 function mergeSessionRules(existing, incoming) {
   if (!incoming) return existing || undefined;
   const merged = { ...(existing || {}) };
@@ -3844,7 +4083,11 @@ function mergeSessionRules(existing, incoming) {
     if (incoming[k] !== undefined) merged[k] = incoming[k];
   });
   if (incoming.weeklyGroupSetCaps) {
-    merged.weeklyGroupSetCaps = { ...((existing && existing.weeklyGroupSetCaps) || {}), ...incoming.weeklyGroupSetCaps };
+    const caps = { ...((existing && existing.weeklyGroupSetCaps) || {}), ...incoming.weeklyGroupSetCaps };
+    Object.keys(incoming.weeklyGroupSetCaps).forEach((g) => {
+      if (incoming.weeklyGroupSetCaps[g] === null) delete caps[g];
+    });
+    merged.weeklyGroupSetCaps = caps;
   }
   return merged;
 }
@@ -3853,15 +4096,21 @@ function mergeSessionRules(existing, incoming) {
  * no change under merge semantics, there's nothing to announce on
  * omission — what's loud instead is an explicit note whenever a merge
  * actually changes a stored value, surfaced the same way every other
- * coach-gate note is (gated.gates, rendered in the apply-result UI). */
+ * coach-gate note is (gated.gates, rendered in the apply-result UI).
+ * Iterates the UNION of old/new group keys, not just new — a cleared cap
+ * (null, deleted by mergeSessionRules above) disappears from newCaps
+ * entirely, and would go unreported by a new-keys-only scan. */
 function describeSessionRulesChange(oldRules, newRules) {
   const notes = [];
   const oldCaps = (oldRules && oldRules.weeklyGroupSetCaps) || {};
   const newCaps = (newRules && newRules.weeklyGroupSetCaps) || {};
-  Object.keys(newCaps).forEach((g) => {
+  const allGroups = new Set([...Object.keys(oldCaps), ...Object.keys(newCaps)]);
+  allGroups.forEach((g) => {
     if (oldCaps[g] !== newCaps[g]) {
       const name = (MUSCLE_GROUPS[g] && MUSCLE_GROUPS[g].name) || g;
-      notes.push(`${name} weekly cap ${oldCaps[g] != null ? oldCaps[g] : "default"} → ${newCaps[g]}`);
+      const from = oldCaps[g] != null ? oldCaps[g] : "default";
+      const to = newCaps[g] != null ? newCaps[g] : "default";
+      notes.push(`${name} weekly cap ${from} → ${to}`);
     }
   });
   ["maxSetsPerMovement", "trimPriority", "orderByFocus"].forEach((k) => {

@@ -126,6 +126,36 @@ check("mergeSessionRules: no existing, fresh incoming -> incoming as the whole r
 check("describeSessionRulesChange: no actual difference -> no notes",
   app.describeSessionRulesChange({ maxSetsPerMovement: 4 }, { maxSetsPerMovement: 4 }), []);
 
+// 6. Explicit removal: pasting a group's cap as JSON null clears it back
+//    to "no explicit cap" — a real, distinct state from "some large
+//    number" (falls through to defaultGroupCap's own baseline-tracking).
+{
+  const prior = { weeklyGroupSetCaps: { legs: 18, shoulders: 20 } };
+  const rec = { ...BASE_REC, sessionRules: { weeklyGroupSetCaps: { shoulders: null } } };
+  const gated = app.applyCoachGates(rec, {}, NOT_RECOVERING, { plan: { sessionRules: prior } });
+  ok("cleared cap is DELETED from storage, not kept as a literal null",
+    !("shoulders" in gated.sessionRules.weeklyGroupSetCaps), JSON.stringify(gated.sessionRules));
+  check("the other group's cap is untouched by clearing a different one",
+    gated.sessionRules.weeklyGroupSetCaps, { legs: 18 });
+  const note = gated.gates.find((g) => g.startsWith("Session rules updated"));
+  ok("clearing produces an 'updated' note", !!note);
+  ok("note reads '-> default', not '-> null'", note && note.includes("Shoulders weekly cap 20 → default") && !note.includes("null"), note);
+}
+
+// 6b. Clearing a cap that was never set is a real no-op — no note, nothing
+//     to delete.
+{
+  const prior = { weeklyGroupSetCaps: { legs: 18 } };
+  const rec = { ...BASE_REC, sessionRules: { weeklyGroupSetCaps: { shoulders: null } } };
+  const gated = app.applyCoachGates(rec, {}, NOT_RECOVERING, { plan: { sessionRules: prior } });
+  check("no-op clear leaves existing caps exactly as they were", gated.sessionRules.weeklyGroupSetCaps, { legs: 18 });
+  ok("no-op clear produces no 'updated' note",
+    !gated.gates.some((g) => g.startsWith("Session rules updated")));
+}
+
+check("mergeSessionRules: null deletes the key from a fresh (no prior) merge too",
+  app.mergeSessionRules(undefined, { weeklyGroupSetCaps: { legs: null } }), { weeklyGroupSetCaps: {} });
+
 if (failures > 0) {
   console.error(`\nSESSION-RULES CHECK FAILED: ${failures}/${checks} assertions failed.`);
   process.exit(1);

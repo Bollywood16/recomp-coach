@@ -1,4 +1,4 @@
-# Handoff note (end of 2026-09-05 session)
+# Handoff note (updated during Task 2, 2026-09-05 session)
 
 **Done:** Tasks 0 (injuryProfile as protected, structured data), 1
 (exercise attribute tagging, 75/75 coverage), 4 (safety gates 1-8), 5
@@ -7,45 +7,85 @@ enforcement, uncapped injury/pain data). All signed off, all committed on
 `task-0-injury-profile`. Review files in the repo root (`TASK-N-*.txt`)
 are the detailed record per task; this note is just the pointer.
 
-**Next:** Task 2 (per-exercise prescriptions / sessionRules — the
-generator-side half of what Task 4's gates already validate). Three
-specific things Task 2 must address, beyond its own stated scope:
+**Task 2, in progress** (design in `TASK-2-RECONCILIATION-PROPOSAL.txt`,
+reviewed and approved before implementation, per that file's full record):
 
-1. **Render-time prescription reconciliation (architecture note owed from
-   Task 4).** `applyPasted` in `index.html` already stores gated
-   `prescriptions` onto `data.plan.prescriptions`, with a comment
-   admitting "merging them into what the generator actually renders per
-   day is Task 2's wiring, not this gate pipeline's job." That wiring
-   doesn't exist yet. The render pipeline (`getProgram(data)` ->
-   `PROGRAMS[template]` -> `resolveSlot`/swaps/focus-driven bonus lifts)
-   computes each day's exercises today with zero awareness that
-   `data.plan.prescriptions` exists. Task 2 has to decide the semantics,
-   not just wire plumbing: does a stored prescription for an exerciseId
-   that's ALREADY in the generator's output for that day REPLACE that
-   slot (its sets/reps/load override the generator's own), or does it ADD
-   a new entry alongside whatever the generator already produces? This
-   isn't cosmetic — it's the direct cause of item 2 below, and
-   `weeklySetsByGroup(data)` (which Gate 6's running tally starts from)
-   is computed from the CURRENT rendered program, so whatever semantics
-   Task 2 picks has to keep that baseline calculation honest rather than
-   double-counting.
+- Commit 1 (done): consolidated the day-exercise-list construction that
+  used to be independently duplicated in DayPage, weeklySetsByGroup,
+  dayFittedMinutes, and dayFocusSummary into one `resolveDayExercises`.
+- Commit 2 (done): wired `sessionRules` (was silently dropped before this
+  — never in `KNOWN_PLAN_KEYS` — so every weekly-set cap in this build had
+  been inert since Task 4). Merges onto prior state rather than replacing
+  it wholesale; a real change is loudly noted, an omission is silent.
+- Commit 3 (done): the reconciliation itself. Both items below, from the
+  original handoff note, are now resolved — see
+  `scripts/check-prescription-reconciliation.js` for the tests proving it:
+  - **Item 1 (render-time reconciliation)** — resolved. Default is
+    REPLACE: a prescription naming an exerciseId already present in that
+    day's current (swap- and focus-resolved) output overrides that slot's
+    sets/reps/load/rest IN PLACE; a prescription naming anything else ADDs
+    a new entry. New Gate 1c (dayKey required + must be a real day in the
+    current template) and Gate 1d (reject if the named exerciseId is
+    ambiguous — appears more than once in that day, which only happens via
+    two independently converged swaps) back this with reject-with-reason,
+    never a silent guess.
+  - **Item 2 (legs-cap headroom)** — resolved. Gate 6's running tally now
+    subtracts a replaced slot's own prior contribution before adding the
+    prescription's new value (`ctx.currentSlotFor`, built from the same
+    `resolveDayExercises` the render path uses — one predicate, not two
+    that could disagree). A net-neutral REPLACE-plus-ADD against a group
+    already at its cap is correctly accepted; a pure ADD with no offsetting
+    replace against the same group is still correctly rejected (both
+    covered as positive/negative-control assertions in the test file).
+  - Also landed as part of this commit, all covered by the same test file:
+    a within-batch collision guard (two prescriptions in one paste naming
+    the same day+exercise — deterministic first-wins by array order, named
+    in the rejection), a prescribed `load` actually reaching the render
+    layer (`recommend()`'s new `ex.prescribedLoad` branch, deload-aware),
+    a prescribed `restSec` reaching both the display text and the
+    duration/trim math (one shared `restFor`), `DayPicker.lastDone` now
+    counting an ADDed exercise's logged sessions (still excluding bonus
+    lifts — see the Gate 8 amendment below for why a similar-looking
+    "just wire it in" change elsewhere was deliberately NOT made the same
+    way), and a `StalePrescriptionsNotice` for prescriptions left inert by
+    a template switch.
+- Commit 4 (not started): `sessionRules.maxSetsPerMovement` + pool-
+  splitting overflow logic — deferred test 2 below. Gets its own review
+  round before starting, per instruction.
 
-2. **Gate 6's legs-cap headroom limitation.** `defaultGroupCap(group,
-   weeklyGroupSets) = max(MUSCLE_GROUPS[group].mav, current baseline)` —
-   correct in that it's never stricter than what the app already
-   prescribes unprompted, but for a group already at/above its own mav
-   (legs: baseline ~26 sets vs. mav 20), there's currently zero headroom
-   for anything new in that group, because the running tally also starts
-   from the full baseline with no way to say "this prescription replaces
-   part of that baseline, don't double-count it." Same root cause as
-   item 1 above — fixing the reconciliation there fixes this too, not two
-   separate problems.
+## Amendment to Task 4's sign-off: Gate 8 is now render-time-only
 
-3. **Deferred test 2** (from the table below): 6 sets prescribed on a
-   single movement with `maxSetsPerMovement: 4` -> capped, overflow spawns
-   a second movement from the same pool. Needs `sessionRules.
-   maxSetsPerMovement` + pool-splitting logic, both Task 2's job. Per the
-   standing rule below, Task 2 isn't done until this passes.
+Task 4's original Gate 8 (`gate8DeloadOverride`) mutated a surviving
+prescription's `sets`/`load` before it was stored, baking ~60%/~90% deload
+scaling into `data.plan.prescriptions` at apply time. That was correct
+when prescriptions had no render path at all — but once Task 2 commit 3
+made them actually render, it became wrong in two ways: (1) deload state
+can start or end AFTER a plan was applied, with no re-paste to refresh a
+frozen value, so a stored scaled value goes stale in either direction; (2)
+DayPage's own render-time deload scaling (its `isDeload` block, which
+applies to every rendered entry unconditionally) would then scale an
+already-scaled stored value a SECOND time, silently compounding past the
+intended ~60%/~90%.
+
+Fixed as part of Task 2 commit 3, not a separate task: `gate8DeloadOverride`
+no longer exists. Stored prescriptions always hold RAW values. Deload
+scaling is applied exactly once, at render time, uniformly to every
+rendered entry regardless of origin (generator, bonus, or
+prescription-reconciled) — DayPage's existing `isDeload` block continues
+to own `sets` (unchanged, it always applied to everything already), and a
+new `recommend()` branch (`ex.prescribedLoad`, checked before the deload
+branch so deload still overrides it) now owns `load` for a prescribed
+exercise the same way `recommend()`'s history-driven logic already owned
+it for a generator exercise.
+
+This is a correction to Task 4's implementation, not a reversal of Task
+4's SPEC requirement — "deload overrides all prescriptions, unconditionally"
+still holds exactly as stated; only the mechanism moved. Gate 3/4/5's
+escalation ratchet (the actual subject of Task 4's most safety-sensitive
+review round) is untouched by this. Verified by
+`scripts/check-prescription-reconciliation.js`: applying a prescription
+with an explicit `load` while a deload is active asserts the STORED value
+is still the raw prescribed number, never `round5(load * 0.9)`.
 
 ---
 

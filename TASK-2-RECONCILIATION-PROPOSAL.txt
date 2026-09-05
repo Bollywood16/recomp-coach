@@ -409,11 +409,163 @@ COMMIT 2 — sessionRules wiring (DONE)
   session-rules).
 
 ================================================================================
+TWO QUESTIONS BEFORE COMMIT 3 (user review round 3)
+================================================================================
+
+Q1 — DayPicker.lastDone: does "done" hold against a list a prescription can
+now change?
+
+Answer: it needed to change, and now does. Before commit 3, resolveDayExercises
+had no reconciliation logic at all, so lastDone's exclusion was moot — there
+was nothing for it to miss yet. Once commit 3 lands, a prescription can ADD an
+exercise that isn't in day.exercises at all; if the user logged THAT exercise
+and nothing else on the day, the static list would report "not started" even
+though the user did do the day's coach-authored work — stale relative to what
+this app now actually prescribes, which is the specific kind of mismatch this
+whole build exists to close (Task 5 fixed an analogous case: lifts visible in
+Insights but absent from the exported brief).
+
+Fix: lastDone now calls resolveDayExercises(day, data) and filters out
+isBonus entries, rather than reading day.exercises directly. This required NO
+change to resolveDayExercises's contract — every entry already carries
+isBonus (bonusForDay sets it true; generator slots and reconciled entries
+both leave it falsy), so lastDone just filters on data already present.
+Bonus lifts stay excluded, unchanged from before: they're ambient and
+focus-slider-driven, not the stable "what is this day" a deliberate,
+gate-approved prescription is — folding them in would still be an
+unrequested widening, just via a different call site than the one originally
+flagged.
+
+Verified (scripts/check-prescription-reconciliation.js): a session logged
+only against an ADDed exercise now registers as "last done" for that day; a
+session logged only against a bonus lift still does not (regression check).
+Live headless-browser confirmation: after applying a plan that ADDs "Dips"
+to Upper A, the day picker's "last done" — not directly exercised in this
+round's browser pass, but covered by the unit test above with the same
+underlying function calls DayPicker itself now makes.
+
+Q2 — Condition C: can an existing cap still be explicitly changed or removed,
+and does the note fire on change, not just addition?
+
+Changed — confirmed, was already true and already tested (check-session-
+rules.js test 3b: legs 18 -> 22 via an explicit re-paste; live-browser
+confirmation in commit 2's writeup). A key present in the incoming paste
+always overwrites the stored value for that key, merge semantics only
+protect keys the paste DIDN'T mention.
+
+Removed — this was a genuine, previously-undocumented gap, now closed. The
+per-group merge (`{...existing, ...incoming.weeklyGroupSetCaps}`) was
+letting a `null` value pass through as a literal stored `null`, and Gate 6's
+own cap lookup (`ctx.weeklyGroupSetCaps[group] ?? defaultGroupCap(...)`)
+already treats `null` as nullish and falls through to the default — meaning
+explicit removal was ALREADY reachable by accident, just untested and
+undocumented (indistinguishable, before this fix, from a bug). Made it a
+real, intentional, tested capability: mergeSessionRules now explicitly
+deletes a group's key from the stored weeklyGroupSetCaps when the incoming
+value for it is `null`, rather than leaving a stray null sitting in
+persisted data. Pasting `{"weeklyGroupSetCaps": {"shoulders": null}}` clears
+that group's cap back to the default (max(mav, current baseline)).
+describeSessionRulesChange now reports a clear back to null as "-> default"
+in its note (not a literal "null"), consistent with how the FROM side of an
+addition already reads "default" when there was no prior explicit cap.
+
+This isn't "immutable" even without this fix — any explicit numeric value
+already overwrote a stored cap. What was missing was specifically "go back
+to having no explicit cap at all," which is a real, distinct state
+(defaultGroupCap's own baseline-tracking behavior) from "explicit cap set to
+some large number." Confirmed via scripts/check-session-rules.js (new
+assertions: null clears the key entirely from storage — not stored as
+literal null — and produces a "-> default" note; a fresh merge with no
+prior state also deletes rather than storing null; clearing a cap that was
+never set is a real no-op, no note) and re-verified condition C's "changed"
+half still passes unaffected. Also verified this fix actually catches a
+regression, not just present: temporarily reverted the delete logic, reran
+— 5/22 assertions failed exactly as predicted (literal null values
+surfacing in storage, spurious/missing notes), restored, reran clean. Live
+headless-browser confirmation: seeded {legs: 18, shoulders: 20}, pasted a
+plan clearing only shoulders — UI showed "Session rules updated: Shoulders
+weekly cap 20 → default.", storage ended up with exactly {legs: 18}
+(shoulders key gone, not null). Zero console errors.
+
+================================================================================
+COMMIT 3 — reconciliation itself (DONE)
+================================================================================
+- resolveDayExercises extended with the actual reconciliation: filters
+  data.plan.prescriptions by dayKey === day.id, then for each: 0 matches
+  by resolved id => ADD (push a new {slot, ex} built from EX_BY_ID + the
+  prescription's overrides); 1 match => REPLACE in place (same array
+  index — this is what keeps weeklySetsByGroup's "sum whatever's in the
+  list once" arithmetic honest); >1 matches (only reachable via two
+  independently converged swaps) => skip defensively, render-time fallback
+  only, the authoritative reject lives at gate time (below).
+- New ctx.currentSlotFor(dayKey, exerciseId) in buildGateContext: built
+  from the SAME resolveDayExercises call the render path uses, against
+  data as it stood BEFORE this batch (the correct Gate-6 baseline),
+  memoized per day. One predicate answers both "is this a replace, and
+  what does it replace" (tally subtraction) and "is this ambiguous" (Gate
+  1d) — they read the same lookup, they cannot disagree with each other.
+  ctx.programDayIds added alongside it for Gate 1c.
+- New Gate 1c (gate1cDayKey): dayKey required; must be a real day id in
+  getProgram(data) for the CURRENT template. Naming the valid day ids in
+  the rejection reason.
+- New Gate 1d (gate1dAmbiguousMatch): rejects if ctx.currentSlotFor finds
+  more than one match, naming both slot ids so the user knows which swap
+  to undo.
+- applyGatedPrescriptions: subtracts a REPLACE's existing slot sets from
+  the running tally before adding the new value (closes the legs-cap
+  headroom gap — see the negative-control test proving the subtraction is
+  load-bearing, not just present). Within-batch collision guard: a
+  Map keyed by "dayKey::exerciseId" claims the first prescription to reach
+  a given slot; any later one targeting the same pair in the SAME batch is
+  rejected, reason naming that the first (by array order) was kept. Every
+  surviving prescription gets an explicit "Replaces ..." or "Adds ..." note
+  (gate: "reconcile"), independent of gates 3/4/5's own notes.
+- Gate 8 (deload) revised per the approved amendment: gate8DeloadOverride
+  deleted; stored prescriptions always hold raw values. recommend() gained
+  an ex.prescribedLoad branch (checked before the deload branch, so deload
+  still overrides it) so a prescribed load actually reaches the UI — it
+  had NO render-time consumer at all before this, a gap this commit closes
+  alongside the reconciliation it was blocking. restFor() similarly gained
+  an ex.restSec check, ahead of the category defaults, so a prescribed
+  rest reaches both the display text and the duration/trim math through
+  the one function both already shared. DEFERRED-TESTS.md amended with the
+  full Task-4-sign-off-accurate record of why this changed.
+- New StalePrescriptionsNotice, wired into WorkoutFlow next to the other
+  gate/migration notices: names which prescriptions (by exercise name)
+  aren't applying because their dayKey doesn't exist in the current
+  template, without deleting them.
+- DayPicker.lastDone updated per Q1 above.
+- New scripts/check-prescription-reconciliation.js (33 assertions, wired
+  into npm test): REPLACE in place / no double count, ADD / full addition
+  to the tally, render-time ambiguous-match defensive skip, Gate 1c
+  (missing + invalid dayKey), Gate 1d (ambiguous match, names both slots),
+  within-batch collision (first wins by array order, named), the legs-cap
+  headroom fix PLUS a negative control proving a pure addition against the
+  same at-cap group is still correctly rejected (proves the subtraction is
+  actually doing something, not just present and inert), prescribedLoad
+  through recommend() both with and without deload active, restSec through
+  restFor() in both the sub-minute and over-a-minute label formats, the
+  Gate 8 stored-raw-value assertion, and lastDone counting an ADDed
+  exercise's session while still excluding a bonus lift's.
+- Verified the subtraction fix is load-bearing, not just present:
+  temporarily removed the subtraction line, reran — the exact legs-cap
+  headroom assertion failed with the exact predicted wrong numbers (27,
+  28 instead of accepted), restored, reran clean.
+- Live headless-browser check: applied a plan with one REPLACE (bench
+  press, 3->5 sets, load 100) and one ADD (dips, 3 sets) to Upper A under
+  Balanced — UI showed both "Replaces ..."/"Adds ..." notes, bench
+  rendered at 5x6-10 @ 100 lb tagged PRESCRIBED with the correct +2-set
+  delta, dips appeared as a 7th exercise, Gate 7's trim correctly kicked
+  in and protected the prescribed/focused work while trimming a MAINTAIN-
+  tagged exercise instead. Switched template afterward — StalePrescriptions
+  Notice correctly named both now-inert prescriptions by exercise name.
+  Zero console errors across the whole run.
+- npm test: all four scripts pass (write-isolation, day-resolution,
+  session-rules, prescription-reconciliation).
+
+================================================================================
 NEXT
 ================================================================================
-Commit 3: reconciliation itself — REPLACE/ADD semantics, gate-side tally
-subtraction, dayKey required + rejection gate, within-batch collision
-rejection (array order, named in the message), Q1's ambiguous-match
-rejection, the Gate 8 deload fix + DEFERRED-TESTS.md amendment,
-StalePrescriptionsNotice.
-Commit 4: maxSetsPerMovement pool-splitting — deferred test 2 must pass.
+Commit 3 complete. Stopping here per instruction — commit 4
+(maxSetsPerMovement + pool-splitting, deferred test 2) gets its own review
+round before starting.
