@@ -1,13 +1,37 @@
-# Handoff note (updated during Task 2, 2026-09-05 session)
+# Handoff note (updated after Fix 1, 2026-09-06 session)
 
 **Done:** Tasks 0 (injuryProfile as protected, structured data), 1
-(exercise attribute tagging, 75/75 coverage), 4 (safety gates 1-8), 5
-(coach brief export — tiered checkin/full payload, checkin-scope
-enforcement, uncapped injury/pain data). All signed off, all committed on
-`task-0-injury-profile`. Review files in the repo root (`TASK-N-*.txt`)
-are the detailed record per task; this note is just the pointer.
+(exercise attribute tagging, 75/75 coverage), 2 (day-resolution
+consolidation, sessionRules wiring, prescription reconciliation,
+maxSetsPerMovement + pool-splitting), 3 (set schemes — back-off and drop
+sets, data model through logger UI), 4 (safety gates 1-8), 5 (coach brief
+export — tiered checkin/full payload, checkin-scope enforcement, uncapped
+injury/pain data). All signed off, all committed on `task-0-injury-profile`.
+Review files in the repo root (`TASK-N-*.txt`) are the detailed record per
+task; this note is just the pointer.
 
-**Task 2, in progress** (design in `TASK-2-RECONCILIATION-PROPOSAL.txt`,
+Also done: **Fix 1** (trim priority weights by emphasis level, floored per
+group — see `FIX-1-TRIM-PRIORITY-SUMMARY.txt` and commit `aed617b`), the
+first of three fixes that came out of testing Task 0-3's work against a
+real pre-Task-0 backup export rather than seeded test data (full findings
+in `TASK-0-BACKUP-MIGRATION-REVIEW.txt`).
+
+**Next, in order:**
+- **Fix 2** — migration notice missing on the backup-import path
+  (`BackupCard.importData` seeds `recoveringMode` with no notice, no
+  history entry, and skips the goblet->boxsquat migration entirely; only
+  the app-boot/localStorage path has that logic today). Scoped, not
+  started.
+- **Fix 3** — Gate 2 vs. user swaps: a swapped-in exercise carrying a
+  contraindication is never gated or flagged today. Scoped as warn, don't
+  block (the swap picker flags contraindicated alternates at selection
+  time; an already-swapped contraindicated exercise gets a persistent
+  card warning naming the contraindication; logged to the Injury Profile
+  card; never auto-removed). Not started.
+- **Task 6** and **Task 7** — not started; scope not yet reviewed against
+  the real-data findings above.
+
+**Task 2 (done)** (design in `TASK-2-RECONCILIATION-PROPOSAL.txt`,
 reviewed and approved before implementation, per that file's full record):
 
 - Commit 1 (done): consolidated the day-exercise-list construction that

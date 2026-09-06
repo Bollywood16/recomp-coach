@@ -2,3 +2,4 @@
 .mcp.json
 .env*
 /node_modules/
+recomp-coach-backup-*.json
