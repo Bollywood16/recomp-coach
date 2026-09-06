@@ -147,6 +147,34 @@ review round) is untouched by this. Verified by
 with an explicit `load` while a deload is active asserts the STORED value
 is still the raw prescribed number, never `round5(load * 0.9)`.
 
+## Second amendment to Task 4's sign-off: Gate 5's set count excludes drop segments
+
+Task 3 (set schemes) needed `gate5PainEscalation`'s `lastSetCount` to stop
+reading `last.sets.length` — a raw logged-row count — and start reading a
+hard-set row count instead (`segment !== "drop"`). A drop segment is a
+continuation of an existing set, not a separate one (`hardSetsFor`); once
+drop segments are logged as their own rows, the raw count over-counts (a
+4-hard-set session with one drop logs as 5 rows), which would silently let
+the escalation cap admit MORE volume next time than it should — the exact
+kind of quiet loosening Gate 5 exists to prevent.
+
+This is a correction to Task 4's implementation for the same reason as the
+Gate 8 amendment above: Task 4 built Gate 5 before set schemes (or their
+underlying "a row isn't always a hard set" concept) existed, so there was
+nothing to get wrong yet. The RULE Gate 5 enforces — cap sets at what was
+actually done last time, don't loosen — is unchanged; only the counting
+method needed fixing once "a row" and "a hard set" stopped being the same
+thing. Migration-safe by construction: a pre-Task-3 session has no
+`segment` field at all, and the exclusion form (`!== "drop"`) reads that as
+"not a drop," so every existing session still counts exactly as it did
+before this shipped — verified in `scripts/check-set-schemes.js`, including
+a deliberately-reintroduced-bug check: reverting to raw `.length` on a
+4-hard-set-plus-1-drop session let the cap admit 4 sets instead of the
+correct 3, confirmed, then restored.
+
+Full Task 3 design record, decisions, and the set-row-consumer audit in
+`TASK-3-SET-SCHEMES-PROPOSAL.txt`.
+
 ---
 
 # Deferred tests

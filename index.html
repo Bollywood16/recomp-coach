@@ -865,7 +865,12 @@ const isCompound = (ex) => COMPOUND_CATS.includes(ex.cat);
 function fitDayToTime(list, sessionMin) {
   const budget = Math.max(20, (sessionMin || 60) - 8) * 60; // minus ~8 min warm-up
   const items = list.map((e) => ({ ...e }));
-  const dur = (ex) => ex.sets * (40 + restFor(ex).sec);
+  // Point 4: a drop segment adds real (if brief) time beyond its host
+  // set's own "40s work + rest" — see dropExtraSec/DROP_SEGMENT_SEC.
+  // Backoff needs no separate term: its sets are already full rested
+  // sets once hardSetsFor/the normalization pass in resolveDayExercises
+  // have run, so ex.sets already IS the complete segment count.
+  const dur = (ex) => ex.sets * (40 + restFor(ex).sec) + dropExtraSec(ex);
   const total = () => items.reduce((a, e) => a + dur(e), 0);
   const minSets = (ex) => (isCompound(ex) ? 2 : 1);
   const prio = (ex) => (ex.focusBoost ? 2 : 0) + (isCompound(ex) ? 1 : 0);
@@ -876,7 +881,8 @@ function fitDayToTime(list, sessionMin) {
     const cands = items.filter((e) => e.sets > minSets(e));
     if (cands.length) {
       cands.sort((a, b) => prio(a) - prio(b) || items.indexOf(b) - items.indexOf(a));
-      cands[0].sets -= 1;
+      const idx = items.indexOf(cands[0]);
+      items[idx] = trimOneHardSet(items[idx]); // backoff sheds backoffSets first — see trimOneHardSet
       trimmed++;
       continue;
     }
@@ -1332,9 +1338,21 @@ ${formatLiftsCompact(m.lifts)}
 
 <set_quality>
 Recent sets (weight x reps), most recent last. Rep decay >30-40% or under-range = too heavy, don't repeat
-it. Pain is in <pain_history>, not here.
+it — UNLESS a set is tagged (backoff) or (drop): those are a DELIBERATE lower-load continuation, not
+fatigue collapse, and must not be read as "too heavy." Pain is in <pain_history>, not here.
 ${(data.sessions || []).slice(-3).map((s) => {
-    const setsStr = s.sets.map((x) => `${x.w || "BW"}x${x.r}`).join(", ");
+    // Point 1's 4th consumer: unfiltered, a deliberate backoff/drop set
+    // reads to the model exactly like the fatigue collapse the
+    // instruction above tells it to flag — the same corruption as
+    // recommend()'s progression math, just landing in the coach's own
+    // reasoning instead of the app's. Annotate, don't filter or exclude,
+    // since the model should see the full set, correctly labeled.
+    // Undefined/"top"/"straight" segment gets no tag — pre-Task-3
+    // sessions render byte-identical to before.
+    const setsStr = s.sets.map((x) => {
+      const tag = (x.segment === "backoff" || x.segment === "drop") ? `(${x.segment})` : "";
+      return `${x.w || "BW"}x${x.r}${tag}`;
+    }).join(", ");
     return `- ${shortDate(s.date)} ${(EX_BY_ID[s.exerciseId] || {}).name || s.exerciseId}: ${setsStr}`;
   }).join("\n") || "(no sessions logged yet)"}
 </set_quality>
@@ -1405,9 +1423,20 @@ const currentBodyweight = (data) => {
   return (w && w.lbs) || (data.nutrition && Number(data.nutrition ? 146 : 146)) || 146;
 };
 
+/* Point 1: drop segments excluded from e1RM — a drop's high-rep, reduced-
+   load continuation can produce an inflated Epley estimate that isn't
+   representative of true strength, corrupting the trend this feeds
+   (weeklySeries -> stallScore -> the deload suggestion). Exclusion form
+   (!== "drop"), not an inclusion whitelist: every pre-Task-3 session has
+   no segment field at all, and undefined must read as "not drop" so
+   historical data isn't retroactively dropped from e1RM tracking (see
+   check-set-scheme-migration.js). Backoff rows stay eligible — a backoff
+   set's e1RM essentially never beats the top set's anyway, so excluding
+   it would cost nothing and including it costs nothing either. */
 function bestSet(sets) {
   let best = null;
   for (const s of sets) {
+    if (s.segment === "drop") continue;
     const v = e1rm(Number(s.w) || 0, Number(s.r) || 0);
     if (!best || v > best.v) best = { ...s, v };
   }
@@ -1533,7 +1562,17 @@ function capAndSplitMovement(list, maxSetsPerMovement, injuryProfile) {
     if (!ex.sets || ex.sets <= cap) return;
     const overflow = ex.sets - cap;
     const idx = out.indexOf(entry);
-    out[idx] = { slot: entry.slot, ex: { ...ex, sets: cap, cappedFrom: ex.sets } };
+    // Trim order for a backoff scheme (decision 2): backoffSets first —
+    // the reduced-intensity, lower-priority portion — then topSets. Same
+    // trimOneHardSet fitDayToTime/gate7DurationTrim use for their own
+    // time-budget trim, so the two trim mechanisms can't disagree about
+    // which part of a scheme gets shaved. overflow can never exceed
+    // topSets+backoffSets (ex.sets already equals that sum, post-
+    // normalization), so topSets can never go below 0 here.
+    let cappedEx = ex;
+    for (let i = 0; i < overflow; i++) cappedEx = trimOneHardSet(cappedEx);
+    cappedEx = { ...cappedEx, cappedFrom: ex.sets };
+    out[idx] = { slot: entry.slot, ex: cappedEx };
     const plural = (n) => `${n} set${n === 1 ? "" : "s"}`;
 
     if (!ex.pool) {
@@ -1567,6 +1606,12 @@ function capAndSplitMovement(list, maxSetsPerMovement, injuryProfile) {
       repMin: spawned.repMin ?? ex.repMin ?? DEFAULT_REP_RANGE.min,
       repMax: spawned.repMax ?? ex.repMax ?? DEFAULT_REP_RANGE.max,
       slotId: spawned.id, swapped: false, focusBoost: !!ex.focusBoost,
+      // Decision 2: overflow is leftover volume, never a deliberate
+      // intensity choice — a spawned movement is always straight, never
+      // inherits the overflowing exercise's scheme. ALL_KNOWN entries
+      // never carry a scheme field to spread in by accident, but this is
+      // explicit rather than relying on that being true forever.
+      scheme: undefined,
       poolSpawned: true, poolSpawnedFrom: ex.id,
     };
     out.push({ slot: spawnedEx, ex: spawnedEx });
@@ -1574,6 +1619,94 @@ function capAndSplitMovement(list, maxSetsPerMovement, injuryProfile) {
       note: `"${ex.name}" capped at ${cap} sets (was ${ex.sets}) — spawned "${spawned.name}" for the remaining ${plural(overflow)}: best-ranked available "${ex.pool}" pool alternative, passing all safety gates.` });
   });
   return { list: out, notes };
+}
+
+/* Task 3 — set schemes. A scheme changes what "how many sets" means, and
+ * three DIFFERENT numbers fall out of one, conflating them is exactly
+ * what would corrupt volume counts, duration estimates, and the cap:
+ *   - hardSetsFor: what Gate 6 / maxSetsPerMovement / weeklySetsByGroup
+ *     key on. backoff's topSets+backoffSets IS the hard-set count (a
+ *     backoff set is a real, separately-rested set); drop's segments
+ *     never add to it (a drop is a continuation of an existing set, not
+ *     a new one) — straight/drop both just pass ex.sets through.
+ *   - totalSegmentsFor: every physical segment that takes real time —
+ *     used by duration estimation only. Same as hardSetsFor for
+ *     straight/backoff; adds drop's extra continuation(s) on top for
+ *     drop, since those take real (if brief) time even though they don't
+ *     count as hard sets.
+ * ex.sets itself is NORMALIZED to hardSetsFor's answer once, right here,
+ * so every downstream reader (capAndSplitMovement, weeklySetsByGroup,
+ * dayFittedMinutes, dayFocusSummary, DayPage) can keep reading plain
+ * `.sets` with zero scheme-awareness of their own — one place computes
+ * the derived number, not N places remembering to call a helper instead
+ * of the field they're used to reading. */
+function hardSetsFor(ex) {
+  const scheme = ex.scheme;
+  if (scheme && scheme.type === "backoff") return (scheme.topSets || 0) + (scheme.backoffSets || 0);
+  return ex.sets || 0;
+}
+function totalSegmentsFor(ex) {
+  const scheme = ex.scheme;
+  if (scheme && scheme.type === "drop") {
+    const affected = scheme.appliesTo === "allSets" ? (ex.sets || 0) : 1;
+    return (ex.sets || 0) + affected * (scheme.drops || 1);
+  }
+  return ex.sets || 0; // straight and backoff: sets is already the full segment count (post-normalization)
+}
+
+/* Decision 5: no research or spec anchor for this number — flagged as an
+   estimate, not derived. Duration estimation is already approximate
+   (fitDayToTime's own "40s work + rest" per set is itself a rough
+   number); this just needs to not be zero and not be silently invented
+   without saying so. A drop segment skips its own full rest — minimal/no
+   rest is the defining trait of a drop set — but still takes real time
+   to execute, so it adds a flat cost here rather than the full
+   "40s work + restSec" a separately-rested set costs. */
+const DROP_SEGMENT_SEC = 20;
+function dropExtraSec(ex) {
+  const scheme = ex.scheme;
+  if (!scheme || scheme.type !== "drop") return 0;
+  const affected = scheme.appliesTo === "allSets" ? (ex.sets || 0) : 1;
+  return affected * (scheme.drops || 1) * DROP_SEGMENT_SEC;
+}
+
+/* Shared by capAndSplitMovement's cap-trim and fitDayToTime/
+   gate7DurationTrim's time-trim — one implementation of "which part of a
+   scheme gets shaved when this exercise loses a hard set," so the two
+   trim mechanisms (set-cap and time-budget) can't disagree with each
+   other. Backoff sheds backoffSets before ever touching topSets (decision
+   2's "protect the prioritized/heavier work" rule); straight and drop
+   just decrement .sets (a drop's own segments aren't hard sets and are
+   untouched by this — only its host set count moves). */
+function trimOneHardSet(ex) {
+  if (ex.scheme && ex.scheme.type === "backoff") {
+    let { topSets = 0, backoffSets = 0 } = ex.scheme;
+    if (backoffSets > 0) backoffSets -= 1; else topSets -= 1;
+    return { ...ex, sets: ex.sets - 1, scheme: { ...ex.scheme, topSets, backoffSets } };
+  }
+  return { ...ex, sets: ex.sets - 1 };
+}
+
+/* Decision 4: deload strips schemes to straight, same ratchet logic as
+   escalation (gate5PainEscalation) and arguably stronger — deload is a
+   blanket whole-program recovery week, and a drop set is specifically an
+   effort-to-failure-maximizing technique that runs against its purpose.
+   Extracted to its own function (was inline in DayPage's isDeload block)
+   so it's directly testable rather than an unverified one-liner buried in
+   JSX — everything else this deep in the safety logic has a test with a
+   deliberately-reintroduced-bug check behind it; this should too. Not
+   active: pass the exercise through unchanged. Active: existing ~60% set
+   reduction (floor 1-2, protecting compounds) plus the scheme strip —
+   bolted onto the one mechanism rather than two, so recommend(),
+   session-card rendering, and duration estimation never need their own
+   deload awareness; they just never see a non-straight scheme that week. */
+function deloadScale(ex, isDeload) {
+  if (!isDeload) return ex;
+  return {
+    ...ex,
+    sets: Math.max(isCompound(ex) ? 2 : 1, Math.round(ex.sets * 0.6)),
+    scheme: { type: "straight" },
+  };
 }
 
 function resolveDayExercises(day, data) {
@@ -1584,7 +1717,7 @@ function resolveDayExercises(day, data) {
     ...bonusForDay(day, focus, program).map((b) => ({ slot: b, ex: b })),
   ];
   const prescriptions = ((data.plan && data.plan.prescriptions) || []).filter((p) => p.dayKey === day.id);
-  const OVERRIDE_FIELDS = ["sets", "repMin", "repMax", "restSec"];
+  const OVERRIDE_FIELDS = ["sets", "repMin", "repMax", "restSec", "scheme"];
   prescriptions.forEach((p) => {
     const matchIdx = [];
     list.forEach((entry, i) => { if (entry.ex.id === p.exerciseId) matchIdx.push(i); });
@@ -1605,12 +1738,18 @@ function resolveDayExercises(day, data) {
         repMin: overrides.repMin ?? base.repMin ?? DEFAULT_REP_RANGE.min,
         repMax: overrides.repMax ?? base.repMax ?? DEFAULT_REP_RANGE.max,
         restSec: overrides.restSec, prescribedLoad: overrides.prescribedLoad,
+        scheme: overrides.scheme,
         slotId: base.id, swapped: false, focusBoost: false,
         prescribed: true, prescriptionApplied: "add",
       };
       list.push({ slot: added, ex: added });
     }
   });
+  // Normalize .sets to the hard-set count NOW, before capAndSplitMovement
+  // (which must see a backoff's real total, not a possibly-mismatched
+  // sets field — point 5) and before anything else in this file ever
+  // reads .sets again.
+  list.forEach((entry) => { entry.ex.sets = hardSetsFor(entry.ex); });
   // maxSetsPerMovement runs LAST, over the fully generator+bonus+
   // prescription-reconciled list — see capAndSplitMovement's own comment
   // for why it has to be here rather than only in the prescription-gate
@@ -1680,8 +1819,25 @@ function recommend(ex, sessions, deload) {
   }
 
   const last = hist[hist.length - 1];
-  const reps = last.sets.map((s) => Number(s.r) || 0);
-  const w = Math.max(...last.sets.map((s) => Number(s.w) || 0));
+  // Point 1, the important finding: the double-progression math below
+  // (allTop/belowMin/decay) exists specifically to detect "reps
+  // collapsing across sets = load too heavy" and prescribe a REDUCTION.
+  // A deliberate backoff/drop set is, by design, a different (lower)
+  // load with a different rep target — fed in unfiltered, it reads as
+  // exactly that collapse on every single scheme'd session, compounding
+  // a reduction on top of a reduction. Restrict this decision to the
+  // working (top/straight) segment only. Exclusion form, not an
+  // inclusion whitelist (segment !== "top"/"straight" would silently
+  // exclude every pre-Task-3 row, which has no segment field at all —
+  // see check-set-scheme-migration.js): a row counts unless it's
+  // EXPLICITLY tagged backoff or drop.
+  const workingOnly = last.sets.filter((s) => s.segment !== "backoff" && s.segment !== "drop");
+  // Defensive: a session with no top/straight row at all (shouldn't
+  // happen — a backoff/drop set presupposes a working set before it —
+  // but falling back to every row beats Math.max(...[]) === -Infinity).
+  const working = workingOnly.length ? workingOnly : last.sets;
+  const reps = working.map((s) => Number(s.r) || 0);
+  const w = Math.max(...working.map((s) => Number(s.w) || 0));
   if (deload) {
     return { weight: round5(w * 0.9), tag: "Deload", note: `Deload week: ~90% of your last working weight (${w} lb), reduced sets, stop 3-4 reps shy of failure. Recovery is the goal.` };
   }
@@ -1912,6 +2068,27 @@ function gate1dAmbiguousMatch(prescription, ctx) {
   return { reject: false };
 }
 
+/* Gate 1e — scheme/sets consistency (Task 3, decision 1). A backoff
+ * scheme's own topSets+backoffSets IS the authoritative hard-set total
+ * (hardSetsFor) — but if a prescription ALSO specifies a bare `sets`
+ * field that disagrees with that total, silently picking one and
+ * ignoring the other would hide that the author was confused about which
+ * contract they were writing to. Reject instead: cheap to check, and it
+ * surfaces malformed output (from a coach paste today, from Task 6/7
+ * authoring later) rather than quietly resolving it one way. Omitting
+ * `sets` entirely and letting the scheme's own totals define it is not a
+ * mismatch — only an explicit, disagreeing value is. */
+function gate1eSchemeConsistency(prescription) {
+  const scheme = prescription.scheme;
+  if (!scheme || scheme.type !== "backoff" || prescription.sets === undefined) return { reject: false };
+  const implied = (scheme.topSets || 0) + (scheme.backoffSets || 0);
+  if (prescription.sets !== implied) {
+    const ex = EX_BY_ID[prescription.exerciseId];
+    return { reject: true, gate: 1, reason: `Prescription for "${ex ? ex.name : prescription.exerciseId}" specifies sets:${prescription.sets} but its backoff scheme implies ${implied} (topSets:${scheme.topSets || 0} + backoffSets:${scheme.backoffSets || 0}) — these must agree. Omit sets and let the scheme define the total, or fix the mismatch.` };
+  }
+  return { reject: false };
+}
+
 /* Gate 2 — the injury gate. Not overridable by a pasted plan under any
    circumstance: no bypass flag, no confirmation dialog, and — structurally
    — no parameter through which one could even be threaded. injuryProfile
@@ -2065,13 +2242,35 @@ function gate5PainEscalation(prescription, ctx) {
   const ex = EX_BY_ID[prescription.exerciseId];
   if (!ex || !ctx.escalatingCats || !ctx.escalatingCats.has(ex.cat)) return { reject: false };
   const last = lastSessionFor(ctx.sessions, prescription.exerciseId);
-  const lastSetCount = last ? last.sets.length : null;
+  // AMENDMENT (Task 3, recorded in DEFERRED-TESTS.md as a Task 4
+  // sign-off correction): this used to be last.sets.length — a raw
+  // logged-row count. A drop segment is a continuation of an existing
+  // set, not a separate one (see hardSetsFor); once drop segments are
+  // logged as their own rows, raw .length over-counts (a 4-hard-set
+  // session with one drop logs as 5 rows), which would silently let the
+  // escalation cap admit MORE volume next time than it should. Segment
+  // absent (every pre-Task-3 session) reads as a hard set, never as a
+  // drop — the exclusion form, not an inclusion whitelist, is what keeps
+  // that migration-safe (see check-set-scheme-migration.js).
+  const lastSetCount = last ? last.sets.filter((s) => s.segment !== "drop").length : null;
   const requestedSets = prescription.sets || 3;
   const setsCapped = lastSetCount != null && requestedSets > lastSetCount;
+  // ESCALATION RATCHET EXTENSION (Task 3, point 8 — see the governing
+  // "ESCALATION IS A ONE-WAY RATCHET" comment above gate3LoadSanity for
+  // the rule this follows). A drop set is an effort-to-failure-
+  // maximizing intensity technique; prescribing one on a pattern that's
+  // actively escalating runs directly against what this gate exists to
+  // do. Strip ANY non-straight scheme unconditionally — same one-way,
+  // tighter-never-looser treatment as the sets cap above, never
+  // reversible by anything downstream.
+  const schemeStripped = !!(prescription.scheme && prescription.scheme.type !== "straight");
+  const patch = {};
+  if (setsCapped) { patch.sets = lastSetCount; patch.setsCapped = true; }
+  if (schemeStripped) patch.scheme = { type: "straight" };
   return {
     reject: false,
-    value: setsCapped ? { ...prescription, sets: lastSetCount, setsCapped: true } : undefined,
-    note: `Pain escalation on the ${CAT_NAMES[ex.cat] || ex.cat} pattern — no progression in load or sets until this pattern clears (3 consecutive logged sessions with answered pain at or below threshold). See the persistent clinician-consult prompt.${setsCapped ? ` Sets capped at ${lastSetCount}.` : ""}`,
+    value: Object.keys(patch).length ? { ...prescription, ...patch } : undefined,
+    note: `Pain escalation on the ${CAT_NAMES[ex.cat] || ex.cat} pattern — no progression in load or sets until this pattern clears (3 consecutive logged sessions with answered pain at or below threshold). See the persistent clinician-consult prompt.${setsCapped ? ` Sets capped at ${lastSetCount}.` : ""}${schemeStripped ? ` Backoff/drop scheme stripped to straight sets — an intensity technique has no place on an escalating pattern.` : ""}`,
   };
 }
 
@@ -2144,7 +2343,10 @@ function gate7DurationTrim(prescriptions, sessionMin) {
   const budget = Math.max(20, (sessionMin || 60) - 8) * 60;
   const items = prescriptions.map((p) => ({ ...p, sets: p.sets || 3 }));
   const exOf = (p) => EX_BY_ID[p.exerciseId];
-  const dur = (p) => p.sets * (40 + restFor(exOf(p)).sec);
+  // Point 4: same drop-time addition as fitDayToTime — a prescription
+  // carries its own scheme/sets directly, so dropExtraSec/trimOneHardSet
+  // work on it unchanged.
+  const dur = (p) => p.sets * (40 + restFor(exOf(p)).sec) + dropExtraSec(p);
   const total = () => items.reduce((a, p) => a + dur(p), 0);
   const minSets = (p) => (isCompound(exOf(p)) ? 2 : 1);
   let trimmedCount = 0;
@@ -2154,7 +2356,8 @@ function gate7DurationTrim(prescriptions, sessionMin) {
     const cands = items.filter((p) => p.sets > minSets(p));
     if (cands.length) {
       cands.sort((a, b) => (isCompound(exOf(a)) ? 1 : 0) - (isCompound(exOf(b)) ? 1 : 0) || items.indexOf(b) - items.indexOf(a));
-      cands[0].sets -= 1;
+      const idx = items.indexOf(cands[0]);
+      items[idx] = trimOneHardSet(items[idx]);
       trimmedCount++;
       continue;
     }
@@ -2211,6 +2414,49 @@ function defaultGroupCap(group, weeklyGroupSets) {
    short-circuits on the first outright rejection (everything in the 1
    family, plus 2 — 3/4/5 only ever modify-and-continue, never reject
    outright, so there's nothing to short-circuit past them). */
+/* Point 6/7's fix, decision 3 (approved with change: always note, never
+ * silent). A scheme's derived loads must never exceed the scheme's own
+ * approved top load (value.load) — which has already passed gates
+ * 3/4/5 by the time this runs. Two smuggling vectors closed: an absolute
+ * backoffLoad exceeding the top (never validated by anything before
+ * this), and a backoffLoadPct over 100% (mathematically bounded, but
+ * makes the "backoff" heavier than the top set it's supposed to be
+ * lighter than — not arithmetic drift, an author writing something
+ * incoherent). dropPct >= 100% (zero or negative weight) gets the same
+ * treatment. Clamp and note — never reject: this is arithmetic derived
+ * from an already-approved number, not a fresh safety judgment, but per
+ * decision 3 the clamp itself must always be visible, same as every
+ * other modify-and-continue gate here. Runs LAST, after value.load has
+ * settled through gates 3/4/5, so a pain-rule reduction or escalation
+ * cap on the top load automatically cascades to the derived numbers. */
+function clampSchemeToTopLoad(value) {
+  const scheme = value.scheme;
+  if (!scheme || value.load == null) return { value, note: null };
+  if (scheme.type === "backoff") {
+    const notes = [];
+    let pct = scheme.backoffLoadPct;
+    if (pct != null && pct > 100) { notes.push(`backoffLoadPct ${pct}% is heavier than the top set — clamped to 100%`); pct = 100; }
+    let load = scheme.backoffLoad;
+    if (load != null && load > value.load) {
+      const fallback = round5(value.load * ((pct ?? 80) / 100));
+      notes.push(`backoffLoad ${load} lb is heavier than the ${value.load} lb top set — replaced with ${fallback} lb`);
+      load = fallback;
+    }
+    if (!notes.length) return { value, note: null };
+    const newScheme = { ...scheme };
+    if (pct !== scheme.backoffLoadPct) newScheme.backoffLoadPct = pct;
+    if (load !== scheme.backoffLoad) newScheme.backoffLoad = load;
+    return { value: { ...value, scheme: newScheme }, note: notes.join("; ") };
+  }
+  if (scheme.type === "drop" && scheme.dropPct != null && scheme.dropPct >= 100) {
+    return {
+      value: { ...value, scheme: { ...scheme, dropPct: 50 } },
+      note: `dropPct ${scheme.dropPct}% would mean zero or negative weight on the drop segment — clamped to 50%`,
+    };
+  }
+  return { value, note: null };
+}
+
 function runPrescriptionGates(prescription, ctx) {
   const g1 = gate1UnknownId(prescription);
   if (g1.reject) return { accepted: false, gate: g1.gate, reason: g1.reason };
@@ -2223,6 +2469,9 @@ function runPrescriptionGates(prescription, ctx) {
 
   const g1d = gate1dAmbiguousMatch(prescription, ctx);
   if (g1d.reject) return { accepted: false, gate: g1d.gate, reason: g1d.reason };
+
+  const g1e = gate1eSchemeConsistency(prescription);
+  if (g1e.reject) return { accepted: false, gate: g1e.gate, reason: g1e.reason };
 
   const g2 = gate2Injury(prescription, ctx);
   if (g2.reject) return { accepted: false, gate: g2.gate, reason: g2.reason };
@@ -2241,6 +2490,10 @@ function runPrescriptionGates(prescription, ctx) {
   const g5 = gate5PainEscalation(value, ctx);
   if (g5.value) value = g5.value;
   if (g5.note) notes.push({ gate: 5, note: g5.note });
+
+  const clamped = clampSchemeToTopLoad(value);
+  value = clamped.value;
+  if (clamped.note) notes.push({ gate: "scheme", note: clamped.note });
 
   return { accepted: true, value, notes };
 }
@@ -2850,9 +3103,7 @@ function DayPage({ day, data, persist, onBack }) {
       {(() => {
         const entries = resolveDayExercises(day, data);
         const isDeload = deloadActive(data);
-        const pool = entries.map((e) => isDeload
-          ? { ...e.ex, sets: Math.max(isCompound(e.ex) ? 2 : 1, Math.round(e.ex.sets * 0.6)) }
-          : e.ex);
+        const pool = entries.map((e) => e.ex).map((ex) => deloadScale(ex, isDeload));
         const fit = fitDayToTime(pool, (data.plan && data.plan.sessionMin) || 60);
         const sum = dayFocusSummary(day, data);
         const focusParts = [];
@@ -3053,7 +3304,12 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                     <span style={{ color: C.sub, fontSize: 11.5 }}>S{i + 1} </span>
                     <b>{s.w || "BW"}</b>
                     <span style={{ color: C.sub }}> × </span>
-                    <b style={{ color: (s.r < ex.repMin) ? C.orange : C.text }}>{s.r}</b>
+                    {/* A backoff/drop segment is deliberately at a different
+                        (lower) rep target than ex.repMin — flagging it
+                        orange here would mark correct execution of the
+                        scheme as a shortfall. Only warn on the working
+                        (top/straight) segments the target actually applies to. */}
+                    <b style={{ color: (s.r < ex.repMin && s.segment !== "backoff" && s.segment !== "drop") ? C.orange : C.text }}>{s.r}</b>
                   </div>
                 ))}
               </div>
