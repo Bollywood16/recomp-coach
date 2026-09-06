@@ -412,8 +412,136 @@ starting to interact with old untagged ones — so it gets its own review
 round before landing.
 
 ================================================================================
-NEXT
+NEXT (superseded by the round below)
 ================================================================================
 Non-logger-UI implementation complete and verified. Awaiting review before
 the logger UI round: ExerciseCard's pre-fill + saveSession segment tagging
 + requirement 3's legible rendering.
+
+================================================================================
+LOGGER UI ROUND (user review round 3) — DONE
+================================================================================
+
+Scope: ExerciseCard pre-fill per totalSegmentsFor with per-segment default
+loads (point 1); saveSession tags each row (point 2); requirement 3's
+legible rendering; segment visible and correctable in the UI (point 5);
+the Log tab's quick-log form gets the same treatment (point 6); Addition
+B's partial-logging confirmation, with a correction — an over-logged extra
+row defaults to the SAME segment as the row above, not "straight" as
+originally proposed.
+
+New pure functions (both directly unit-tested, no React needed):
+  - buildSegmentRows(ex, rec): one row per totalSegmentsFor(ex), each with
+    its own segment tag and default weight — top at rec.weight, backoff
+    at scheme.backoffLoad ?? rec.weight * backoffLoadPct/100, drop at
+    rec.weight * (1 - dropPct/100), inserted after the set(s) appliesTo
+    targets. Every row's segment is written EXPLICITLY, including "top"
+    for a plain/no-scheme exercise — simpler than two representations
+    (omitted vs "top") for the same thing, and harmless: every exclusion
+    predicate from the previous round already treats them identically.
+    Bodyweight guard: rec.weight === 0 keeps every segment at 0 rather
+    than round5's floor manufacturing a fake "5 lb" backoff/drop.
+  - formatSchemeSets(sets): groups consecutive same-segment rows,
+    "N x reps @ weight lb", joined by "then" — matches the spec's own
+    example EXACTLY, character for character, once verified. Deliberately
+    NO parenthetical segment label (an earlier draft added "(backoff)"/
+    "(drop)" annotations; removed to match the spec's literal example —
+    the "then"-separated grouping and differing numbers already carry the
+    structure, and requirement 3 asks for fewer words, not more). Falls
+    back to a slash-joined list when weight or reps vary within one
+    group, rather than silently picking one number.
+
+UI wiring:
+  - New SegmentPicker component (Top/Backoff/Drop pills), shown per row
+    ONLY when the exercise's own scheme makes more than one segment
+    possible (backoff or drop) — a plain exercise has nothing to get
+    wrong (every row is trivially "top"), and showing this on every set
+    of every exercise would be exactly the clutter requirement 3 asks
+    this UI to avoid. Wired into BOTH ExerciseCard and the Log tab's
+    quick-log form.
+  - ExerciseCard's pre-fill useEffect now calls buildSegmentRows instead
+    of a flat ex.sets copies-of-one-number. saveSession persists each
+    row's segment. "+ Add set" defaults the new row to the SAME segment
+    AND weight as the row above (point 4's correction from "straight") —
+    "one more like the last one" matches what adding an extra set
+    mid-scheme almost always means.
+  - The Log tab's quick-log form (point 6) now routes its exercise list
+    through resolveDayExercises instead of a hand-rolled resolveSlot-only
+    map — without this it had no scheme context to key the picker or
+    pre-fill off at all. Its blank-slate design (never auto-fills a
+    recommended weight, unlike ExerciseCard) is preserved: row count and
+    segment sequence come from buildSegmentRows(ex, {weight:0}), which
+    conveniently blanks every weight via the same bodyweight guard,
+    keeping this form's existing "manual, no auto-fill" character while
+    still seeding the right number of rows with the right tags.
+  - "LAST TIME" panel and the Log tab's "Recent sessions" list both now
+    render formatSchemeSets' one-liner (requirement 3) — the per-set
+    S1/S2/S3 breakdown stays underneath for anyone who wants the detail.
+
+Addition B (partial logging), confirmed rather than assumed:
+  - Under-logging: saveSession's existing `.filter(s => s.r > 0)` already
+    drops any row nobody filled in — unchanged, segment tagging rides
+    along harmlessly on a row that gets filtered out either way. No
+    phantom zero-rep rows.
+  - Over-logging: corrected per the review — same segment AND weight as
+    the row above, not "straight" regardless of context.
+
+REAL GAP FOUND WHILE BUILDING THE REQUIRED END-TO-END VERIFICATION, not
+hypothetical: clampSchemeToTopLoad (previous round's point 6/decision 3
+fix) short-circuited entirely whenever a prescription's `load` was
+omitted (the spec's own "let recommend() drive it" case) — meaning a
+backoffLoadPct of 150% would sail through completely unclamped whenever
+no explicit top load was prescribed, which is precisely the scenario
+needed to exercise recommend()'s history-driven path at all (a prescribed
+`load` makes ex.prescribedLoad win unconditionally forever, so
+recommend()'s progression math — the actual subject of this whole task —
+never even runs while one is active). Fixed: the percentage clamps
+(backoffLoadPct, dropPct) now run regardless of whether load is known;
+only the ABSOLUTE backoffLoad-vs-top comparison still needs a concrete
+top number to compare against, so that piece alone stays conditional.
+New regression tests for both the load-omitted and load-present paths,
+verified against a deliberately reverted fix (confirmed 3 assertions fail
+with the exact unclamped values before restoring).
+
+Verification:
+  - scripts/check-set-scheme-logger.js: 13 assertions (buildSegmentRows
+    across straight/backoff/both drop appliesTo values/the bodyweight
+    guard; formatSchemeSets against the spec's literal example, plain
+    sessions, legacy no-segment rows, varied data, empty input).
+  - scripts/check-set-schemes.js: +3 assertions for the clamp gap above.
+  - Two deliberately-reintroduced-bug checks this round (bodyweight
+    guard, the clamp gap), both confirmed to fail for the predicted
+    reason before being restored.
+  - REQUIRED END-TO-END LIVE VERIFICATION (this is the one that actually
+    proves the task, not a proxy for it): applied a backoff-scheme
+    prescription (topSets:2, backoffSets:2, backoffLoadPct:70, load
+    OMITTED so recommend()'s history path actually runs) to Incline DB
+    Curl through the real paste-and-apply UI. Opened the exercise fresh:
+    pre-fill showed exactly 4 rows at [15, 15, 10, 10] lb with the
+    correct segment pills pre-selected, segment picker visible and
+    tappable. Logged top sets at 15 reps (hit the ceiling) and backoff
+    sets at 6 reps (a normal, correctly-executed backoff pushed toward
+    failure at the lighter load) — exactly the input that read as
+    unintended decay before this task existed. Reopened the exercise:
+    "LAST TIME" showed "2 x 15 @ 15 lb, then 2 x 6 @ 10 lb" (character-
+    for-character the spec's format) with the backoff rows correctly NOT
+    flagged by the rep-floor warning; the card showed "ADD WEIGHT" at
+    17.5 lb with the note "You hit 15+ reps on every set at 15 lb. Move
+    up..." — completely unaffected by the backoff set's low rep count.
+    Then, to prove this is actually load-bearing and not a coincidence:
+    reverted recommend()'s exclusion filter, reran the IDENTICAL scenario
+    from the same saved state — the card flipped to "REDUCE" with "Your
+    reps fell from 15 to 6 at 15 lb — that's a 60% drop... Drop to
+    12.5 lb" — the exact compounding-reduction bug this whole task exists
+    to prevent, reproduced live from real UI interaction, not a synthetic
+    unit test. Restored the fix, reran, confirmed "ADD WEIGHT" again.
+    Zero console errors across every run.
+  - npm test: 8 scripts, 227 assertions total across the whole suite.
+
+================================================================================
+NEXT
+================================================================================
+Task 3 complete: all four requirements, all eight review-round
+constraints, both post-review additions. Next: the real-data day
+comparison (Task 2's earlier deferred request) once the backup export is
+available, then Task 6.

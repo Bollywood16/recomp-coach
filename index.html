@@ -2431,13 +2431,29 @@ function defaultGroupCap(group, weeklyGroupSets) {
  * cap on the top load automatically cascades to the derived numbers. */
 function clampSchemeToTopLoad(value) {
   const scheme = value.scheme;
-  if (!scheme || value.load == null) return { value, note: null };
+  if (!scheme) return { value, note: null };
+  // backoffLoadPct/dropPct > 100 is incoherent regardless of whether an
+  // explicit top `load` was even prescribed — "80% of whatever the top
+  // ends up being" (load omitted, recommend() drives it) is just as
+  // nonsensical at 150% as an absolute backoffLoad exceeding a KNOWN top.
+  // Found while building the end-to-end verification for this round:
+  // the original version only ran this whole function when value.load !=
+  // null, which meant a scheme attached to a load-omitted prescription
+  // (spec: omitting load means "let recommend() drive it") skipped this
+  // clamp ENTIRELY — the exact smuggling vector point 6 exists to close,
+  // just reachable through a different door. The one check that
+  // genuinely needs a known top number — an ABSOLUTE backoffLoad
+  // exceeding it — is the only piece still gated on value.load != null;
+  // there's nothing concrete to compare an absolute number against
+  // otherwise (buildSegmentRows resolves that relative to whatever
+  // recommend() decides at render time instead, visible to the user
+  // before they save).
   if (scheme.type === "backoff") {
     const notes = [];
     let pct = scheme.backoffLoadPct;
     if (pct != null && pct > 100) { notes.push(`backoffLoadPct ${pct}% is heavier than the top set — clamped to 100%`); pct = 100; }
     let load = scheme.backoffLoad;
-    if (load != null && load > value.load) {
+    if (value.load != null && load != null && load > value.load) {
       const fallback = round5(value.load * ((pct ?? 80) / 100));
       notes.push(`backoffLoad ${load} lb is heavier than the ${value.load} lb top set — replaced with ${fallback} lb`);
       load = fallback;
@@ -2632,6 +2648,76 @@ function buildGateContext(data, plan) {
   };
 }
 
+
+/* Task 3, logger UI round. Every row this produces gets an EXPLICIT
+   segment — "top" for a plain/no-scheme exercise too, not omitted —
+   simpler than two representations of the same thing floating around,
+   and harmless: every exclusion predicate in this file already treats
+   "top" and undefined identically. Only "backoff" and "drop" are ever
+   distinguished; there is no third stored value, "straight" stays a
+   SCHEME type (ex.scheme.type), never a row's own segment tag, since
+   nothing anywhere needs to tell "top" and "straight" apart on a row.
+   Pure and testable on its own — no React, no persist — so the pre-fill
+   logic itself is covered the same way everything else in this build is. */
+function buildSegmentRows(ex, rec) {
+  const topWeight = (w) => (w === 0 ? "" : String(w));
+  const scheme = ex.scheme;
+  // round5's floor of 5 makes sense for a real load, not for "80% of
+  // bodyweight" — a pure-bodyweight top (rec.weight === 0) stays 0 for
+  // every segment rather than manufacturing a nonsensical "5 lb".
+  if (scheme && scheme.type === "backoff") {
+    const backoffLoad = rec.weight === 0 ? 0 : scheme.backoffLoad ?? round5(rec.weight * ((scheme.backoffLoadPct ?? 80) / 100));
+    const rows = [];
+    for (let i = 0; i < (scheme.topSets || 0); i++) rows.push({ w: topWeight(rec.weight), r: "", segment: "top" });
+    for (let i = 0; i < (scheme.backoffSets || 0); i++) rows.push({ w: topWeight(backoffLoad), r: "", segment: "backoff" });
+    return rows;
+  }
+  if (scheme && scheme.type === "drop") {
+    const dropWeight = rec.weight === 0 ? 0 : round5(rec.weight * (1 - (scheme.dropPct ?? 20) / 100));
+    const total = ex.sets || 0;
+    const rows = [];
+    for (let i = 0; i < total; i++) {
+      rows.push({ w: topWeight(rec.weight), r: "", segment: "top" });
+      const isLast = i === total - 1;
+      if (scheme.appliesTo === "allSets" || isLast) {
+        for (let d = 0; d < (scheme.drops || 1); d++) rows.push({ w: topWeight(dropWeight), r: "", segment: "drop" });
+      }
+    }
+    return rows;
+  }
+  return Array.from({ length: ex.sets || 0 }, () => ({ w: topWeight(rec.weight), r: "", segment: "top" }));
+}
+
+/* Requirement 3, matching the spec's own example exactly: "2 x 15 @ 12.5
+   lb, then 2 x 15 @ 10 lb" — no parenthetical segment label. The
+   "then"-separated grouping plus the differing numbers already convey the
+   structure; scannable on a phone mid-workout means fewer words, not
+   more. Groups CONSECUTIVE same-segment rows (order preserved — a
+   scheme's segments are always contiguous by construction, but this
+   doesn't assume it, it just groups whatever's actually there). Real
+   logged data isn't always perfectly uniform within a group (fatigue, a
+   missed rep) — falls back to a slash-joined list for weight or reps
+   that differ within one group rather than silently picking one number
+   and hiding the rest. The unscemed case reads exactly as it always did:
+   "3 x 8 @ 95 lb", one group, no "then". */
+function formatSchemeSets(sets) {
+  if (!sets || !sets.length) return "";
+  const groups = [];
+  sets.forEach((s) => {
+    const seg = s.segment === "backoff" || s.segment === "drop" ? s.segment : "top";
+    const last = groups[groups.length - 1];
+    if (last && last.segment === seg) last.rows.push(s); else groups.push({ segment: seg, rows: [s] });
+  });
+  const joinVaried = (vals) => {
+    const uniq = [...new Set(vals)];
+    return uniq.length === 1 ? String(uniq[0]) : vals.join("/");
+  };
+  return groups.map((g) => {
+    const wLabel = joinVaried(g.rows.map((r) => r.w || "BW"));
+    const rLabel = joinVaried(g.rows.map((r) => r.r));
+    return `${g.rows.length} × ${rLabel} @ ${wLabel} lb`;
+  }).join(", then ");
+}
 
 function formatRestSeconds(sec) {
   if (sec < 60) return `${sec} s`;
@@ -3185,6 +3271,34 @@ function DayPage({ day, data, persist, onBack }) {
   );
 }
 
+/* Point 5: segment must be visible and correctable — a row logged into
+   the wrong tag reads wrong in every consumer fixed earlier this task
+   (e1RM, progression, Gate 5's count, the coach brief). Shown only when
+   an exercise's own scheme makes more than one segment possible
+   (backoff/drop); a plain exercise has nothing to get wrong (every row is
+   trivially "top") and showing this on every set of every exercise would
+   be exactly the clutter requirement 3 is asking this UI to avoid. */
+function SegmentPicker({ value, onChange }) {
+  const OPTIONS = [{ key: "top", label: "Top" }, { key: "backoff", label: "Backoff" }, { key: "drop", label: "Drop" }];
+  return (
+    <div style={{ display: "flex", gap: 4 }}>
+      {OPTIONS.map((o) => (
+        <button
+          key={o.key} type="button" onClick={() => onChange(o.key)}
+          style={{
+            ...font, fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 999,
+            border: "none", cursor: "pointer",
+            background: value === o.key ? C.blue : "#F0F0F3",
+            color: value === o.key ? "#fff" : C.sub,
+          }}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const rec = recommend(ex, data.sessions, deloadActive(data));
   const rest = restFor(ex);
@@ -3203,26 +3317,37 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
     return () => clearTimeout(t);
   }, [timer]);
 
-  // Prefill the form with the recommended weight when opened
+  // Prefill the form with the recommended weight when opened — one row
+  // per totalSegmentsFor(ex), each pre-loaded with its own segment's
+  // default weight (top/backoff/drop), not a flat ex.sets copies of the
+  // same number (point 1 of this round).
   useEffect(() => {
     if (open && sets === null) {
-      setSets(Array.from({ length: ex.sets }, () => ({ w: rec.weight === 0 ? "" : String(rec.weight), r: "" })));
+      setSets(buildSegmentRows(ex, rec));
     }
     if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); }
   }, [open]); // eslint-disable-line
 
+  const hasNonTrivialScheme = ex.scheme && ex.scheme.type !== "straight";
+
   const saveSession = () => {
     const assistMode = ex.assistable && assist;
+    // Point 2: each row's segment rides straight through to the stored
+    // row. Point 4 (Addition B): the existing r>0 filter already drops
+    // any row nobody filled in — a pre-filled drop/backoff segment the
+    // user skipped just never gets persisted, not saved as a phantom
+    // zero-rep row. That's unchanged; segment tagging doesn't touch it.
     const clean = (sets || [])
       .map((s) => {
         const raw = Number(s.w) || 0;
         const r = Number(s.r) || 0;
+        const segment = s.segment || "top";
         if (assistMode) {
           // Entered value is machine assistance; store what was actually lifted.
           const eff = Math.max(1, Math.round(bw - raw));
-          return { w: eff, r, assist: raw, bw };
+          return { w: eff, r, assist: raw, bw, segment };
         }
-        return { w: raw, r };
+        return { w: raw, r, segment };
       })
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
@@ -3298,6 +3423,11 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
               <div style={{ fontSize: 11.5, fontWeight: 700, color: C.sub, letterSpacing: 0.4 }}>
                 LAST TIME · {shortDate(lastSess.date)}
               </div>
+              {/* Requirement 3: the scannable one-liner first ("2 x 15 @
+                  12.5 lb, then 2 x 15 @ 10 lb") — this is the thing meant
+                  to be read at a glance mid-workout. The per-set S1/S2/S3
+                  breakdown below stays for anyone who wants the detail. */}
+              <div style={{ fontSize: 14, fontWeight: 700, marginTop: 4 }}>{formatSchemeSets(lastSess.sets)}</div>
               <div style={{ display: "flex", gap: 14, marginTop: 6, flexWrap: "wrap" }}>
                 {lastSess.sets.map((s, i) => (
                   <div key={i} style={{ fontSize: 14 }}>
@@ -3337,17 +3467,24 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
           )}
 
           {(sets || []).map((s, i) => (
-            <div key={i} style={{ ...S.row, marginBottom: 8 }}>
-              <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
-              <input
-                style={S.input} type="number" inputMode="decimal"
-                placeholder={ex.assistable && assist ? "assist lbs" : "lbs"}
-                value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
-              />
-              <input
-                style={S.input} type="number" inputMode="numeric" placeholder="reps"
-                value={s.r} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, r: e.target.value } : x)))}
-              />
+            <div key={i} style={{ marginBottom: 8 }}>
+              <div style={S.row}>
+                <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
+                <input
+                  style={S.input} type="number" inputMode="decimal"
+                  placeholder={ex.assistable && assist ? "assist lbs" : "lbs"}
+                  value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
+                />
+                <input
+                  style={S.input} type="number" inputMode="numeric" placeholder="reps"
+                  value={s.r} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, r: e.target.value } : x)))}
+                />
+              </div>
+              {hasNonTrivialScheme && (
+                <div style={{ marginTop: 4, marginLeft: 54 }}>
+                  <SegmentPicker value={s.segment || "top"} onChange={(seg) => setSets(sets.map((x, j) => (j === i ? { ...x, segment: seg } : x)))} />
+                </div>
+              )}
             </div>
           ))}
 
@@ -3368,7 +3505,15 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
           )}
 
           <div style={{ ...S.row, marginTop: 4, flexWrap: "wrap", gap: 8 }}>
-            <button style={S.smallPill()} onClick={() => setSets([...(sets || []), { w: rec.weight === 0 ? "" : String(rec.weight), r: "" }])}>
+            {/* Point 4: an over-logged extra row defaults to the SAME
+                segment and weight as the row above it, not "straight"/
+                the top weight regardless of context — "one more like the
+                last one" matches what a user adding an extra set mid-
+                scheme almost always means. */}
+            <button style={S.smallPill()} onClick={() => {
+              const prior = sets && sets.length ? sets[sets.length - 1] : null;
+              setSets([...(sets || []), { w: prior ? prior.w : (rec.weight === 0 ? "" : String(rec.weight)), r: "", segment: prior ? (prior.segment || "top") : "top" }]);
+            }}>
               <Plus size={13} /> Add set
             </button>
             {!slot.isBonus && (
@@ -4067,22 +4212,38 @@ function TaggingCoverageCard() {
 }
 
 function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOut }) {
+  // Point 6: routed through resolveDayExercises (was a hand-rolled
+  // resolveSlot-only map) so this form sees the same picture the in-day
+  // flow does — bonus lifts, prescription reconciliation, and any active
+  // scheme all included, not bypassed. Without this, "the same treatment"
+  // for schemes would have nothing to key off: a bare resolveSlot result
+  // never carries .scheme at all.
   const resolvedProgram = getProgram(data).map((d) => ({
     ...d,
-    exercises: d.exercises.map((slot) => resolveSlot(slot, data.swaps, data.focus)),
+    exercises: resolveDayExercises(d, data).map((e) => e.ex),
   }));
+  const exerciseById = (id) => resolvedProgram.flatMap((d) => d.exercises).find((e) => e.id === id) || EX_BY_ID[id] || { id, sets: 3 };
+  // Blank-slate rows (weight:0 forces buildSegmentRows' bodyweight guard,
+  // which blanks every segment's weight) — this form has never
+  // auto-filled a recommended weight the way ExerciseCard does, only the
+  // SEGMENT sequence and row count are worth seeding here.
+  const blankRowsFor = (id) => buildSegmentRows(exerciseById(id), { weight: 0 });
+
   const [exId, setExId] = useState(resolvedProgram[0].exercises[0].id);
-  const [sets, setSets] = useState([{ w: "", r: "" }, { w: "", r: "" }, { w: "", r: "" }]);
+  const [sets, setSets] = useState(() => blankRowsFor(resolvedProgram[0].exercises[0].id));
   const [bw, setBw] = useState("");
   const [savedFlash, setSavedFlash] = useState("");
   const [pain, setPain] = useState("");
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  const selectedEx = exerciseById(exId);
+  const hasNonTrivialScheme = selectedEx.scheme && selectedEx.scheme.type !== "straight";
 
   const flash = (msg) => { setSavedFlash(msg); setTimeout(() => setSavedFlash(""), 2000); };
 
   const saveSession = () => {
+    // Point 2: segment rides through to the stored row here too.
     const clean = sets
-      .map((s) => ({ w: Number(s.w) || 0, r: Number(s.r) || 0 }))
+      .map((s) => ({ w: Number(s.w) || 0, r: Number(s.r) || 0, segment: s.segment || "top" }))
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
     // Delayed-onset pain (painRetro) is asked for separately, across all lifts —
@@ -4094,7 +4255,7 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
       painRetro: null, painRetroAt: null, painRetroDismissed: false,
     };
     persist({ ...data, sessions: [...data.sessions, session] });
-    setSets([{ w: "", r: "" }, { w: "", r: "" }, { w: "", r: "" }]);
+    setSets(blankRowsFor(exId));
     setPain("");
     flash("Session saved");
   };
@@ -4148,7 +4309,7 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
         <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 10 }}>Log a lift</div>
         <select
           style={{ ...S.input, appearance: "none", marginBottom: 12 }}
-          value={exId} onChange={(e) => setExId(e.target.value)}
+          value={exId} onChange={(e) => { const id = e.target.value; setExId(id); setSets(blankRowsFor(id)); }}
         >
           {resolvedProgram.map((d) => (
             <optgroup key={d.id} label={d.name}>
@@ -4167,16 +4328,23 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
         </select>
 
         {sets.map((s, i) => (
-          <div key={i} style={{ ...S.row, marginBottom: 8 }}>
-            <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
-            <input
-              style={S.input} type="number" inputMode="decimal" placeholder="lbs"
-              value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
-            />
-            <input
-              style={S.input} type="number" inputMode="numeric" placeholder="reps"
-              value={s.r} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, r: e.target.value } : x)))}
-            />
+          <div key={i} style={{ marginBottom: 8 }}>
+            <div style={S.row}>
+              <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
+              <input
+                style={S.input} type="number" inputMode="decimal" placeholder="lbs"
+                value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
+              />
+              <input
+                style={S.input} type="number" inputMode="numeric" placeholder="reps"
+                value={s.r} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, r: e.target.value } : x)))}
+              />
+            </div>
+            {hasNonTrivialScheme && (
+              <div style={{ marginTop: 4, marginLeft: 54 }}>
+                <SegmentPicker value={s.segment || "top"} onChange={(seg) => setSets(sets.map((x, j) => (j === i ? { ...x, segment: seg } : x)))} />
+              </div>
+            )}
           </div>
         ))}
 
@@ -4193,7 +4361,10 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
         <div style={{ ...S.row, marginTop: 12 }}>
           <button
             style={S.pillBtn("#E9E9EB", C.text)}
-            onClick={() => setSets([...sets, { w: "", r: "" }])}
+            onClick={() => {
+              const prior = sets.length ? sets[sets.length - 1] : null;
+              setSets([...sets, { w: prior ? prior.w : "", r: "", segment: prior ? (prior.segment || "top") : "top" }]);
+            }}
           >
             <Plus size={14} style={{ verticalAlign: -2 }} /> Add set
           </button>
@@ -4214,7 +4385,7 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
           <div>
             <div style={{ fontWeight: 700, fontSize: 14 }}>{EX_BY_ID[s.exerciseId]?.name || s.exerciseId}</div>
             <div style={{ color: C.sub, fontSize: 13, marginTop: 2 }}>
-              {shortDate(s.date)} · {s.sets.map((x) => `${x.w || "BW"}×${x.r}`).join("  ")}
+              {shortDate(s.date)} · {formatSchemeSets(s.sets)}
             </div>
           </div>
           <button

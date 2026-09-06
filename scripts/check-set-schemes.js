@@ -106,6 +106,19 @@ check("totalSegmentsFor: drop allSets adds drops*sets", app.totalSegmentsFor({ s
   ok("clamp is always noted, never silent", !!r.note && /150%/.test(r.note), r.note);
 }
 {
+  // Found while building the end-to-end verification: load omitted
+  // (spec's "let recommend() drive it") must NOT skip the percentage
+  // clamp — a prescription can smuggle an incoherent backoffLoadPct
+  // through this door just as easily as through an explicit load.
+  const r = app.clampSchemeToTopLoad({ load: undefined, scheme: { type: "backoff", topSets: 2, backoffSets: 2, backoffLoadPct: 150 } });
+  ok("backoffLoadPct > 100 clamped even when load is omitted entirely", r.value.scheme.backoffLoadPct === 100, JSON.stringify(r));
+  ok("noted", !!r.note);
+}
+{
+  const r = app.clampSchemeToTopLoad({ load: undefined, scheme: { type: "drop", drops: 1, dropPct: 150, appliesTo: "lastSet" } });
+  ok("dropPct >= 100 clamped even when load is omitted", r.value.scheme.dropPct === 50, JSON.stringify(r));
+}
+{
   const r = app.clampSchemeToTopLoad({ load: 100, scheme: { type: "backoff", topSets: 2, backoffSets: 2, backoffLoad: 120 } });
   ok("absolute backoffLoad exceeding top load replaced (120 -> derived from default 80%)", r.value.scheme.backoffLoad === 80, r.value.scheme.backoffLoad);
   ok("noted", !!r.note && /120 lb/.test(r.note));
