@@ -195,6 +195,38 @@ stay tracked against their owning task rather than quietly dropped.
 | 8 | A day omitting the `specialize` group entirely → Gate 12 rejects. | `days` schema + focus-group tracking per day + Gate 12 | Task 6 | Not started |
 | 9 | A trim that would cut RDL / goblet squat / hip thrust below the maintain floor → Gate 13 rejects. | `days` schema + maintain-floor concept + Gate 13 | Task 6 | Not started |
 
+**Real-data note for row 9 (Fix 1, TASK-0-BACKUP-MIGRATION-REVIEW.txt):**
+Fix 1's time-budget trim now gives specialize/emphasize groups a real
+floor (a share of their own pre-trim volume), but maintain still gets
+none beyond the pre-existing per-exercise minimum — deliberately, per
+that fix's design ("maintain yields first," Gate 13's job to change).
+Stress-tested against this user's real `ufLower` day (legs = maintain) at
+an extreme forced budget: **hip thrust and calf raise are the two
+movements that get dropped entirely** (not just cut to their floor —
+removed from the day) before goblet squat / leg press / leg curl, which
+hold at their per-exercise floor instead. Both are rehab-relevant lifts
+on this profile. Whoever builds Gate 13 should treat these as the
+concrete real-world case the maintain floor needs to cover, not a
+hypothetical.
+
+## Fix 1 (trim priority) follow-ups — not fixed
+
+- **Biceps (6) vs triceps (5) on the Delts & Arms day is incidental, not
+  a designed balance.** Fix 1 corrected the emphasis-level inversion
+  (arms was getting cut harder than shoulders despite being the higher
+  priority), and the biceps/triceps split happened to tighten from 7v4 to
+  6v5 as a side effect of which spawned/bonus movements absorb the
+  remaining trim — nothing in `trimPriority`/`groupTrimFloors` targets
+  that ratio. Don't rely on it staying close as inputs (focus levels,
+  swaps, session length) change. Not scheduled against any task; flagging
+  so it isn't later described as fixed.
+- **`sessionRules.trimPriority` is still inert.** Accepted as a known
+  plan key (so a paste isn't rejected for including it) but never read by
+  `fitDayToTime` or `gate7DurationTrim`, before or after Fix 1. Letting a
+  coach plan override the default emphasis-tier ordering is a separate
+  feature with its own shape to design (per-group ranking list? per-
+  exercise?) — out of scope for Fix 1, not assigned to a task yet.
+
 ## Completed now (Task 4, gates 1-8)
 
 Tested against the 5 directly-applicable required cases, plus 2 synthetic

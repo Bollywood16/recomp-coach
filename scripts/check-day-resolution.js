@@ -83,7 +83,7 @@ function REFERENCE_dayPageEntries(day, data) {
 
 function REFERENCE_dayFittedMinutes(day, data) {
   const list = REFERENCE_dayPageEntries(day, data).map((e) => e.ex);
-  return app.fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60).minutes;
+  return app.fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60, data.focus).minutes;
 }
 
 function REFERENCE_weeklySetsByGroup(data, CAT_TO_GROUP) {
@@ -91,7 +91,7 @@ function REFERENCE_weeklySetsByGroup(data, CAT_TO_GROUP) {
   const t = {};
   program.forEach((day) => {
     const list = REFERENCE_dayPageEntries(day, data).map((e) => e.ex);
-    const fitted = app.fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60).list;
+    const fitted = app.fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60, data.focus).list;
     fitted.forEach((ex) => {
       const g = CAT_TO_GROUP[ex.cat];
       if (g) t[g] = (t[g] || 0) + ex.sets;
