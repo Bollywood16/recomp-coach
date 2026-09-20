@@ -506,6 +506,95 @@ function cloneInjuryProfileDefaults() {
   return JSON.parse(JSON.stringify(DEFAULT_INJURY_PROFILE));
 }
 
+/* Shared by both "load a persisted record" paths — App's boot-time
+   localStorage read and BackupCard's file-import restore
+   (TASK-0-BACKUP-MIGRATION-REVIEW.txt, Fix 2). Before this, only the boot
+   path ran the goalProfile.injuryRecovery -> recoveringMode fail-safe, the
+   one-time migration notice, and the goblet -> boxsquat session rename; the
+   import path reimplemented just the injuryProfile merge and silently
+   skipped all three. A restored pre-Task-0 backup with
+   goalProfile.injuryRecovery === false landed on whatever injuryProfile the
+   app already had in memory (accidentally correct only when that happened
+   to already read recoveringMode: true) instead of running the fail-safe,
+   and real logged "goblet" sessions never got renamed. One function now,
+   called from both places, so they cannot drift apart again.
+
+   `source` is the record being loaded (the parsed localStorage blob on
+   boot; the parsed backup file's `data` on import). Whether a migration is
+   needed at all is decided from `source` alone, deliberately never falling
+   back to `existing` — restoring an old backup means loading THAT backup's
+   own history, not silently inheriting whatever the current device already
+   has in memory just because the file happens to be older. This is also
+   what keeps the fail-safe live on import: the current device's live
+   injuryProfile is always present and truthy, so folding it into the
+   "has this record already been migrated" check would make the fail-safe
+   permanently unreachable there.
+
+   `existing` is the current in-memory data to fall back onto for the
+   bookkeeping fields (history / notice / goblet-migration state) when
+   `source` doesn't carry its own — e.g. re-importing an old backup after
+   the goblet/boxsquat prompt was already resolved on this device must not
+   re-trigger it. There is no such fallback on boot (nothing is loaded yet),
+   so that call passes null.
+
+   Renames goblet sessions to boxsquat IN PLACE within the one returned
+   `sessions` array — there is no separate per-id bucket for weeklySeries /
+   bestSet / stallScore to disagree about, so e1RM trend and stall
+   detection see one continuous history under the new id, never a split
+   one (verified in scripts/check-backup-import-migration.js). */
+function migrateInjuryAndGobletData(source, existing) {
+  const prevHistory = source.injuryProfileHistory || (existing && existing.injuryProfileHistory) || [];
+  const prevMigrationNotice = source.injuryProfileMigration || (existing && existing.injuryProfileMigration) || null;
+  const prevGobletMigration = source.gobletBoxSquatMigration || (existing && existing.gobletBoxSquatMigration) || null;
+
+  // Fails safe: goalProfile.injuryRecovery was only ever written by the
+  // user's own toggle in CoachCard, so a real `false` is unambiguous. But
+  // absent/null/anything-else-falsy is not a confirmed user choice, and a
+  // silent OFF-with-no-gating is the one failure mode where nothing
+  // surfaces — so only a strict `=== false` carries forward as OFF;
+  // everything else defaults ON.
+  const migrating = !source.injuryProfile && !!source.goalProfile;
+  let injuryProfile;
+  if (source.injuryProfile) {
+    injuryProfile = { ...cloneInjuryProfileDefaults(), ...source.injuryProfile };
+  } else {
+    const explicitlyOff = source.goalProfile && source.goalProfile.injuryRecovery === false;
+    injuryProfile = { ...cloneInjuryProfileDefaults(), recoveringMode: !explicitlyOff };
+  }
+
+  // One-time, dismissible, and recorded — so a migration that silently
+  // changed effective behavior is never silent to the user.
+  let injuryProfileHistory = prevHistory;
+  let injuryProfileMigration = prevMigrationNotice;
+  if (migrating && !injuryProfileMigration) {
+    const at = new Date().toISOString();
+    injuryProfileMigration = {
+      at,
+      message: injuryProfile.recoveringMode
+        ? "Injury gating has been turned on. Adjust in the Log tab."
+        : "Injury gating stayed off, carried over from your previous setting. Adjust in the Log tab.",
+      dismissed: false,
+    };
+    injuryProfileHistory = [...injuryProfileHistory, { at, device: "migration", profile: injuryProfile }].slice(-50);
+  }
+
+  // goblet/box-squat split (Task 1 item 1): "goblet" used to mean the
+  // combined "Goblet / Box Squat" entry. Historical sessions logged under
+  // that id are ambiguous now that the two are separate exercises with
+  // different risk profiles (self-limited vs an external stop) — default
+  // to boxsquat but ask, once, via GobletBoxSquatMigrationPrompt, rather
+  // than silently guessing for a lift with real logged history.
+  let gobletBoxSquatMigration = prevGobletMigration;
+  let sessions = source.sessions || (existing && existing.sessions) || [];
+  const migratingGoblet = sessions.some((s) => s.exerciseId === "goblet") && !gobletBoxSquatMigration;
+  if (migratingGoblet) {
+    sessions = sessions.map((s) => (s.exerciseId === "goblet" ? { ...s, exerciseId: "boxsquat" } : s));
+    gobletBoxSquatMigration = { at: new Date().toISOString(), resolved: false, defaultedTo: "boxsquat" };
+  }
+
+  return { injuryProfile, injuryProfileHistory, injuryProfileMigration, gobletBoxSquatMigration, sessions, migrated: migrating || migratingGoblet };
+}
+
 /* Job (b): "is specialization timing appropriate yet" — separate from Gate 2's
    movement-safety job, which recoveringMode alone covers and which never lifts.
    This is intentionally derived, not stored: it tracks metrics.weeksTraining
@@ -2933,74 +3022,30 @@ function App() {
         } catch (e) { /* no v1 data either */ }
       }
       if (found) {
-        // One-time migration: goalProfile.injuryRecovery used to conflate Gate 2's
-        // movement-safety job with the week-based specialization-timing job (see
-        // isSpecializationUnlocked). injuryProfile.recoveringMode takes over job (a)
-        // only, and never auto-lifts. Only applies when no injuryProfile exists yet.
-        //
-        // Fails safe: goalProfile.injuryRecovery was only ever written by the
-        // user's own toggle in CoachCard (grepped — applyCoachGates's week-8
-        // override mutates gated.template only, never goalProfile), so a real
-        // `false` is unambiguous. But absent/null/anything else-falsy is not a
-        // confirmed user choice, and a silent OFF-with-no-gating is the one
-        // failure mode where nothing surfaces — so only a strict `=== false`
-        // carries forward as OFF; everything else defaults ON.
-        const migrating = !found.injuryProfile && !!found.goalProfile;
-        let migratedInjuryProfile;
-        if (found.injuryProfile) {
-          migratedInjuryProfile = { ...cloneInjuryProfileDefaults(), ...found.injuryProfile };
-        } else {
-          const explicitlyOff = found.goalProfile && found.goalProfile.injuryRecovery === false;
-          migratedInjuryProfile = { ...cloneInjuryProfileDefaults(), recoveringMode: !explicitlyOff };
-        }
-        // One-time, dismissible, and recorded — so a migration that silently
-        // changed effective behavior is never silent to the user.
-        let injuryProfileHistory = found.injuryProfileHistory || [];
-        let migrationNotice = found.injuryProfileMigration || null;
-        if (migrating && !migrationNotice) {
-          const at = new Date().toISOString();
-          migrationNotice = {
-            at,
-            message: migratedInjuryProfile.recoveringMode
-              ? "Injury gating has been turned on. Adjust in the Log tab."
-              : "Injury gating stayed off, carried over from your previous setting. Adjust in the Log tab.",
-            dismissed: false,
-          };
-          injuryProfileHistory = [...injuryProfileHistory, { at, device: "migration", profile: migratedInjuryProfile }].slice(-50);
-        }
-        // goblet/box-squat split (Task 1 item 1): "goblet" used to mean the
-        // combined "Goblet / Box Squat" entry. Historical sessions logged
-        // under that id are ambiguous now that the two are separate
-        // exercises with different risk profiles (self-limited vs an
-        // external stop) — default to boxsquat (matches what "Lower B" now
-        // prescribes) but ask, once, via GobletBoxSquatMigrationPrompt,
-        // rather than silently guessing for a lift with real logged
-        // history. Not folded into the injury-profile migrating flag above
-        // — the two are independent events with independent triggers.
-        let gobletBoxSquatMigration = found.gobletBoxSquatMigration || null;
-        let sessions = found.sessions || [];
-        const migratingGoblet = sessions.some((s) => s.exerciseId === "goblet") && !gobletBoxSquatMigration;
-        if (migratingGoblet) {
-          sessions = sessions.map((s) => (s.exerciseId === "goblet" ? { ...s, exerciseId: "boxsquat" } : s));
-          gobletBoxSquatMigration = { at: new Date().toISOString(), resolved: false, defaultedTo: "boxsquat" };
-        }
+        // goalProfile.injuryRecovery -> injuryProfile.recoveringMode fail-safe,
+        // the one-time migration notice, and the goblet -> boxsquat session
+        // rename all live in migrateInjuryAndGobletData — shared with
+        // BackupCard's import path, see that function's comment. `existing`
+        // is null here: nothing is loaded yet for this record to fall back
+        // onto.
+        const migration = migrateInjuryAndGobletData(found, null);
         const stamped = {
           ...DEFAULT_DATA, ...found,
-          sessions,
+          sessions: migration.sessions,
           swaps: found.swaps || {},
           nutrition: { ...DEFAULT_NUTRITION, ...(found.nutrition || {}) },
           focus: { ...DEFAULT_FOCUS, ...(found.focus || {}) },
           plan: { ...DEFAULT_PLAN, ...(found.plan || {}) },
           phase: found.phase || {},
-          injuryProfile: migratedInjuryProfile,
-          injuryProfileHistory,
-          injuryProfileMigration: migrationNotice,
-          gobletBoxSquatMigration,
+          injuryProfile: migration.injuryProfile,
+          injuryProfileHistory: migration.injuryProfileHistory,
+          injuryProfileMigration: migration.injuryProfileMigration,
+          gobletBoxSquatMigration: migration.gobletBoxSquatMigration,
         };
         setData(stamped);
         // Persist either migration immediately — neither should depend on the
         // user happening to trigger some other write before becoming durable.
-        if (migrating || migratingGoblet) {
+        if (migration.migrated) {
           try { await window.storage.set(STORAGE_KEY, JSON.stringify({ ...stamped, _updatedAt: new Date().toISOString() })); } catch (e) { /* saved in memory at least */ }
         }
       }
@@ -3824,19 +3869,27 @@ function BackupCard({ data, persist }) {
         const parsed = JSON.parse(reader.result);
         const incoming = parsed && parsed.data ? parsed.data : parsed;
         if (!incoming || !Array.isArray(incoming.sessions)) throw new Error("bad file");
+        // Same migration a fresh app boot would run against this same file —
+        // see migrateInjuryAndGobletData's comment. `existing` (the app's
+        // current in-memory data) is the fallback for bookkeeping fields the
+        // file doesn't carry (history, an already-resolved goblet/boxsquat
+        // decision) — it is never consulted for whether THIS file needs
+        // migrating, so an old backup's fail-safe still fires even when the
+        // live app already has some injuryProfile in memory.
+        const migration = migrateInjuryAndGobletData(incoming, data);
         const merged = {
           ...data, ...incoming,
-          sessions: incoming.sessions || data.sessions,
+          sessions: migration.sessions,
           weights: incoming.weights || data.weights,
           swaps: incoming.swaps || data.swaps || {},
           nutrition: { ...(data.nutrition || {}), ...(incoming.nutrition || {}) },
           focus: { ...(data.focus || {}), ...(incoming.focus || {}) },
           plan: { ...(data.plan || {}), ...(incoming.plan || {}) },
           phase: incoming.phase || data.phase || {},
-          injuryProfile: incoming.injuryProfile
-            ? { ...cloneInjuryProfileDefaults(), ...incoming.injuryProfile }
-            : (data.injuryProfile || cloneInjuryProfileDefaults()),
-          injuryProfileHistory: incoming.injuryProfileHistory || data.injuryProfileHistory || [],
+          injuryProfile: migration.injuryProfile,
+          injuryProfileHistory: migration.injuryProfileHistory,
+          injuryProfileMigration: migration.injuryProfileMigration,
+          gobletBoxSquatMigration: migration.gobletBoxSquatMigration,
         };
         persist(merged);
         flash(`Restored ${merged.sessions.length} log entries and ${merged.weights.length} weigh-ins.`);

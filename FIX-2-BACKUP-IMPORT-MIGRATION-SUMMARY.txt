@@ -1,0 +1,162 @@
+FIX 2 — SHARED MIGRATION FUNCTION FOR BOOT AND BACKUP-IMPORT PATHS
+Branch: task-0-injury-profile
+Status: IMPLEMENTED, TESTED, COMMITTED. Part 2 of 3 (Fix 3 not started).
+
+================================================================================
+THE BUG
+================================================================================
+
+TASK-0-BACKUP-MIGRATION-REVIEW.txt, section 1. There are two "load a
+persisted record" code paths: App's boot-time localStorage read, and
+BackupCard.importData (the "Import backup" button on the Log tab — the
+ONLY way a downloaded backup file ever actually gets back into the app).
+Only the boot path ran the goalProfile.injuryRecovery -> recoveringMode
+fail-safe migration, the one-time migration notice, the
+injuryProfileHistory entry, and the goblet -> boxsquat session rename.
+The import path did none of it — it just merged
+`incoming.injuryProfile ? merge : (data.injuryProfile || defaults)`,
+which never once reads `goalProfile` at all.
+
+Verified live (Playwright, fresh app, real Sept 6 backup) before this fix:
+recoveringMode landed on true, but only because the app's already-loaded
+default (DEFAULT_INJURY_PROFILE.recoveringMode: true) happened to be true
+— not because anything read the file's own goalProfile.injuryRecovery. No
+migration notice, no history entry, no goblet rename (all 8 goblet
+sessions stayed tagged "goblet"). Had the file's goalProfile.injuryRecovery
+been false (gating explicitly turned off), the import would have silently
+turned gating ON anyway, with zero notice.
+
+================================================================================
+THE FIX
+================================================================================
+
+One new function, migrateInjuryAndGobletData(source, existing), called
+from both places — no duplicated logic left to drift:
+
+- Boot path (App's load effect): migrateInjuryAndGobletData(found, null).
+  `existing` is null; nothing is loaded yet for a record to fall back onto.
+- Import path (BackupCard.importData): migrateInjuryAndGobletData(incoming,
+  data). `existing` is the app's current in-memory data.
+
+Algorithm is unchanged from what the boot path already did (ported
+verbatim, not redesigned) — see the function's own comment in index.html
+for the full rationale:
+
+- Whether migration is needed is decided from `source` ALONE, never
+  falling back to `existing`. A live app's injuryProfile is always
+  truthy (DEFAULT_INJURY_PROFILE), so folding `existing` into that check
+  would make the fail-safe permanently unreachable on import — restoring
+  an old backup means loading THAT backup's own history, not silently
+  inheriting whatever the current device happens to have in memory.
+- `existing` is consulted only for the bookkeeping fallbacks
+  (injuryProfileHistory, an already-resolved gobletBoxSquatMigration) when
+  `source` doesn't carry its own — so re-importing an old file after the
+  goblet/boxsquat prompt was already resolved on this device does not
+  re-trigger it.
+- Fail-safe polarity, confirmed with you directly (2026-09-20) before
+  writing any assertions, since my first read of the ported logic
+  produced the OPPOSITE of what your Fix 2 request literally described:
+  a real, explicit goalProfile.injuryRecovery === false is honored as OFF
+  (a confirmed prior user choice — the Task 0 grep found it was only ever
+  written by a manual toggle click, never an automated override).
+  Absent/null/anything-else-falsy fails safe to ON. Your call: the bug
+  was the import path's SILENCE, never the polarity — overriding an
+  explicit false on every import would make the toggle effectively
+  un-turn-offable, which is its own silent failure. The notice now fires
+  in BOTH directions (recoveringMode landing true OR false), which is the
+  actual fix.
+- Goblet -> boxsquat rename happens IN PLACE within the single `sessions`
+  array (there's only one) — same ids, same sets, only exerciseId changes.
+  No separate per-id bucket exists for weeklySeries/bestSet/stallScore to
+  disagree about, so e1RM trend and stall detection see one continuous
+  history under the new id post-rename, never a split one. Confirmed
+  directly: weeklySeries(sessions, "boxsquat") computed AFTER migration is
+  byte-identical to weeklySeries(sessions, "goblet") computed on the
+  ORIGINAL file BEFORE migration.
+
+================================================================================
+TESTS
+================================================================================
+
+npm test: 257 assertions pass total (217 pre-existing, unmodified in
+behavior + 40 new in scripts/check-backup-import-migration.js, wired into
+`npm test`):
+
+  Synthetic (no dependency on the real file being present):
+  1. No goalProfile at all -> fails safe to recoveringMode true, no notice
+     (nothing to attribute the default to) — matches pre-fix boot
+     behavior exactly, unchanged.
+  2. An already-present injuryProfile passes through untouched, migration
+     never runs even with a stale goalProfile also present.
+  3. An already-resolved local goblet/boxsquat decision ("kept as
+     goblet") is NOT re-triggered by importing an old file that predates
+     the field — sessions stay tagged goblet, matching the prior decision.
+  4. Import never falls back to `existing` for whether the incoming
+     record itself needs migrating — an old file's explicit false is
+     still honored even though the live app's `existing.injuryProfile`
+     is already truthy.
+
+  Real-data (recomp-coach-backup-2026-09-06.json, gitignored, read
+  directly when present; skipped with a printed note otherwise so a
+  clean checkout doesn't fail `npm test`):
+  5. Sanity: 168 sessions, 8 goblet-tagged, no injuryProfile in the file
+     (matches TASK-0-BACKUP-MIGRATION-REVIEW.txt exactly).
+  6. injuryRecovery true (the file's real value): recoveringMode true,
+     "turned on" notice fires, boot and import agree exactly.
+  7. injuryRecovery flipped false: recoveringMode false, "stayed off,
+     carried over" notice fires — THE case the migration report flagged
+     as silent, now both correct and notified, boot and import agree
+     exactly.
+  8. goalProfile entirely absent: recoveringMode true, no notice — boot
+     and import agree exactly.
+  9. Rename: session count unchanged (168), zero sessions left tagged
+     goblet, exactly 8 tagged boxsquat, each one's id/date/sets match its
+     pre-rename row exactly (proves rename-in-place, not a duplicate
+     under a new id), gobletBoxSquatMigration recorded
+     (resolved: false, defaultedTo: "boxsquat").
+  10. weeklySeries under the new id post-rename is deepEqual to
+      weeklySeries under the old id pre-rename — the concrete "did the
+      rename split this lift's history" check. No residual series left
+      under the old id afterward.
+
+Deliberate-break checks (per your instruction, same discipline as Fix 1):
+  - Reverted the fail-safe's `explicitlyOff` line to always read false
+    (the shape of the original import-path bug: goalProfile ignored).
+    Re-ran the suite — 4 assertions failed immediately (both the false-
+    case recoveringMode checks and the "stayed off" notice checks, on
+    both boot and import). Reverted; `diff` against the pre-break file
+    confirmed byte-identical restoration.
+  - Reverted the goblet-rename guard to always re-rename regardless of an
+    existing resolved decision. Re-ran — 2 assertions failed immediately
+    (the "not re-triggered" and "sessions stay tagged goblet" checks).
+    Reverted; confirmed byte-identical restoration.
+
+Live browser verification (Playwright, matching the original
+investigation's method): fresh app, localStorage cleared, the actual Sept
+6 backup file with goalProfile.injuryRecovery flipped to false, uploaded
+through the real "Import backup" file input (not a direct localStorage
+write). All 10 post-import checks passed against the persisted
+recompcoach:v2 blob: recoveringMode false, migration notice set with the
+"stayed off" message, a new injuryProfileHistory entry,
+gobletBoxSquatMigration set (unresolved, defaultedTo boxsquat), 0
+sessions left tagged goblet, exactly 8 tagged boxsquat, 168 sessions
+total. Notice text is genuinely visible in the DOM via innerText (not
+just textContent's inline-<script>-text false positive from the original
+investigation) on the Workout tab. Zero console errors.
+
+================================================================================
+NOT FIXED HERE
+================================================================================
+
+- Fix 3 (Gate 2 vs. user swaps — a swapped-in contraindicated exercise is
+  never gated or flagged) is scoped, not started.
+- Nothing about the goblet/boxsquat migration's UI (GobletBoxSquatMigrationPrompt)
+  changed — it already reads data.gobletBoxSquatMigration reactively, so
+  populating that field correctly from the import path was sufficient; no
+  new UI needed.
+
+================================================================================
+NEXT
+================================================================================
+
+Fix 3, then Task 6, then Task 7, per DEFERRED-TESTS.md's handoff note.

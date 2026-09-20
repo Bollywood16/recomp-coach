@@ -1,4 +1,4 @@
-# Handoff note (updated after Fix 1, 2026-09-06 session)
+# Handoff note (updated after Fix 2, 2026-09-20 session)
 
 **Done:** Tasks 0 (injuryProfile as protected, structured data), 1
 (exercise attribute tagging, 75/75 coverage), 2 (day-resolution
@@ -11,17 +11,15 @@ Review files in the repo root (`TASK-N-*.txt`) are the detailed record per
 task; this note is just the pointer.
 
 Also done: **Fix 1** (trim priority weights by emphasis level, floored per
-group — see `FIX-1-TRIM-PRIORITY-SUMMARY.txt` and commit `aed617b`), the
-first of three fixes that came out of testing Task 0-3's work against a
-real pre-Task-0 backup export rather than seeded test data (full findings
-in `TASK-0-BACKUP-MIGRATION-REVIEW.txt`).
+group — see `FIX-1-TRIM-PRIORITY-SUMMARY.txt` and commit `aed617b`) and
+**Fix 2** (one shared `migrateInjuryAndGobletData` function for both the
+boot path and `BackupCard.importData` — see
+`FIX-2-BACKUP-IMPORT-MIGRATION-SUMMARY.txt`), two of three fixes that came
+out of testing Task 0-3's work against a real pre-Task-0 backup export
+rather than seeded test data (full findings in
+`TASK-0-BACKUP-MIGRATION-REVIEW.txt`).
 
 **Next, in order:**
-- **Fix 2** — migration notice missing on the backup-import path
-  (`BackupCard.importData` seeds `recoveringMode` with no notice, no
-  history entry, and skips the goblet->boxsquat migration entirely; only
-  the app-boot/localStorage path has that logic today). Scoped, not
-  started.
 - **Fix 3** — Gate 2 vs. user swaps: a swapped-in exercise carrying a
   contraindication is never gated or flagged today. Scoped as warn, don't
   block (the swap picker flags contraindicated alternates at selection
