@@ -330,3 +330,86 @@ DEFERRED-TESTS.md's table updated: all four rows now read **Passed**.
 `npm test`: 378 assertions total (362 prior + 16 new), all passing.
 
 ---
+
+## Section 5 — Pain pattern taxonomy (commit pending)
+
+**Real regression caught by the full suite, not a deliberate break:**
+renaming `ctx.escalatingCats` to `ctx.escalatingPatterns` (for clarity —
+the field holds patterns now, not cats) broke two EXISTING test fixtures
+in `check-set-schemes.js` and `check-set-scheme-migration.js` that
+hand-built a `ctx` object with the old field name directly (bypassing
+`buildGateContext`). `npm test` caught it immediately as a crash
+(`Cannot read properties of undefined`), not a silent pass. Fixed both
+fixtures to use `escalatingPatterns` with the exercise's real
+`painPattern` value instead of its `cat`. Logged here because the run
+instructions asked for every surprise, not just the ones in new code.
+
+**`painPattern` is DERIVED, not hand-typed** — a genuine design choice,
+logged since it's a real deviation from "tag all 75 exercises" read
+literally. `inferPainPattern(ex)` computes it from each exercise's
+ALREADY-tagged `attributes`/`pool` (Task 1's own tagging), applied once
+across `ALL_KNOWN` at load time, same mutate-in-place pattern
+`EXERCISE_ATTRS` itself uses. Rationale: a derived value can't drift out
+of sync with the attributes it's derived from, and one small, reviewable
+function is at least as auditable as 75 independent hand-typed judgment
+calls — more so, since every one of the 75 is provably consistent with
+the same rule rather than independently re-decided.
+
+**Priority rule** (full reasoning in `inferPainPattern`'s own comment in
+index.html): any exercise carrying `loaded_hip_flexion`, `hip_hinge`, or
+`hip_extension` in its attributes → `hip_dominant`, checked BEFORE the
+pool-based fallback, regardless of pool. This is the actual fix pre-
+decision 5 asked for (merges squat + hinge + glute pools into one
+pattern), and it deliberately reaches two places a naive pool-copy would
+have missed:
+- `kneeraise` (pool `core`) carries `loaded_hip_flexion` on its own
+  terms — its own existing code comment already called this out as
+  "real (bodyweight) hip flexion." Lands on `hip_dominant`, not `core`.
+- `bbrow`/`meadows` (pool `hpull`) carry `hip_hinge`; `bbrow` is already
+  contraindicated for `prox_hamstring_tendinosis` for exactly that
+  mechanical reason, the same reason `trapdl` (hinge pool) is. Grouping
+  them together means pain on either one now correctly informs the SAME
+  escalation state.
+- Within the `quad` pool specifically: `bss`/`sissy`/
+  `bonus_walkinglunge` (loaded hip flexion, unilateral) override to
+  `hip_dominant`; `legext`/`sledpush` (no hip involvement at all) stay
+  `knee_dominant` — the pool alone couldn't distinguish these two real,
+  different cases.
+`calf`/`seatedcalf` land on `knee_dominant` as the nearest available
+category — the given 11-pattern taxonomy has no dedicated ankle/calf
+pattern. Flagged explicitly (in-code and here) so it isn't later mistaken
+for a considered clinical judgment.
+
+**Migration**: there is no STORED escalation state to migrate —
+`isPainEscalating` has always derived "currently escalating" fresh from
+session history on every call (`ctx.escalatingPatterns` is rebuilt in
+`buildGateContext` every render), never persisted a flag. Swapping the
+grouping key takes effect immediately, uniformly, for every historical
+session the next time it runs — there's no separate migration STEP,
+only a migration PROOF that the new grouping doesn't behave worse than
+the old one on the same data. `scripts/check-pain-pattern-migration.js`
+demonstrates this concretely: a synthetic but realistic hip-labral
+session history (pain alternating between goblet squat and RDL) is
+replayed through both a frozen copy of the OLD cat-based grouping logic
+and the NEW painPattern-based one — old grouping never reaches the
+2-of-4 trigger (split across squat/hinge cats, exactly the named gap);
+new grouping correctly combines them and DOES trigger. Real-data check:
+the actual backup has ZERO sessions with any pain value logged at all —
+recorded as a fact (both old and new grouping trivially agree: nothing
+escalates), not assumed.
+
+Deliberately broke the hip-loading priority rule (forced it to never
+fire) — 25 of 40 assertions failed immediately, covering coverage,
+every named override, and the cross-cat fix demonstration itself.
+Restored, diff-clean.
+
+Not done in this section: no live-browser check of `PainEscalationNotice`
+— the real backup has no pain data to trigger it, and the component's
+only change is a label swap in already-tested render logic (the
+underlying mechanism is exercised end-to-end at the unit level,
+including gate5/gate3's actual consumption of `escalatingPatterns`).
+Logged as a deliberate scope decision given the sections still ahead.
+
+`npm test`: 418 assertions total (378 prior + 40 new), all passing.
+
+---

@@ -854,6 +854,89 @@ const EXERCISE_ATTRS = {
 Object.entries(EXERCISE_ATTRS).forEach(([id, attrs]) => { if (EX_BY_ID[id]) Object.assign(EX_BY_ID[id], attrs); });
 validateContraindicationVocabulary();
 
+/* Task 6, Section 5 (pre-decision 5): pain-escalation's pattern grouping
+   used to be `cat` — flagged from the start (see isPainEscalating's own
+   comment) as both too wide (any pain on ANY lift sharing a cat
+   suppresses every other lift in it) and too narrow (a hip labral issue
+   presents across BOTH the squat and hinge cats, which `cat` treats as
+   two unrelated patterns, so neither alone reaches the 2-of-4 trigger —
+   exactly the gap this profile was built around). `painPattern` replaces
+   it: 11 mechanical-loading categories (hip_dominant, knee_dominant,
+   horizontal_press, vertical_press, vertical_pull, horizontal_pull,
+   elbow_flexion, elbow_extension, lateral_raise, rear_delt, core),
+   DERIVED from each exercise's own already-tagged attributes/pool rather
+   than hand-typed a second time — cannot drift out of sync with Task 1's
+   tagging, and is itself exactly as reviewable (one small function,
+   not 75 independent judgment calls to individually re-verify).
+
+   PRIORITY RULE, in order:
+   1. Any exercise carrying `loaded_hip_flexion`, `hip_hinge`, or
+      `hip_extension` in its attributes -> hip_dominant, REGARDLESS of
+      pool/cat. This is the actual fix: it merges squat-pool AND
+      hinge-pool AND glute-pool (all hip-flexion-or-extension-loading)
+      into ONE pattern, and it deliberately reaches two places a pure
+      pool-copy would have missed:
+        - kneeraise (pool: core) carries loaded_hip_flexion on its own
+          terms (see its comment: "real (bodyweight) hip flexion,
+          moderate/controlled, not end-range") -- mechanically a
+          hip-flexion movement wearing a "core" muscle-group label. For
+          escalation specifically (which pattern is provoking pain, not
+          which muscle grows) that mechanical fact outranks the
+          muscle-group tag.
+        - bbrow and meadows (pool: hpull) both carry hip_hinge, and
+          bbrow is already contraindicated for prox_hamstring_tendinosis
+          for exactly that reason (same mechanism, same contraindication,
+          as trapdl). Grouping them with the hip-hinge pattern instead of
+          "horizontal_pull" means pain on trapdl and pain on bbrow now
+          correctly inform the SAME escalation state, not two unrelated
+          ones.
+      quad-pool bss/sissy/bonus_walkinglunge (unilateral, loaded hip
+      flexion) fall under this rule too -- correctly separated from
+      quad-pool legext/sledpush (pure knee extension, no hip
+      involvement at all), which the pool alone can't distinguish.
+   2. Otherwise, by pool: delts_lateral -> lateral_raise, delts_rear ->
+      rear_delt, hpress -> horizontal_press, vpress -> vertical_press,
+      hpull -> horizontal_pull, vpull -> vertical_pull, biceps ->
+      elbow_flexion, triceps -> elbow_extension, quad/ham/calf ->
+      knee_dominant, core -> core.
+
+   calf/seatedcalf land on knee_dominant as the nearest available lower-
+   body category -- the given taxonomy has no dedicated ankle/calf
+   pattern. Flagged here rather than silently absorbed so it isn't
+   mistaken for a considered clinical judgment; if a real ankle/calf
+   escalation pattern ever matters for this profile, it needs its own
+   category, not a borrowed one.
+
+   Coverage is asserted, not assumed: painPatternTaggingGaps() (used by
+   scripts/check-pain-pattern-migration.js) lists any ALL_KNOWN exercise
+   this function fails to classify — must be empty; a real gap here means
+   a missing exercise is silently invisible to escalation entirely. */
+const PAIN_PATTERNS = [
+  "hip_dominant", "knee_dominant", "horizontal_press", "vertical_press", "vertical_pull",
+  "horizontal_pull", "elbow_flexion", "elbow_extension", "lateral_raise", "rear_delt", "core",
+];
+const PAIN_PATTERN_NAMES = {
+  hip_dominant: "hip-dominant", knee_dominant: "knee-dominant", horizontal_press: "horizontal press",
+  vertical_press: "overhead press", vertical_pull: "vertical pull", horizontal_pull: "horizontal pull",
+  elbow_flexion: "biceps / elbow flexion", elbow_extension: "triceps / elbow extension",
+  lateral_raise: "lateral raise", rear_delt: "rear delt", core: "core",
+};
+const POOL_TO_PAIN_PATTERN = {
+  delts_lateral: "lateral_raise", delts_rear: "rear_delt", hpress: "horizontal_press", vpress: "vertical_press",
+  hpull: "horizontal_pull", vpull: "vertical_pull", biceps: "elbow_flexion", triceps: "elbow_extension",
+  quad: "knee_dominant", ham: "knee_dominant", calf: "knee_dominant", core: "core",
+};
+const HIP_LOADING_ATTRS = ["loaded_hip_flexion", "hip_hinge", "hip_extension"];
+function inferPainPattern(ex) {
+  if (!ex) return null;
+  if ((ex.attributes || []).some((a) => HIP_LOADING_ATTRS.includes(a))) return "hip_dominant";
+  return POOL_TO_PAIN_PATTERN[ex.pool] || null;
+}
+ALL_KNOWN.forEach((ex) => { ex.painPattern = inferPainPattern(ex); });
+function painPatternTaggingGaps() {
+  return ALL_KNOWN.filter((ex) => !PAIN_PATTERNS.includes(ex.painPattern));
+}
+
 /* Task 1 item 5: machohp, cablelat, skull, ohte and ezcurl are declared in
    both D and LIBRARY. _dedupe (above) silently keeps whichever appears
    first when building ALL_KNOWN — today that's harmless because the two
@@ -1501,9 +1584,9 @@ function buildCoachBrief(data, goalProfile, tier) {
     : `Injury status: ${injuryProfile.recoveringMode ? `recovering, ${m.weeksTraining} logged weeks (specialization gate lifts around week 8)` : "not currently in injury recovery"}.`;
 
   const threshold = (injuryProfile.movementConstraints && injuryProfile.movementConstraints.painRule && injuryProfile.movementConstraints.painRule.threshold) ?? 3;
-  const escalatingCats = Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold));
-  const escalationLine = escalatingCats.length
-    ? `PAIN ESCALATION ACTIVE on: ${escalatingCats.map((c) => CAT_NAMES[c] || c).join(", ")}. No load or set increase is permitted on these movement patterns until the pattern clears (3 consecutive logged sessions with answered pain at or below ${threshold}/10) — any progression you propose there will be capped or rejected by the app's gates regardless of what you recommend, so don't propose it.`
+  const escalatingPatterns = PAIN_PATTERNS.filter((p) => isPainEscalating(data.sessions, p, threshold));
+  const escalationLine = escalatingPatterns.length
+    ? `PAIN ESCALATION ACTIVE on: ${escalatingPatterns.map((p) => PAIN_PATTERN_NAMES[p] || p).join(", ")}. No load or set increase is permitted on these movement patterns until the pattern clears (3 consecutive logged sessions with answered pain at or below ${threshold}/10) — any progression you propose there will be capped or rejected by the app's gates regardless of what you recommend, so don't propose it.`
     : "No pain escalation active.";
 
   const librarySectionIntro = isFullTier
@@ -2227,7 +2310,7 @@ function trendPct(series) {
      { reject: true, gate, reason }        — whole prescription dropped
 
    ctx = { injuryProfile, sessions, weeklyGroupSets, weeklyGroupSetCaps,
-           sessionMin, deloadActive, escalatingCats }
+           sessionMin, deloadActive, escalatingPatterns }
    Gates 6-8 are inherently multi-prescription concerns (a volume cap, a
    session-length trim, and a deload override all only make sense across
    the whole accepted set) and are applied in applyGatedPrescriptions,
@@ -2528,7 +2611,7 @@ function gate3LoadSanity(prescription, ctx) {
   const ex = EX_BY_ID[prescription.exerciseId];
   if (!ex) return { reject: false };
   const lastW = lastWorkingWeight(ctx.sessions, prescription.exerciseId);
-  const escalating = ctx.escalatingCats && ctx.escalatingCats.has(ex.cat);
+  const escalating = ctx.escalatingPatterns && ctx.escalatingPatterns.has(ex.painPattern);
 
   if (prescription.load == null) {
     // Omitted load normally means "let recommend() drive it at render
@@ -2601,7 +2684,7 @@ function gate4PainRule(prescription, { injuryProfile, ...ctx }) {
    whether an injury is worsening — that assessment is the clinician's. */
 function gate5PainEscalation(prescription, ctx) {
   const ex = EX_BY_ID[prescription.exerciseId];
-  if (!ex || !ctx.escalatingCats || !ctx.escalatingCats.has(ex.cat)) return { reject: false };
+  if (!ex || !ctx.escalatingPatterns || !ctx.escalatingPatterns.has(ex.painPattern)) return { reject: false };
   const last = lastSessionFor(ctx.sessions, prescription.exerciseId);
   // AMENDMENT (Task 3, recorded in DEFERRED-TESTS.md as a Task 4
   // sign-off correction): this used to be last.sets.length — a raw
@@ -2631,7 +2714,7 @@ function gate5PainEscalation(prescription, ctx) {
   return {
     reject: false,
     value: Object.keys(patch).length ? { ...prescription, ...patch } : undefined,
-    note: `Pain escalation on the ${CAT_NAMES[ex.cat] || ex.cat} pattern — no progression in load or sets until this pattern clears (3 consecutive logged sessions with answered pain at or below threshold). See the persistent clinician-consult prompt.${setsCapped ? ` Sets capped at ${lastSetCount}.` : ""}${schemeStripped ? ` Backoff/drop scheme stripped to straight sets — an intensity technique has no place on an escalating pattern.` : ""}`,
+    note: `Pain escalation on the ${PAIN_PATTERN_NAMES[ex.painPattern] || ex.painPattern} pattern — no progression in load or sets until this pattern clears (3 consecutive logged sessions with answered pain at or below threshold). See the persistent clinician-consult prompt.${setsCapped ? ` Sets capped at ${lastSetCount}.` : ""}${schemeStripped ? ` Backoff/drop scheme stripped to straight sets — an intensity technique has no place on an escalating pattern.` : ""}`,
   };
 }
 
@@ -2656,17 +2739,25 @@ function gate5PainEscalation(prescription, ctx) {
    escalating — they neither advance nor reset the clean streak, they hold
    it. An answered value over threshold resets the streak to 0.
 
-   Known limitation (see DEFERRED-TESTS.md): grouping by `cat` is both too
-   wide (any pain on ANY lift sharing a cat suppresses/tightens every other
-   lift in that cat) and too narrow (a hip labral issue presents across
-   BOTH the squat and hinge cats, which this treats as two unrelated
-   patterns, so neither alone may reach the 2-of-4 trigger). Not rebuilt
-   here — flagged in the notice copy and tracked for a real pattern
-   taxonomy (hip-dominant, knee-dominant, etc.) later. */
-function isPainEscalating(sessions, cat, threshold) {
+   Task 6, Section 5 (pre-decision 5): grouped by `painPattern`, not
+   `cat`, as of this commit — `cat` was both too wide (any pain on ANY
+   lift sharing a cat suppressed/tightened every other lift in that cat,
+   regardless of mechanical relationship) and too narrow (a hip labral
+   issue presents across BOTH the squat and hinge cats, which `cat`
+   treated as two unrelated patterns, so neither alone reached the 2-of-4
+   trigger — the concrete gap this profile was built around). See
+   PAIN_PATTERNS/inferPainPattern's own comment for the full taxonomy and
+   derivation rule. No stored escalation state to migrate — this function
+   has always derived "currently escalating" fresh from session history
+   on every call, never persisted a flag, so swapping the grouping key
+   takes effect immediately and uniformly across all historical sessions
+   the next time this runs; scripts/check-pain-pattern-migration.js
+   verifies the swap doesn't invent or drop an escalation for any
+   realistic real-data case. */
+function isPainEscalating(sessions, painPattern, threshold) {
   const t = threshold ?? 3;
   const hist = (sessions || [])
-    .filter((s) => (EX_BY_ID[s.exerciseId] || {}).cat === cat)
+    .filter((s) => (EX_BY_ID[s.exerciseId] || {}).painPattern === painPattern)
     .sort((a, b) => (a.date < b.date ? -1 : 1)); // oldest first
   const painOf = (s) => { const v = Math.max(s.pain ?? -1, s.painRetro ?? -1); return v >= 0 ? v : null; };
   let escalating = false;
@@ -3022,7 +3113,7 @@ function buildGateContext(data, plan) {
     // pasted plan trims by the same emphasis tiers a generator day would.
     focus: data.focus || DEFAULT_FOCUS,
     deloadActive: deloadActive(data),
-    escalatingCats: new Set(Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold))),
+    escalatingPatterns: new Set(PAIN_PATTERNS.filter((p) => isPainEscalating(data.sessions, p, threshold))),
     checkinScoped,
     checkinScopeIds: checkinScoped ? checkInExerciseIds(data) : null,
     programDayIds: new Set(program.map((d) => d.id)),
@@ -4610,32 +4701,33 @@ function ClinicianReviewNotice({ compact }) {
 function PainEscalationNotice({ data, persist }) {
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   const threshold = (injuryProfile.movementConstraints && injuryProfile.movementConstraints.painRule && injuryProfile.movementConstraints.painRule.threshold) ?? 3;
-  const cats = Object.keys(CAT_NAMES).filter((cat) => isPainEscalating(data.sessions, cat, threshold));
-  const prevCatsRef = useRef(cats);
+  const patterns = PAIN_PATTERNS.filter((p) => isPainEscalating(data.sessions, p, threshold));
+  const prevPatternsRef = useRef(patterns);
 
   useEffect(() => {
-    const prev = prevCatsRef.current;
-    const cleared = prev.filter((c) => !cats.includes(c));
+    const prev = prevPatternsRef.current;
+    const cleared = prev.filter((p) => !patterns.includes(p));
     if (cleared.length > 0) {
       const at = new Date().toISOString();
-      const entries = cleared.map((cat) => ({ at, device: getDeviceId(), profile: null, note: `pain escalation cleared: ${CAT_NAMES[cat] || cat}` }));
+      const entries = cleared.map((p) => ({ at, device: getDeviceId(), profile: null, note: `pain escalation cleared: ${PAIN_PATTERN_NAMES[p] || p}` }));
       persist({ ...data, injuryProfileHistory: [...(data.injuryProfileHistory || []), ...entries].slice(-50) });
     }
-    prevCatsRef.current = cats;
+    prevPatternsRef.current = patterns;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cats.join(",")]);
+  }, [patterns.join(",")]);
 
-  if (cats.length === 0) return null;
+  if (patterns.length === 0) return null;
   return (
     <div style={{ ...S.card, background: "#FDECEC", display: "flex", gap: 10, alignItems: "flex-start" }}>
       <Flame size={18} color={C.red} style={{ marginTop: 1, flexShrink: 0 }} />
       <div style={{ fontSize: 12.5, color: "#3A3A3C", lineHeight: 1.45 }}>
         <b style={{ color: C.red }}>Consult your treating clinician:</b> pain above {threshold}/10 has recurred on
-        the {cats.map((c) => CAT_NAMES[c] || c).join(", ")} pattern. No progression in load or sets is allowed on
-        these movements until it clears — 3 consecutive logged sessions with answered pain at or below {threshold}/10
-        (a dismissed or unanswered session doesn't count either way). This grouping is by movement pattern
-        (e.g. all squat-cat lifts together) and won't catch a pattern spanning two groups, like squat and hinge —
-        this app enforces rules, it does not assess whether an injury is worsening.
+        the {patterns.map((p) => PAIN_PATTERN_NAMES[p] || p).join(", ")} pattern. No progression in load or sets is
+        allowed on these movements until it clears — 3 consecutive logged sessions with answered pain at or below
+        {" "}{threshold}/10 (a dismissed or unanswered session doesn't count either way). Grouped by mechanical
+        loading pattern (Task 6) — a hip-flexion movement counts toward the same pattern whether it's a squat, a
+        hinge, or a hip-loaded row, so this no longer misses a pattern that spans what used to be separate
+        categories. This app enforces rules, it does not assess whether an injury is worsening.
       </div>
     </div>
   );

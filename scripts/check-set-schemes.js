@@ -154,7 +154,7 @@ check("totalSegmentsFor: drop allSets adds drops*sets", app.totalSegmentsFor({ s
 
 /* ===== Decision 6 + point 8: Gate 5 escalation strips schemes, hard-set row count ===== */
 {
-  const ctx = { escalatingCats: new Set(["biceps"]), sessions: [
+  const ctx = { escalatingPatterns: new Set(["elbow_flexion"]), sessions: [
     { id: 1, date: "2026-08-01", exerciseId: "ezcurl", sets: [{ w: 35, r: 10, segment: "top" }, { w: 35, r: 10, segment: "top" }, { w: 35, r: 10, segment: "top" }, { w: 28, r: 12, segment: "drop" }] },
   ] };
   const g5 = app.gate5PainEscalation({ exerciseId: "ezcurl", sets: 5, scheme: { type: "backoff", topSets: 3, backoffSets: 2 } }, ctx);
@@ -164,7 +164,7 @@ check("totalSegmentsFor: drop allSets adds drops*sets", app.totalSegmentsFor({ s
 }
 {
   // Not escalating: scheme untouched.
-  const ctx = { escalatingCats: new Set(), sessions: [] };
+  const ctx = { escalatingPatterns: new Set(), sessions: [] };
   const g5 = app.gate5PainEscalation({ exerciseId: "ezcurl", sets: 4, scheme: { type: "backoff", topSets: 2, backoffSets: 2 } }, ctx);
   ok("no escalation on this pattern: reject:false and no value patch", g5.reject === false && g5.value === undefined);
 }

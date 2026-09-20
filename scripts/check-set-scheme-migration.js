@@ -84,7 +84,7 @@ const legacySets = [{ w: 95, r: 8 }, { w: 95, r: 8 }, { w: 95, r: 9 }];
 
 /* ===== Gate 5's lastSetCount: legacy rows count as hard sets ===== */
 {
-  const ctx = { escalatingCats: new Set(["hpress"]), sessions: [
+  const ctx = { escalatingPatterns: new Set(["horizontal_press"]), sessions: [
     { id: 1, date: "2026-08-01", exerciseId: "bench", sets: legacySets }, // 3 legacy rows, no segment field
   ] };
   const g5 = app.gate5PainEscalation({ exerciseId: "bench", sets: 5 }, ctx);
