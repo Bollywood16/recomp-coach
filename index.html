@@ -1874,9 +1874,64 @@ function deloadScale(ex, isDeload) {
   };
 }
 
+/* Task 6, Section 1: resolves one `data.plan.days[]` entry's exercise
+   into the same {slot, ex} shape resolveDayExercises builds for a
+   generator slot, so every downstream consumer (capAndSplitMovement,
+   weeklySetsByGroup, the swap picker, ExerciseCard's gate2Injury warn
+   calls) needs zero authored-day-awareness of its own.
+
+   Routes through the EXISTING resolveSlot rather than a parallel
+   resolver — `pseudoSlot` spreads the real EX_BY_ID entry (not a bare
+   {id,cat,sets} literal) so pool/rank/attributes/romProfile/
+   contraindications/tagSource all carry onto the resolved `ex` exactly
+   as they do for a generator slot, which is what capAndSplitMovement's
+   spawn candidates and the swap picker's `alternates` pool filter both
+   need. Passing `focus: null` deliberately skips resolveSlot's
+   emphasis-rescaling branch (`base.sets = focus ? adjustSets(...) :
+   baseSets`) — an authored `sets` count is the coach's own considered
+   number, not something the day's focus sliders should silently
+   rescale a second time. resolveSlot's swap-lookup keeps working
+   unmodified: a user can still swap an authored exercise out via the
+   normal picker, keyed by `ae.exerciseId` as the pseudo-slot's `id`. */
+function resolveAuthoredExercise(ae, data) {
+  const authoredBase = EX_BY_ID[ae.exerciseId];
+  if (!authoredBase) return null; // Gate 9/1 rejects this at apply time; defensive here only
+  const pseudoSlot = {
+    ...authoredBase, id: ae.exerciseId,
+    sets: ae.sets, repMin: ae.repMin ?? authoredBase.repMin, repMax: ae.repMax ?? authoredBase.repMax,
+  };
+  const resolved = resolveSlot(pseudoSlot, data.swaps, null);
+  return {
+    ...resolved,
+    restSec: ae.restSec, prescribedLoad: ae.load, scheme: ae.scheme,
+    order: ae.order ?? 0, rationale: ae.rationale, substitutedFor: ae.substitutedFor,
+    authored: true,
+  };
+}
+
 function resolveDayExercises(day, data) {
   const focus = data.focus || DEFAULT_FOCUS;
   const program = getProgram(data);
+  // Task 6, Section 1: an authored day fully REPLACES generator selection
+  // for this dayKey — checked first, before any generator/swap/bonus/
+  // prescription-reconciliation logic runs. Prescriptions (Task 2) are a
+  // PARTIAL-override mechanism against generator output; they don't
+  // compose with full day authorship, so a prescription targeting an
+  // authored dayKey is simply never reached below (this branch returns
+  // before that filter runs).
+  const authoredDay = data.plan && Array.isArray(data.plan.days) && data.plan.days.find((d) => d.dayKey === day.id);
+  if (authoredDay) {
+    const list = authoredDay.exercises
+      .map((ae) => ({ slot: ae, ex: resolveAuthoredExercise(ae, data) }))
+      .filter((entry) => entry.ex)
+      .sort((a, b) => (a.ex.order ?? 0) - (b.ex.order ?? 0));
+    list.forEach((entry) => { entry.ex.sets = hardSetsFor(entry.ex); });
+    const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
+    const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+    const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
+    splitList.maxSetsNotes = notes;
+    return splitList;
+  }
   const list = [
     ...day.exercises.map((s) => ({ slot: s, ex: resolveSlot(s, data.swaps, focus) })),
     ...bonusForDay(day, focus, program).map((b) => ({ slot: b, ex: b })),
