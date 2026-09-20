@@ -56,6 +56,7 @@ const app = loadApp([
   "dayFittedMinutes",
   "dayFocusSummary",
   "resolveDayExercises",
+  "trimPriority",
 ]);
 const { DEFAULT_FOCUS } = app;
 
@@ -74,10 +75,18 @@ function applyCap(list, data) {
 function REFERENCE_dayPageEntries(day, data) {
   const focusObj = data.focus || DEFAULT_FOCUS;
   const program = app.getProgram(data);
-  const list = [
+  const genList = [
     ...day.exercises.map((s) => ({ slot: s, ex: app.resolveSlot(s, data.swaps, focusObj) })),
     ...app.bonusForDay(day, focusObj, program).map((b) => ({ slot: b, ex: b })),
   ];
+  // Task 6, Section 6: mirrors resolveDayExercises's own default-order
+  // sort (emphasis rank descending, via trimPriority) — updated here for
+  // the same reason commit 4's capAndSplitMovement call was: a real,
+  // legitimate behavior change, not something this reference should stay
+  // frozen against.
+  const order = genList.map((_, i) => i);
+  order.sort((i, j) => app.trimPriority(genList[j].ex, focusObj) - app.trimPriority(genList[i].ex, focusObj) || i - j);
+  const list = order.map((i) => genList[i]);
   return applyCap(list, data);
 }
 

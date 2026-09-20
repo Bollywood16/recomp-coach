@@ -1042,19 +1042,32 @@ const isCompound = (ex) => COMPOUND_CATS.includes(ex.cat);
    compound bonus is scaled to never bridge a one-tier gap: a maintain-
    group compound (rank 0, +1 = 1) is still trimmed before a specialize-
    group isolation (rank 3, +0 = 30). List position remains the final
-   tie-break only, unchanged. sessionRules.trimPriority is not read here —
-   it's accepted as a known plan key but nothing has ever consumed it
-   (grepped: zero reads before this fix, same after); wiring a coach-
-   plan override is a separate feature this fix doesn't take on. */
-const LEVEL_TRIM_FLOOR_PCT = { specialize: 0.75, emphasize: 0.65, normal: 0, maintain: 0 };
+   tie-break only, unchanged.
 
-function emphasisRank(ex, focus) {
+   Task 6, Section 6 (pre-decision 4): sessionRules.trimPriority — an
+   array like ["maintain","normal","emphasize","specialize"], first
+   entry cut first — is now wired through the optional `order` param
+   below, threaded from data.plan.sessionRules.trimPriority at every
+   call site. Floor percentages (LEVEL_TRIM_FLOOR_PCT_BY_RANK, below)
+   are keyed by RANK POSITION, not level name, specifically so a custom
+   order stays internally coherent with itself: whichever level a coach
+   names LAST (cut last) gets the 75% floor, second-to-last gets 65%,
+   regardless of what that level is actually called. Cutting specialize
+   first and still protecting "specialize" by name would fight the
+   coach's own stated order; this can't, by construction. Gate 13's
+   maintain-floor protection (dropTierRank, below) is NOT customizable
+   this way — see its own comment for why that stays a fixed safety
+   invariant, order param or not. */
+const LEVEL_TRIM_FLOOR_PCT_BY_RANK = { 3: 0.75, 2: 0.65, 1: 0, 0: 0 };
+
+function emphasisRank(ex, focus, order) {
   const g = CAT_TO_GROUP[ex.cat];
   const lvl = (focus && g && focus[g]) || "normal";
+  if (order && order.includes(lvl)) return order.indexOf(lvl);
   return LEVEL_RANK[lvl] ?? 1;
 }
-function trimPriority(ex, focus) {
-  return emphasisRank(ex, focus) * 10 + (isCompound(ex) ? 1 : 0);
+function trimPriority(ex, focus, order) {
+  return emphasisRank(ex, focus, order) * 10 + (isCompound(ex) ? 1 : 0);
 }
 /* Gate 13 (maintain floor, per-movement — Task 6, pre-decision 3;
    DEFERRED-TESTS.md row 9). ONLY for the "drop an entire movement"
@@ -1075,10 +1088,20 @@ function trimPriority(ex, focus) {
    behavior change to a prior signed-off (Fix 1) result — the "core's
    kneeraise survives over legs' maintain lifts" assertion in
    check-trim-priority.js flips as of this commit; see that file's own
-   updated comment for the new expected numbers. */
+   updated comment for the new expected numbers.
+
+   Deliberately takes NO `order` param, unlike trimPriority/emphasisRank
+   below sessionRules.trimPriority reorders which group's SETS get
+   trimmed first (a preference) — this protection is a safety invariant
+   (pre-decision 3: "cannot be dropped entirely"), not a preference a
+   plan can dial down. Checks literal maintain-ness directly off `focus`
+   rather than deriving from a rank number, so there's no custom order
+   array whose omission of "maintain," or reordering, could weaken it. */
 function dropTierRank(ex, focus) {
-  const r = emphasisRank(ex, focus);
-  return r === 0 ? LEVEL_RANK.specialize + 1 : r;
+  const g = CAT_TO_GROUP[ex.cat];
+  const lvl = (focus && g && focus[g]) || "normal";
+  if (lvl === "maintain") return 99;
+  return emphasisRank(ex, focus);
 }
 /* Shared by fitDayToTime's trim loop and Gate 10 (Task 6, estimatedMin
    verification) — "how long does this exercise list take" computed
@@ -1112,25 +1135,24 @@ function estimateDurationSec(list) {
    full-drop fallback below) leaves its floor stale — that only makes
    the floor MORE conservative for whatever's left in the group, never
    less, so it's left alone rather than recomputed. */
-function groupTrimFloors(items, focus) {
+function groupTrimFloors(items, focus, order) {
   const totals = {};
   items.forEach((ex) => {
     const g = CAT_TO_GROUP[ex.cat];
     if (!g) return;
-    const t = totals[g] || (totals[g] = { preFit: 0, absFloor: 0 });
+    const t = totals[g] || (totals[g] = { preFit: 0, absFloor: 0, rank: emphasisRank(ex, focus, order) });
     t.preFit += ex.sets;
     t.absFloor += isCompound(ex) ? 2 : 1;
   });
   const floors = {};
   Object.keys(totals).forEach((g) => {
-    const lvl = (focus && focus[g]) || "normal";
-    const pct = LEVEL_TRIM_FLOOR_PCT[lvl] ?? 0;
+    const pct = LEVEL_TRIM_FLOOR_PCT_BY_RANK[totals[g].rank] ?? 0;
     floors[g] = Math.max(totals[g].absFloor, Math.round(totals[g].preFit * pct));
   });
   return floors;
 }
 
-function fitDayToTime(list, sessionMin, focus) {
+function fitDayToTime(list, sessionMin, focus, trimPriorityOrder) {
   const budget = Math.max(20, (sessionMin || 60) - 8) * 60; // minus ~8 min warm-up
   const items = list.map((e) => ({ ...e }));
   // Point 4: a drop segment adds real (if brief) time beyond its host
@@ -1140,7 +1162,7 @@ function fitDayToTime(list, sessionMin, focus) {
   // have run, so ex.sets already IS the complete segment count.
   const total = () => estimateDurationSec(items);
   const minSets = (ex) => (isCompound(ex) ? 2 : 1);
-  const floors = groupTrimFloors(items, focus);
+  const floors = groupTrimFloors(items, focus, trimPriorityOrder);
   const groupOf = (ex) => CAT_TO_GROUP[ex.cat];
   const groupTotal = (g) => items.reduce((a, e) => a + (groupOf(e) === g ? e.sets : 0), 0);
   let trimmed = 0;
@@ -1161,7 +1183,7 @@ function fitDayToTime(list, sessionMin, focus) {
     // budget; trimPriority below still orders which group absorbs it.
     if (!cands.length) cands = items.filter((e) => e.sets > minSets(e));
     if (cands.length) {
-      cands.sort((a, b) => trimPriority(a, focus) - trimPriority(b, focus) || items.indexOf(b) - items.indexOf(a));
+      cands.sort((a, b) => trimPriority(a, focus, trimPriorityOrder) - trimPriority(b, focus, trimPriorityOrder) || items.indexOf(b) - items.indexOf(a));
       const idx = items.indexOf(cands[0]);
       items[idx] = trimOneHardSet(items[idx]); // backoff sheds backoffSets first — see trimOneHardSet
       trimmed++;
@@ -1180,9 +1202,16 @@ function fitDayToTime(list, sessionMin, focus) {
   return { list: items, trimmed, dropped, minutes: Math.round(total() / 60) + 8 };
 }
 
+/* Task 6, Section 6: single lookup for sessionRules.trimPriority, reused
+   at every fitDayToTime/gate7DurationTrim call site so "did we remember
+   to thread it here" isn't a question asked five separate times. */
+function trimPriorityOf(data) {
+  return (data && data.plan && data.plan.sessionRules && data.plan.sessionRules.trimPriority) || undefined;
+}
+
 function dayFittedMinutes(day, data) {
   const list = resolveDayExercises(day, data).map((e) => e.ex);
-  return fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60, data.focus).minutes;
+  return fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60, data.focus, trimPriorityOf(data)).minutes;
 }
 
 /* ===== Auto-periodization (phase engine) =====
@@ -1286,7 +1315,7 @@ function weeklySetsByGroup(data) {
   const t = {};
   program.forEach((day) => {
     const list = resolveDayExercises(day, data).map((e) => e.ex);
-    const fitted = fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60, data.focus).list;
+    const fitted = fitDayToTime(list, (data.plan && data.plan.sessionMin) || 60, data.focus, trimPriorityOf(data)).list;
     fitted.forEach((ex) => {
       const g = CAT_TO_GROUP[ex.cat];
       if (g) t[g] = (t[g] || 0) + ex.sets;
@@ -2049,10 +2078,27 @@ function resolveDayExercises(day, data) {
     splitList.maxSetsNotes = notes;
     return splitList;
   }
-  const list = [
+  const generatorList = [
     ...day.exercises.map((s) => ({ slot: s, ex: resolveSlot(s, data.swaps, focus) })),
     ...bonusForDay(day, focus, program).map((b) => ({ slot: b, ex: b })),
   ];
+  // Task 6, Section 6 (pre-decision 6): default render order sorts by
+  // emphasis rank DESCENDING — highest-focus group first — reusing
+  // trimPriority (Fix 1's own emphasis+compound ranking) rather than a
+  // second ordering scheme, so trim order and render order can't
+  // disagree about which group is the day's priority. Fixes observed
+  // failure #3 ("arms sequenced last, after 12 shoulder sets"):
+  // generator slot declaration order used to be the ONLY thing driving
+  // render order, unrelated to which group was actually focused.
+  // Decorate-sort-undecorate on original index (not list.indexOf inside
+  // the comparator, which would read a PARTIALLY-sorted array mid-sort
+  // on some engines) keeps the tie-break stable. Authored days (above)
+  // order by their own explicit `order` field instead; a prescription's
+  // ADD is still appended after this sort, unchanged from before —
+  // prescriptions carry no `order` field of their own to sort by today.
+  const genOrder = generatorList.map((_, i) => i);
+  genOrder.sort((i, j) => trimPriority(generatorList[j].ex, focus) - trimPriority(generatorList[i].ex, focus) || i - j);
+  const list = genOrder.map((i) => generatorList[i]);
   const prescriptions = ((data.plan && data.plan.prescriptions) || []).filter((p) => p.dayKey === day.id);
   const OVERRIDE_FIELDS = ["sets", "repMin", "repMax", "restSec", "scheme"];
   prescriptions.forEach((p) => {
@@ -2795,7 +2841,7 @@ function isPainEscalating(sessions, painPattern, threshold) {
    so `exOf(p)` stands in for `ex` at every call. sessionRules.trimPriority
    is still not read here, same as fitDayToTime — see that function's
    comment. */
-function gate7DurationTrim(prescriptions, sessionMin, focus) {
+function gate7DurationTrim(prescriptions, sessionMin, focus, trimPriorityOrder) {
   const budget = Math.max(20, (sessionMin || 60) - 8) * 60;
   const items = prescriptions.map((p) => ({ ...p, sets: p.sets || 3 }));
   const exOf = (p) => EX_BY_ID[p.exerciseId];
@@ -2806,7 +2852,7 @@ function gate7DurationTrim(prescriptions, sessionMin, focus) {
   const dur = (p) => p.sets * (40 + restFor(exOf(p)).sec) + dropExtraSec(p);
   const total = () => items.reduce((a, p) => a + dur(p), 0);
   const minSets = (p) => (isCompound(exOf(p)) ? 2 : 1);
-  const floors = groupTrimFloors(items.map(shapeOf), focus);
+  const floors = groupTrimFloors(items.map(shapeOf), focus, trimPriorityOrder);
   const groupOf = (p) => CAT_TO_GROUP[(exOf(p) || {}).cat];
   const groupTotal = (g) => items.reduce((a, p) => a + (groupOf(p) === g ? p.sets : 0), 0);
   let trimmedCount = 0;
@@ -2820,7 +2866,7 @@ function gate7DurationTrim(prescriptions, sessionMin, focus) {
     });
     if (!cands.length) cands = items.filter((p) => p.sets > minSets(p));
     if (cands.length) {
-      cands.sort((a, b) => trimPriority(shapeOf(a), focus) - trimPriority(shapeOf(b), focus) || items.indexOf(b) - items.indexOf(a));
+      cands.sort((a, b) => trimPriority(shapeOf(a), focus, trimPriorityOrder) - trimPriority(shapeOf(b), focus, trimPriorityOrder) || items.indexOf(b) - items.indexOf(a));
       const idx = items.indexOf(cands[0]);
       items[idx] = trimOneHardSet(items[idx]);
       trimmedCount++;
@@ -3051,7 +3097,7 @@ function applyGatedPrescriptions(prescriptions, ctx) {
     survivors.push(result.value);
   });
 
-  const trimmed = gate7DurationTrim(survivors, ctx.sessionMin, ctx.focus);
+  const trimmed = gate7DurationTrim(survivors, ctx.sessionMin, ctx.focus, ctx.trimPriorityOrder);
   if (trimmed.trimmedCount > 0 || trimmed.dropped.length > 0) {
     notes.push({ gate: 7, note: `Fitted to your ${ctx.sessionMin || 60}-minute session: trimmed ${trimmed.trimmedCount} set${trimmed.trimmedCount !== 1 ? "s" : ""}${trimmed.dropped.length ? `, dropped ${trimmed.dropped.join(", ")}` : ""}.` });
   }
@@ -3107,6 +3153,9 @@ function buildGateContext(data, plan) {
     sessions: data.sessions || [],
     weeklyGroupSets: weeklySetsByGroup(data),
     weeklyGroupSetCaps: (plan && plan.sessionRules && plan.sessionRules.weeklyGroupSetCaps) || {},
+    // Task 6, Section 6 (pre-decision 4): Gate 7's own trim, wired the
+    // same way fitDayToTime is — see trimPriorityOf's comment.
+    trimPriorityOrder: (plan && plan.sessionRules && plan.sessionRules.trimPriority) || undefined,
     sessionMin: (plan && plan.sessionMin) || (data.plan && data.plan.sessionMin) || 60,
     // Gate 7's trim priority (Fix 1) needs the real focus levels, not just
     // sessionMin — same data.focus DayPage/fitDayToTime already read, so a
@@ -3936,7 +3985,7 @@ function DayPage({ day, data, persist, onBack }) {
         const entries = resolveDayExercises(day, data);
         const isDeload = deloadActive(data);
         const pool = entries.map((e) => e.ex).map((ex) => deloadScale(ex, isDeload));
-        const fit = fitDayToTime(pool, (data.plan && data.plan.sessionMin) || 60, data.focus);
+        const fit = fitDayToTime(pool, (data.plan && data.plan.sessionMin) || 60, data.focus, trimPriorityOf(data));
         const sum = dayFocusSummary(day, data);
         const focusParts = [];
         if (sum.added > 0) focusParts.push(`+${sum.added} set${sum.added > 1 ? "s" : ""}`);

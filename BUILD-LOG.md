@@ -413,3 +413,86 @@ Logged as a deliberate scope decision given the sections still ahead.
 `npm test`: 418 assertions total (378 prior + 40 new), all passing.
 
 ---
+
+## Section 6 — Day ordering (pre-decision 6) + trimPriority wiring (pre-decision 4) (commit pending)
+
+**trimPriority (pre-decision 4)**: `emphasisRank`/`trimPriority` now take
+an optional `order` array (`sessionRules.trimPriority`, e.g.
+`["maintain","normal","emphasize","specialize"]`) overriding the default
+`LEVEL_RANK` lookup. Threaded through every `fitDayToTime`/
+`gate7DurationTrim` call site via a new single lookup helper
+(`trimPriorityOf(data)` / `ctx.trimPriorityOrder`) so "did we remember to
+wire it here" isn't asked 5 separate times. Real design decision, logged:
+`LEVEL_TRIM_FLOOR_PCT` (specialize 75%/emphasize 65%) used to be keyed by
+LEVEL NAME — changed to `LEVEL_TRIM_FLOOR_PCT_BY_RANK`, keyed by RANK
+POSITION instead, so a custom order stays internally coherent with
+itself: whichever level the coach names LAST (cut last) gets the 75%
+floor, regardless of what that level is actually called. Keeping the
+floor keyed by name would have let a custom order fight its own
+protection (cut specialize first, but still reserve 75% for "specialize"
+by name).
+
+**Gate 13 stays non-customizable, deliberately**: `dropTierRank` takes NO
+`order` param — it checks literal `focus[group] === "maintain"` directly
+rather than deriving from any rank number, so no custom
+`sessionRules.trimPriority` (even one that omits "maintain" entirely, or
+reorders it) can weaken the per-movement maintain-floor safety guarantee
+from Section 2. This is the direct, concrete expression of "Gate 13 is a
+safety invariant, not a preference a plan can dial down."
+
+**Day ordering (pre-decision 6)**: the generator's base exercise list
+(`day.exercises` + bonus lifts) is now sorted by `trimPriority`
+descending — reusing the exact same ranking function trim order uses,
+per the user's own stated reasoning ("incoherent for trim order and
+render order to disagree") — rather than a second, independent ordering
+scheme. Stable sort (decorate-original-index, sort, undecorate — NOT
+`list.indexOf` inside the comparator, which would read a partially-
+reordered array mid-sort on some engines) so same-rank exercises keep
+their template declaration order. Authored days (Section 1) are
+unaffected — they already order by their own explicit `order` field.
+`sessionRules.orderByFocus` remains unwired — out of scope for both this
+section and pre-decision 4/6 as stated; flagged here so it isn't later
+assumed done.
+
+Fixed a test regression from the ordering change (not a deliberate
+break): `check-day-resolution.js`'s `REFERENCE_dayPageEntries` (a frozen
+reimplementation proving 4 call sites agree with each other) needed the
+identical sort applied — updated it the same way its own header comment
+already documented doing for Task 2 commit 4's capping change: a real,
+legitimate behavior change, not something the reference should stay
+frozen against.
+
+**Real-data re-run (as pre-decision 6 explicitly asked), Delts & Arms,
+upperFocus, real focus (shoulders emphasize, arms specialize)**:
+
+```
+1. EZ-Bar Curl (biceps)              4 sets
+2. EZ-Bar Skullcrusher (triceps)     4 sets
+3. Overhead Cable Triceps Ext.       4 sets
+4. Cross-Body Hammer Curl (biceps)   1 set  (-2, trimmed)
+5. Machine Shoulder Press (vpress)   4 sets
+6. Cable Lateral Raise (delts)       3 sets (-1, trimmed)
+7. Lateral Raise (delts, swap)       1 set  (-3, trimmed)
+8. Incline DB Curl (spawned)         1 set  (-1, trimmed)
+9. Overhead DB Triceps Ext. (spawned) 1 set (-1, trimmed)
+```
+
+Arms (specialize) now sequences entirely before shoulders (emphasize) —
+directly fixes observed failure #3 ("Arms sequenced last, after 12
+shoulder sets, despite being the specialized group"). Session still
+fits the 60-minute budget exactly (8 sets trimmed, 0 dropped, same
+trim total as Fix 1's own real-data result — only ORDER changed, not
+which sets survive).
+
+`scripts/check-day-ordering.js`: 13 assertions, including the real-data
+re-run above and a synthetic trimPriority-customization test proving the
+cut order and floor move together coherently. Deliberately broke both
+the generator sort and the custom-order lookup together — 6/13
+assertions failed immediately, covering both mechanisms independently.
+Restored, diff-clean. Live Playwright run against the real backup file
+confirms EZ-Bar Curl (arms) renders before Machine Shoulder Press
+(shoulders) on the actual Workout tab, zero console errors.
+
+`npm test`: 431 assertions total (418 prior + 13 new), all passing.
+
+---
