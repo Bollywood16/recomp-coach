@@ -27,9 +27,10 @@
  *      lexicographic tier's own overcorrection, verified against real
  *      data during design and rejected).
  *   5. The maintain-floor stress case (Lower day, forced tiny budget):
- *      per-exercise floors still hold, and normal still outranks maintain
- *      at the full-drop stage — must not regress what was verified before
- *      implementing.
+ *      per-exercise floors still hold, and (Task 6 Section 2, Gate 13)
+ *      maintain is now protected LAST for a full-movement drop — normal
+ *      gives up its own movement first, and maintain only starts losing
+ *      whole movements once normal has nothing left to give.
  *   6. A single emphasized group with nothing specialized (the common
  *      case) doesn't behave strangely — compounds and the emphasized
  *      group stay intact, only the lone unemphasized isolation lift
@@ -151,8 +152,18 @@ function check(label, actual, expected) {
 }
 
 /* ===== 5. Maintain-floor stress case (Lower day, forced tiny budget) =====
- * Regression guard for the check already run against real data before
- * implementing — must not get worse. */
+ * UPDATED for Task 6 Section 2 (Gate 13, pre-decision 3): before this,
+ * maintain dropped FIRST for a full-movement removal (this exact test
+ * used to assert kneeraise survives, hip thrust/calf don't — recorded as
+ * the deliberate residual gap "Gate 13's job to change," DEFERRED-TESTS.md
+ * row 9). dropTierRank now protects maintain LAST for a full drop — normal
+ * gives up its own movement(s) first. Verified live, not guessed: under
+ * this exact extreme budget, kneeraise alone isn't enough headroom, so
+ * the drop proceeds into the (now-last-priority) maintain pool too, in
+ * list order (calf idx4, then hipthrust idx3) — legcurl (also maintain,
+ * idx2) is the one maintain isolation lift that survives, purely because
+ * only 2 of the 3 tied maintain candidates were needed once kneeraise's
+ * removal was already counted. */
 {
   const focus = { legs: "maintain", core: "normal" };
   const preFit = [
@@ -166,8 +177,9 @@ function check(label, actual, expected) {
   const fit = app.fitDayToTime(preFit, 20, focus);
   ok("no exercise fell below its own absolute floor under extreme budget pressure", fit.list.every((ex) => ex.sets >= (app.isCompound(ex) ? 2 : 1)), JSON.stringify(fit.list.map((e) => ({ id: e.id, sets: e.sets }))));
   const survivorIds = fit.list.map((e) => e.id);
-  ok("core's kneeraise (normal) survives over legs' hip thrust/calf (maintain) when something has to be fully dropped", survivorIds.includes("kneeraise"), JSON.stringify(survivorIds));
-  ok("hip thrust and calf raise are the maintain-group lifts exposed to a full drop first (record for whoever builds Gate 13)", !survivorIds.includes("hipthrust") && !survivorIds.includes("calf"), JSON.stringify(survivorIds));
+  ok("Gate 13: normal-tier kneeraise is sacrificed BEFORE any maintain movement is fully dropped", !survivorIds.includes("kneeraise"), JSON.stringify(survivorIds));
+  ok("maintain-tier hip thrust and calf raise are still dropped once normal's headroom (kneeraise) is exhausted and budget still isn't met — Gate 13 protects maintain from going FIRST, not from ever going", !survivorIds.includes("hipthrust") && !survivorIds.includes("calf"), JSON.stringify(survivorIds));
+  ok("legcurl (maintain) survives — the one maintain isolation lift not needed to hit budget once kneeraise's removal is counted", survivorIds.includes("legcurl"), JSON.stringify(survivorIds));
 }
 
 /* ===== 6. Single emphasize, nothing specialized — the common case ===== */

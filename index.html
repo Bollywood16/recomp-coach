@@ -973,6 +973,40 @@ function emphasisRank(ex, focus) {
 function trimPriority(ex, focus) {
   return emphasisRank(ex, focus) * 10 + (isCompound(ex) ? 1 : 0);
 }
+/* Gate 13 (maintain floor, per-movement — Task 6, pre-decision 3;
+   DEFERRED-TESTS.md row 9). ONLY for the "drop an entire movement"
+   fallback both fitDayToTime and gate7DurationTrim fall to once
+   literally every remaining exercise is already at its bare
+   per-exercise floor (isCompound ? 2 : 1) — ordinary set-trimming above
+   this point is UNCHANGED: maintain still yields sets first, by design
+   (trimPriority/emphasisRank ascending, ties broken by list position).
+   Losing an entire movement is a different kind of loss than losing a
+   set, and for a rehab-relevant maintain movement (hip thrust, calf
+   raise on this profile) it's worse than any higher-tier group losing
+   one of ITS isolation movements instead — DEFERRED-TESTS.md's own
+   words: "maintain still gets none [floor] beyond the per-exercise
+   minimum — deliberately... Gate 13's job to change." This remaps
+   maintain (rank 0) to LAST place (above specialize) for the
+   drop-entirely sort only, so normal/emphasize/specialize all give up a
+   whole movement before a maintain one is ever fully removed. Real
+   behavior change to a prior signed-off (Fix 1) result — the "core's
+   kneeraise survives over legs' maintain lifts" assertion in
+   check-trim-priority.js flips as of this commit; see that file's own
+   updated comment for the new expected numbers. */
+function dropTierRank(ex, focus) {
+  const r = emphasisRank(ex, focus);
+  return r === 0 ? LEVEL_RANK.specialize + 1 : r;
+}
+/* Shared by fitDayToTime's trim loop and Gate 10 (Task 6, estimatedMin
+   verification) — "how long does this exercise list take" computed
+   identically everywhere it's asked. gate7DurationTrim already had its
+   own inline copy of this exact formula before this existed; left alone
+   there deliberately (lower blast radius on its own extensively-tested
+   trim behavior) rather than force a third call site to route through a
+   refactor mid-build — only fitDayToTime and Gate 10 use this directly. */
+function estimateDurationSec(list) {
+  return list.reduce((a, ex) => a + ex.sets * (40 + restFor(ex).sec) + dropExtraSec(ex), 0);
+}
 /* Per-muscle-group floor for the time-budget trim: a share of that
    group's OWN pre-trim (generator-intended) volume, not a share of the
    whole day, so it scales with however much the generator already gave
@@ -1021,8 +1055,7 @@ function fitDayToTime(list, sessionMin, focus) {
   // Backoff needs no separate term: its sets are already full rested
   // sets once hardSetsFor/the normalization pass in resolveDayExercises
   // have run, so ex.sets already IS the complete segment count.
-  const dur = (ex) => ex.sets * (40 + restFor(ex).sec) + dropExtraSec(ex);
-  const total = () => items.reduce((a, e) => a + dur(e), 0);
+  const total = () => estimateDurationSec(items);
   const minSets = (ex) => (isCompound(ex) ? 2 : 1);
   const floors = groupTrimFloors(items, focus);
   const groupOf = (ex) => CAT_TO_GROUP[ex.cat];
@@ -1051,11 +1084,12 @@ function fitDayToTime(list, sessionMin, focus) {
       trimmed++;
       continue;
     }
-    // everything at its absolute per-exercise floor: drop the
-    // lowest-emphasis-tier non-compound lift, last-listed first.
+    // everything at its absolute per-exercise floor: drop a non-compound
+    // lift — dropTierRank order (Gate 13: maintain protected LAST, not
+    // first — see its own comment), ties broken last-listed first.
     const dropCands = items.filter((e) => !isCompound(e));
     if (!dropCands.length) break;
-    dropCands.sort((a, b) => emphasisRank(a, focus) - emphasisRank(b, focus) || items.indexOf(b) - items.indexOf(a));
+    dropCands.sort((a, b) => dropTierRank(a, focus) - dropTierRank(b, focus) || items.indexOf(b) - items.indexOf(a));
     const idx = items.indexOf(dropCands[0]);
     dropped.push(items[idx].name);
     items.splice(idx, 1);
@@ -2701,9 +2735,12 @@ function gate7DurationTrim(prescriptions, sessionMin, focus) {
       trimmedCount++;
       continue;
     }
+    // Gate 13: maintain protected LAST for a full drop, not first — see
+    // dropTierRank's comment. Must stay identical to fitDayToTime's own
+    // drop-entirely sort (check-trim-priority.js asserts the two agree).
     const dropCands = items.filter((p) => !isCompound(exOf(p)));
     if (!dropCands.length) break;
-    dropCands.sort((a, b) => emphasisRank(shapeOf(a), focus) - emphasisRank(shapeOf(b), focus) || items.indexOf(b) - items.indexOf(a));
+    dropCands.sort((a, b) => dropTierRank(shapeOf(a), focus) - dropTierRank(shapeOf(b), focus) || items.indexOf(b) - items.indexOf(a));
     const idx = items.indexOf(dropCands[0]);
     dropped.push((exOf(items[idx]) || {}).name || items[idx].exerciseId);
     items.splice(idx, 1);
@@ -2990,7 +3027,276 @@ function buildGateContext(data, plan) {
     checkinScopeIds: checkinScoped ? checkInExerciseIds(data) : null,
     programDayIds: new Set(program.map((d) => d.id)),
     currentSlotFor,
+    // Task 6, Gates 9-13: the day-gate orchestrator needs the raw program
+    // array itself (to find a dayKey's base template day for Gate 12/13's
+    // comparisons) and the pre-this-plan `data` (to compute a day's OLD
+    // per-group contribution for Gate 11's tally subtraction — the same
+    // subtract-before-add shape Gate 6 already uses via currentSlotFor).
+    program,
+    data,
   };
+}
+
+/* ===== Gates 9-13 (Task 6, Section 2) =====
+   Authored days (data.plan.days[]) are Claude designing a session
+   directly, not overriding one generator slot — the highest-trust
+   surface this app has, and the one Task 4's premise ("Claude proposes,
+   the app disposes, and neither decides what is medically safe") most
+   needs a full gate stack in front of.
+
+   Day-level rejection, not per-exercise (BUILD-LOG.md's pre-flight
+   note): the spec's partial-application requirement ("if one day fails
+   validation, apply the others") is about DAYS, not exercises within a
+   day. Gates 10-13 are day-level self-consistency checks that only mean
+   anything against a day's COMPLETE exercise list — silently dropping
+   one exercise from a coach-authored day would invalidate the coach's
+   own self-reported totals (estimatedMin, weeklyGroupSets) and
+   specialize coverage in ways the coach never intended. One bad
+   exercise anywhere in a day fails that day's Gate 9, and a day that
+   fails any gate 9-13 is simply absent from the accepted set — no
+   partial exercise list is ever stored. resolveDayExercises then finds
+   no override for that dayKey and falls through to the tested
+   generator path — a known-safe fallback, never "no day at all". */
+
+/* Gate 9 — every exerciseId in a day exists and passes Gates 1-8's
+   per-item logic. Reuses gate1UnknownId / gate1bCheckinScope /
+   gate1eSchemeConsistency / gate2Injury / gate3LoadSanity /
+   gate4PainRule / gate5PainEscalation / clampSchemeToTopLoad VERBATIM —
+   same functions runPrescriptionGates calls, no fork, asserted by
+   scripts/check-authored-day-gates.js (every gate2Injury call site
+   grepped). Skips gate1d (ambiguous match): that gate compares against
+   the CURRENTLY RENDERED day via ctx.currentSlotFor — meaningless for a
+   day being authored from scratch; a duplicate exerciseId WITHIN one
+   authored day's own list is checked once, day-level, in
+   applyAuthoredDays below, since it's a property of the day's own list,
+   not a comparison against pre-existing state. Skips gate1c (dayKey
+   validity): checked once per DAY below, not once per exercise — a
+   day-level property. Adds one check neither gate1-8 nor the spec's own
+   pseudocode has an equivalent for: `rationale` is required per the
+   spec's own text ("Rationale required... an unexplained prescription
+   is one you cannot audit") — a missing one is invalid input, same
+   severity as an unknown id. */
+function gate9AuthoredExercise(ae, dayKey, ctx) {
+  if (!ae.rationale || !String(ae.rationale).trim()) {
+    const ex = EX_BY_ID[ae.exerciseId];
+    return { accepted: false, gate: 9, reason: `"${ex ? ex.name : ae.exerciseId}" has no rationale — every authored exercise must carry one (an unexplained prescription can't be audited).` };
+  }
+  const prescription = { ...ae, dayKey };
+  const g1 = gate1UnknownId(prescription);
+  if (g1.reject) return { accepted: false, gate: g1.gate, reason: g1.reason };
+  const g1b = gate1bCheckinScope(prescription, ctx);
+  if (g1b.reject) return { accepted: false, gate: g1b.gate, reason: g1b.reason };
+  const g1e = gate1eSchemeConsistency(prescription);
+  if (g1e.reject) return { accepted: false, gate: g1e.gate, reason: g1e.reason };
+  const g2 = gate2Injury(prescription, ctx);
+  if (g2.reject) return { accepted: false, gate: g2.gate, reason: g2.reason };
+  let value = prescription;
+  const notes = [];
+  const g3 = gate3LoadSanity(value, ctx);
+  if (g3.value) value = g3.value;
+  if (g3.note) notes.push({ gate: 3, note: g3.note });
+  const g4 = gate4PainRule(value, ctx);
+  if (g4.value) value = g4.value;
+  if (g4.note) notes.push({ gate: 4, note: g4.note });
+  const g5 = gate5PainEscalation(value, ctx);
+  if (g5.value) value = g5.value;
+  if (g5.note) notes.push({ gate: 5, note: g5.note });
+  const clamped = clampSchemeToTopLoad(value);
+  value = clamped.value;
+  if (clamped.note) notes.push({ gate: "scheme", note: clamped.note });
+  return { accepted: true, value, notes };
+}
+
+/* Gate 10 — recomputed duration within 10% of the day's self-reported
+   estimatedMin. estimateDurationSec is the exact formula fitDayToTime
+   itself uses (shared, not a separate approximation) — "the model's own
+   arithmetic is checked, not trusted" means checked against the app's
+   real math, not a rough guess at it. No estimatedMin declared: nothing
+   to verify against, passes (a day entry omitting it isn't claiming
+   anything false). */
+function gate10Duration(dayEntry, resolvedList) {
+  if (dayEntry.estimatedMin == null) return { reject: false };
+  const recomputedMin = Math.round(estimateDurationSec(resolvedList) / 60) + 8;
+  const claimed = dayEntry.estimatedMin;
+  const diffPct = claimed > 0 ? Math.abs(recomputedMin - claimed) / claimed : 1;
+  if (diffPct > 0.1) {
+    return { reject: true, gate: 10, reason: `"${dayEntry.label || dayEntry.dayKey}" claims estimatedMin ${claimed}, recomputed ${recomputedMin} — off by ${Math.round(diffPct * 100)}%, above the 10% tolerance.` };
+  }
+  return { reject: false };
+}
+
+/* Gate 11 — two checks: (a) the day's self-reported weeklyGroupSets is
+   within 10% of what's actually in the authored list (same
+   verify-don't-trust framing as Gate 10), and (b) this day's new
+   per-group contribution, swapped in for whatever it contributed
+   BEFORE (subtract old, add new — same shape Gate 6 already uses via
+   ctx.currentSlotFor for prescriptions), stays under each group's cap.
+   `oldContribution` comes from resolveDayExercises against ctx.data —
+   the pre-this-plan state, i.e. the day as it renders today, generator
+   path included (this dayKey has no data.plan.days entry yet at the
+   point ctx was built). */
+function gate11WeeklyGroupSets(dayEntry, resolvedList, templateDay, ctx) {
+  const newContribution = {};
+  resolvedList.forEach((ex) => {
+    const g = CAT_TO_GROUP[ex.cat];
+    if (g) newContribution[g] = (newContribution[g] || 0) + ex.sets;
+  });
+  if (dayEntry.weeklyGroupSets) {
+    for (const g of Object.keys(dayEntry.weeklyGroupSets)) {
+      const claimed = dayEntry.weeklyGroupSets[g];
+      const recomputed = newContribution[g] || 0;
+      const diffPct = claimed > 0 ? Math.abs(recomputed - claimed) / claimed : (recomputed > 0 ? 1 : 0);
+      if (diffPct > 0.1) {
+        return { reject: true, gate: 11, reason: `"${dayEntry.label || dayEntry.dayKey}" claims ${claimed} weekly sets for ${(MUSCLE_GROUPS[g] || {}).name || g}, recomputed ${recomputed} — off by ${Math.round(diffPct * 100)}%, above the 10% tolerance.` };
+      }
+    }
+  }
+  const oldList = templateDay ? resolveDayExercises(templateDay, ctx.data) : [];
+  const oldContribution = {};
+  oldList.forEach(({ ex }) => {
+    const g = CAT_TO_GROUP[ex.cat];
+    if (g) oldContribution[g] = (oldContribution[g] || 0) + ex.sets;
+  });
+  const groups = new Set([...Object.keys(newContribution), ...Object.keys(oldContribution)]);
+  for (const g of groups) {
+    const adjusted = (ctx.weeklyGroupSets[g] || 0) - (oldContribution[g] || 0) + (newContribution[g] || 0);
+    const cap = ctx.weeklyGroupSetCaps[g] ?? defaultGroupCap(g, ctx.weeklyGroupSets);
+    if (adjusted > cap) {
+      return { reject: true, gate: 11, reason: `"${dayEntry.label || dayEntry.dayKey}" would push ${(MUSCLE_GROUPS[g] || {}).name || g} to ${adjusted} weekly sets, above the ${cap}-set cap.` };
+    }
+  }
+  return { reject: false };
+}
+
+/* Gate 12 — a day must retain at least one exercise per group the
+   TEMPLATE'S OWN base day for this dayKey already represents at
+   specialize/emphasize focus. Compared against the template's base day,
+   not "every specialize/emphasize group globally": a Push day under an
+   upperFocus split was never going to train a specialized BACK muscle,
+   so its absence there isn't a violation — only a group the day's own
+   role already carries can be dropped out from under it. */
+function gate12SpecializeCoverage(dayEntry, resolvedList, templateDay, focus) {
+  if (!templateDay) return { reject: false };
+  const templateGroups = new Set(templateDay.exercises.map((s) => CAT_TO_GROUP[(EX_BY_ID[s.id] || {}).cat]).filter(Boolean));
+  const focusedTemplateGroups = [...templateGroups].filter((g) => ["specialize", "emphasize"].includes((focus && focus[g]) || "normal"));
+  if (!focusedTemplateGroups.length) return { reject: false };
+  const authoredGroups = new Set(resolvedList.map((ex) => CAT_TO_GROUP[ex.cat]).filter(Boolean));
+  const missing = focusedTemplateGroups.filter((g) => !authoredGroups.has(g));
+  if (missing.length) {
+    const names = missing.map((g) => (MUSCLE_GROUPS[g] || {}).name || g).join(", ");
+    return { reject: true, gate: 12, reason: `"${dayEntry.label || dayEntry.dayKey}" drops ${names} entirely — this day's own template trains it at ${missing.map((g) => (focus && focus[g]) || "normal").join("/")} focus; a specialized/emphasized group can't be omitted from the day that's supposed to carry it.` };
+  }
+  return { reject: false };
+}
+
+/* Gate 13 — maintain floor, per-movement (pre-decision 3;
+   DEFERRED-TESTS.md row 9). A maintain-tier movement the template's own
+   base day for this dayKey already includes cannot be dropped entirely
+   by an authored day unless a pool-equivalent replacement is present —
+   maintenance volume for a rehab-relevant movement (RDL, goblet squat,
+   hip thrust, per the spec's own naming) is not a source of trimmable
+   volume. Same "compare against the template's base day" shape as Gate
+   12, and the same underlying idea the generator-side trim fix
+   (dropTierRank, above) now enforces for the identical reason — one
+   invariant, two enforcement points, not two different rules that could
+   drift apart. */
+function gate13MaintainFloor(dayEntry, resolvedList, templateDay, focus) {
+  if (!templateDay) return { reject: false };
+  const maintainBase = templateDay.exercises
+    .map((s) => EX_BY_ID[s.id])
+    .filter((ex) => ex && ((focus && focus[CAT_TO_GROUP[ex.cat]]) || "normal") === "maintain");
+  if (!maintainBase.length) return { reject: false };
+  const authoredPools = new Set(resolvedList.map((ex) => ex.pool));
+  const missing = maintainBase.filter((ex) => !authoredPools.has(ex.pool));
+  if (missing.length) {
+    const names = missing.map((ex) => ex.name).join(", ");
+    return { reject: true, gate: 13, reason: `"${dayEntry.label || dayEntry.dayKey}" drops ${names} (maintain-tier) with no pool-equivalent substitute — maintenance volume for a rehab-relevant movement can't be trimmed away entirely.` };
+  }
+  return { reject: false };
+}
+
+/* Batch entry point for data.plan.days — the Task 6 analogue of
+   applyGatedPrescriptions. Runs Gate 9 per exercise (short-circuits the
+   whole day on the first per-exercise reject), then resolves the
+   gate-9-accepted (already load/pain-adjusted) exercises into real
+   exercise shapes and runs gates 10-13 against the complete day. A
+   checkin-tier plan (ctx.checkinScoped) rejects every day outright
+   before Gate 9 even runs — day authorship is a full-tier feature (Task
+   7, Section 7); nothing about scope-checking individual exercises
+   would be meaningful if the day itself shouldn't have been proposed at
+   this tier at all. */
+function applyAuthoredDays(days, ctx) {
+  const accepted = [];
+  const rejections = [];
+  const notes = [];
+  (days || []).forEach((dayEntry) => {
+    if (ctx.checkinScoped) {
+      rejections.push({ dayKey: dayEntry.dayKey, gate: "days", reason: `"${dayEntry.label || dayEntry.dayKey || "(day)"}" was dropped — full day authorship requires a full-tier brief; this plan was generated at check-in scope.` });
+      return;
+    }
+    if (!dayEntry.dayKey || !ctx.programDayIds.has(dayEntry.dayKey)) {
+      rejections.push({ dayKey: dayEntry.dayKey, gate: 9, reason: `"${dayEntry.dayKey || "(missing dayKey)"}" isn't a day in your current template — valid days are: ${[...ctx.programDayIds].join(", ")}.` });
+      return;
+    }
+    if (!Array.isArray(dayEntry.exercises) || !dayEntry.exercises.length) {
+      rejections.push({ dayKey: dayEntry.dayKey, gate: 9, reason: `"${dayEntry.label || dayEntry.dayKey}" has no exercises.` });
+      return;
+    }
+    const seenIds = new Set();
+    const dupId = dayEntry.exercises.map((ae) => ae.exerciseId).find((id) => (seenIds.has(id) ? true : (seenIds.add(id), false)));
+    if (dupId) {
+      rejections.push({ dayKey: dayEntry.dayKey, gate: 9, reason: `"${dayEntry.label || dayEntry.dayKey}" lists "${(EX_BY_ID[dupId] || {}).name || dupId}" more than once — can't tell which entry is authoritative.` });
+      return;
+    }
+
+    const gatedExercises = [];
+    let dayRejectReason = null;
+    for (const ae of dayEntry.exercises) {
+      const result = gate9AuthoredExercise(ae, dayEntry.dayKey, ctx);
+      if (!result.accepted) {
+        dayRejectReason = `"${dayEntry.label || dayEntry.dayKey}" rejected — ${result.reason}`;
+        break;
+      }
+      gatedExercises.push(result.value);
+      (result.notes || []).forEach((n) => notes.push({ dayKey: dayEntry.dayKey, exerciseId: ae.exerciseId, ...n }));
+    }
+    if (dayRejectReason) {
+      rejections.push({ dayKey: dayEntry.dayKey, gate: 9, reason: dayRejectReason });
+      return;
+    }
+
+    // Real exercise shapes for gates 10-13 (and for what's actually
+    // stored/rendered) — same fields resolveAuthoredExercise produces,
+    // built directly here since these are gate-9-MODIFIED values
+    // (post load/pain adjustment), not the raw pasted entries.
+    const resolvedList = gatedExercises
+      .map((ge) => {
+        const base = EX_BY_ID[ge.exerciseId];
+        return {
+          ...base, sets: ge.sets, repMin: ge.repMin ?? base.repMin, repMax: ge.repMax ?? base.repMax,
+          restSec: ge.restSec, prescribedLoad: ge.load, scheme: ge.scheme,
+        };
+      })
+      .map((ex) => ({ ...ex, sets: hardSetsFor(ex) }));
+
+    const templateDay = ctx.program.find((d) => d.id === dayEntry.dayKey);
+
+    const g10 = gate10Duration(dayEntry, resolvedList);
+    if (g10.reject) { rejections.push({ dayKey: dayEntry.dayKey, gate: 10, reason: g10.reason }); return; }
+
+    const g11 = gate11WeeklyGroupSets(dayEntry, resolvedList, templateDay, ctx);
+    if (g11.reject) { rejections.push({ dayKey: dayEntry.dayKey, gate: 11, reason: g11.reason }); return; }
+
+    const g12 = gate12SpecializeCoverage(dayEntry, resolvedList, templateDay, ctx.focus);
+    if (g12.reject) { rejections.push({ dayKey: dayEntry.dayKey, gate: 12, reason: g12.reason }); return; }
+
+    const g13 = gate13MaintainFloor(dayEntry, resolvedList, templateDay, ctx.focus);
+    if (g13.reject) { rejections.push({ dayKey: dayEntry.dayKey, gate: 13, reason: g13.reason }); return; }
+
+    accepted.push({ ...dayEntry, exercises: gatedExercises });
+    notes.push({ dayKey: dayEntry.dayKey, gate: "days", note: `"${dayEntry.label || dayEntry.dayKey}" authored and accepted.` });
+  });
+  return { accepted, rejections, notes };
 }
 
 
@@ -5010,7 +5316,15 @@ function coachMetrics(data) {
 // versioning) is dropped and reported as an ignored field, never silently
 // carried through on the chance nothing downstream reads it back out.
 // check-write-isolation.js asserts injuryProfile is never in this list.
-const KNOWN_PLAN_KEYS = ["template", "focus", "sessionMin", "calorieDelta", "prescriptions", "sessionRules", "pushback", "assessment", "nutritionNote", "nextCheckIn"];
+// Task 6, Section 2: `days` and `splitPattern` added here in the SAME
+// commit as Gates 9-13 (applyAuthoredDays) — see BUILD-LOG.md's Section 1
+// note for why they were deliberately withheld from this list until the
+// gates that make accepting them safe existed. `splitPattern` is stored
+// as declared, ungated: the spec's own Requirements/Gates lists define no
+// enforcement for it (PROGRAMS' fixed day structure remains the real
+// source of truth for which days exist) — it's context the model can
+// echo back about what split it authored, not itself safety-relevant.
+const KNOWN_PLAN_KEYS = ["template", "focus", "sessionMin", "calorieDelta", "prescriptions", "sessionRules", "pushback", "assessment", "nutritionNote", "nextCheckIn", "days", "splitPattern"];
 
 /* sessionRules persists differently from prescriptions on purpose
  * (TASK-2-RECONCILIATION-PROPOSAL.txt, condition C). A `prescriptions`
@@ -5129,6 +5443,22 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
     gated.prescriptions = result.accepted;
     gated.prescriptionRejections = result.rejections;
     gated.prescriptionNotes = result.notes;
+  }
+
+  // Task 6, Section 2: `days` through Gates 9-13. Backward compatible —
+  // a plan with no `days` key skips this entirely, gated.days stays
+  // undefined, and (Section 3 wires the actual persist) nothing changes
+  // for the caller. NOT yet persisted by applyPasted — Section 3 adds
+  // the mandatory diff-and-confirm step that makes storing an authored
+  // plan safe to reach from a live paste; until then this is computed
+  // but inert, exactly like Section 1's read path was before this gate
+  // existed to guard it.
+  if (Array.isArray(rec.days) && rec.days.length && data) {
+    const ctx = buildGateContext(data, gated);
+    const result = applyAuthoredDays(rec.days, ctx);
+    gated.days = result.accepted;
+    gated.dayRejections = result.rejections;
+    gated.dayNotes = result.notes;
   }
   return gated;
 }

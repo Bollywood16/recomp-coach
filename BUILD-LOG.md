@@ -134,3 +134,86 @@ DELIBERATELY`.
 `npm test`: 315 assertions total (296 prior + 19 new), all passing.
 
 ---
+
+## Section 2 — Gates 9-13 (commit pending)
+
+**Generator-side fix landed here too, not just the new gates** (see the
+pre-flight note above for the reasoning): `dropTierRank` remaps
+maintain (rank 0) to LAST place for fitDayToTime's and
+gate7DurationTrim's "drop an entire movement" fallback only — ordinary
+set-trimming (trimPriority/emphasisRank) is untouched, maintain still
+yields sets first. Applied identically to both functions (they're
+asserted to agree in check-trim-priority.js). Real-data check: at the
+user's actual sessionMin (60), the real Lower day trims/drops nothing at
+all — dropTierRank never even activates outside the synthetic
+extreme-budget stress test, so there is no regression against the
+signed-off Fix 1 Delts & Arms result (re-verified, still passes
+unchanged) or any real-world session. The ONE test assertion this
+flips (`check-trim-priority.js`'s maintain-floor stress case) is the
+literal, expected case DEFERRED-TESTS.md named as "Gate 13's job to
+change" — updated with the real recomputed survivor list (legcurl
+survives; kneeraise, hip thrust, and calf raise all end up dropped under
+this specific 20-minute forced-budget synthetic scenario, in that
+order), not guessed.
+
+**Gates 9-13**, all added after `buildGateContext` (which now also
+exposes `ctx.program`/`ctx.data` for the day-vs-template comparisons
+gates 12/13 need):
+
+- Gate 9 (`gate9AuthoredExercise`) reuses `gate1UnknownId`,
+  `gate1bCheckinScope`, `gate1eSchemeConsistency`, `gate2Injury`,
+  `gate3LoadSanity`, `gate4PainRule`, `gate5PainEscalation`,
+  `clampSchemeToTopLoad` verbatim — same functions
+  `runPrescriptionGates` calls. Skips gate1d (ambiguous match — doesn't
+  apply to a day authored from scratch; a within-day duplicate
+  exerciseId is checked once, day-level, in `applyAuthoredDays`
+  instead) and gate1c (day-level, checked once per day not per
+  exercise). Adds a `rationale`-required check per the spec's own text.
+- Gate 10 (`gate10Duration`): recomputed via the new shared
+  `estimateDurationSec` (also now used by `fitDayToTime` — was
+  duplicated 3 ways before this, now 2: `gate7DurationTrim` kept its own
+  inline copy deliberately, lower blast radius on its own
+  extensively-tested behavior).
+- Gate 11 (`gate11WeeklyGroupSets`): self-reported check, plus a
+  subtract-old-add-new cap check identical in shape to the existing
+  Gate 6 (prescriptions) mechanism — `oldContribution` computed via
+  `resolveDayExercises` against `ctx.data` (pre-this-plan state).
+- Gate 12 (`gate12SpecializeCoverage`) / Gate 13
+  (`gate13MaintainFloor`): both compare the authored day against its
+  OWN template's base day (`ctx.program.find(d => d.id ===
+  dayEntry.dayKey)`) — a day is only held to a group's presence if that
+  day's own template role already trained it. Gate 13 checks by `pool`
+  equivalence (same mechanism the swap picker and pool-splitting already
+  use), not exact exerciseId match, so an authored substitution within
+  the same pool passes.
+- `applyAuthoredDays` (batch entry point, analogue of
+  `applyGatedPrescriptions`): checkin-tier scope rejects `days`
+  wholesale before Gate 9 even runs (day authorship is a full-tier
+  feature). Day-level partial application — one bad exercise or one
+  failed day-gate drops the WHOLE day, others in the batch are
+  unaffected.
+
+**Wiring**: `days`/`splitPattern` added to `KNOWN_PLAN_KEYS` in this
+SAME commit (not Section 1's), together with `applyAuthoredDays` being
+called from `applyCoachGates`. Still NOT persisted by `applyPasted` —
+`gated.days`/`gated.dayRejections` are computed but inert until Section
+3 adds the diff-and-confirm flow that makes storing them reachable from
+a live paste.
+
+`scripts/check-authored-day-gates.js`: 28 assertions, including a
+structural check (`gate2Injury(` occurs exactly 7 times in index.html —
+1 definition + 6 callers, Gate 9 is the 7th, no fork) and two real-data
+cases (a plausible authored Delts & Arms day passes end to end; the same
+shape with the real contraindicated exercise, goblet, is rejected).
+Deliberately broke three invariants at once (the rationale check, Gate
+13's maintain-pool check, Gate 11's subtract-old-add-new arithmetic) —
+2 of 3 were caught immediately by existing assertions; the third
+(cap arithmetic) slipped past the original test design, so I added a
+dedicated assertion isolating that exact mechanic (a tight cap against a
+group trained by TWO days, so "this day's own total" and "the true
+adjusted weekly total" diverge) before re-breaking and confirming it now
+catches it too. Restored, diff-clean confirmed.
+
+`npm test`: 343 assertions total (315 prior + 28 new), all passing.
+
+---
