@@ -217,3 +217,73 @@ catches it too. Restored, diff-clean confirmed.
 `npm test`: 343 assertions total (315 prior + 28 new), all passing.
 
 ---
+
+## Section 3 — Plan versioning, diff, revert (commit pending)
+
+**Design decisions, logged (none of these were spec-exact, all had to be
+made):**
+- `days` merges **per-dayKey** into `data.plan.days`, not wholesale-
+  replace like `prescriptions`. An earlier paste's authored day for a
+  dayKey THIS paste doesn't mention stays in effect — same
+  "loud-on-change, silent-on-omission" principle `mergeSessionRules`
+  already uses. Wholesale-replace felt too easy to accidentally regress
+  an unrelated day back to the generator with an unrelated small paste.
+- The diff-and-confirm surface triggers on the RAW paste attempting day
+  authorship (`Array.isArray(raw.days) && raw.days.length`), not on
+  `gated.days` surviving gating. A plan where every day gets rejected by
+  gates 9-13 still needs to show the user why — falling through to the
+  immediate-apply path with rejections unseen would defeat "never
+  auto-apply an authored plan" in spirit even though technically no
+  `days` content would have been written.
+- Every applied plan (days-bearing or the legacy four-field/prescriptions
+  shape alike) gets a `planVersions` entry — not just authored ones. The
+  spec's versioning language sits under Task 6 but reads as a general
+  requirement ("every applied plan stored as a versioned record"), and
+  scoping revert to only-ever-authored plans would make it far less
+  useful in practice.
+- A revert pushes a NEW version entry (`source: "revert"`,
+  `revertedFrom: <id>`) rather than mutating/removing history — the
+  revert itself becomes part of the immutable record, not an edit to it.
+
+**Implementation**: `diffAuthoredDay`/`diffAuthoredPlan` (pure,
+side-effect-free — the confirm step would be meaningless if computing
+the preview itself persisted anything) diff a day's CURRENT
+`resolveDayExercises` output against the newly-gated exercise list:
+added/removed by id-set difference, changed by sets/load, reordered by
+position. `pushPlanVersion` is append-only, capped at 25 (same bounded-
+history pattern as `injuryProfileHistory`, there at 50).
+`applyPasted` now branches: a `days`-bearing paste sets `pendingPlan`
+(gated result + diff) instead of persisting; a bare paste keeps the
+exact pre-Task-6 immediate-apply behavior. `confirmPendingPlan` is the
+only path that ever writes `data.plan.days`. New UI:
+`PendingPlanDiff` (the review/confirm/discard card) and `PlanHistoryCard`
+(reverse-chronological history, "Revert to this" per entry), both in
+CoachCard.
+
+`scripts/check-plan-versioning.js`: 19 assertions, including a real-data
+diff case that had to be corrected mid-build — my first draft assumed
+the template's bare slot list as "current," but real data has a live
+user swap (reardelt→latraise) and pool-overflow spawns already present,
+so I rewrote the assertions to resolve the actual current list first via
+`resolveDayExercises` and diff against THAT, which is what the function
+itself does. Deliberately broke `diffAuthoredDay`'s changed-detection and
+`pushPlanVersion`'s 25-entry cap together — both caught immediately by
+existing assertions, including the real-data one. Restored, diff-clean.
+
+**Live browser verification** (Playwright, real backup data, full
+apply→confirm→render→history→revert flow): pasted a `days`-bearing
+plan, confirmed it does NOT persist until "Confirm & apply" is clicked
+(the diff card renders correctly — added/changed entries visible),
+confirmed persistence and `planVersions` after clicking confirm,
+navigated to the Workout tab and confirmed the authored day actually
+renders — including a real, correct interaction Section 1 designed for:
+the authored 5-set ezcurl gets capped to 4 by `capAndSplitMovement` with
+a spawned overflow movement, exactly like a generator day (my first test
+assertion wrongly expected the raw 5 to survive — fixed once the capping
+banner made the real, correct behavior obvious). Plan History section
+renders, "Revert to this" restores the prior plan and adds a second,
+`source: "revert"` version entry. Zero console errors.
+
+`npm test`: 362 assertions total (343 prior + 19 new), all passing.
+
+---

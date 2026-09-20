@@ -3299,6 +3299,54 @@ function applyAuthoredDays(days, ctx) {
   return { accepted, rejections, notes };
 }
 
+/* ===== Task 6, Section 3: diff, versioning, revert =====
+   "Never auto-apply an authored plan" — diffAuthoredDay/diffAuthoredPlan
+   are pure and side-effect-free specifically so the diff can be computed
+   for PREVIEW without persisting anything; the mandatory confirm step
+   this exists for would be meaningless if computing the diff itself
+   changed data. Diffs the day's CURRENT rendered exercise list (whatever
+   resolveDayExercises produces against `data` as it stands right now —
+   generator, or a previously-authored day, whichever currently applies)
+   against the NEWLY gated exercise list for the same dayKey. */
+function diffAuthoredDay(dayKey, newExercises, data) {
+  const program = getProgram(data);
+  const templateDay = program.find((d) => d.id === dayKey);
+  const currentList = templateDay ? resolveDayExercises(templateDay, data).map((e) => e.ex) : [];
+  const currentById = new Map(currentList.map((ex, i) => [ex.id, { ex, order: i }]));
+  const newIds = new Set(newExercises.map((ne) => ne.exerciseId));
+  const added = [], changed = [], reordered = [];
+  newExercises.forEach((ne, i) => {
+    const name = (EX_BY_ID[ne.exerciseId] || {}).name || ne.exerciseId;
+    const prev = currentById.get(ne.exerciseId);
+    if (!prev) { added.push({ exerciseId: ne.exerciseId, name, sets: ne.sets, load: ne.load ?? null, rationale: ne.rationale }); return; }
+    const fromLoad = prev.ex.prescribedLoad ?? null;
+    const toLoad = ne.load ?? null;
+    if (prev.ex.sets !== ne.sets || fromLoad !== toLoad) {
+      changed.push({ exerciseId: ne.exerciseId, name, fromSets: prev.ex.sets, toSets: ne.sets, fromLoad, toLoad });
+    }
+    if (prev.order !== i) reordered.push({ exerciseId: ne.exerciseId, name, fromOrder: prev.order, toOrder: i });
+  });
+  const removed = currentList.filter((ex) => !newIds.has(ex.id)).map((ex) => ({ exerciseId: ex.id, name: ex.name }));
+  return { added, removed, changed, reordered };
+}
+function diffAuthoredPlan(days, data) {
+  return (days || []).map((d) => ({ dayKey: d.dayKey, label: d.label || d.dayKey, diff: diffAuthoredDay(d.dayKey, d.exercises, data) }));
+}
+
+/* Immutable, append-only plan version history. Every applied plan —
+   days-authored or the legacy four-field/prescriptions shape alike —
+   gets a new record; nothing already written is ever mutated. `plan` is
+   the FULL applied snapshot (everything data.plan carries), not a diff —
+   a revert needs to restore the whole thing, not reconstruct it. Capped
+   at the last 25, same bounded-history pattern injuryProfileHistory
+   already uses (there at 50) so this doesn't grow unbounded in
+   localStorage forever. */
+function pushPlanVersion(data, plan, brief, source, revertedFrom) {
+  const entry = { id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, at: new Date().toISOString(), brief: brief || null, plan, source: source || "paste" };
+  if (revertedFrom) entry.revertedFrom = revertedFrom;
+  return [...(data.planVersions || []), entry].slice(-25);
+}
+
 
 /* Task 3, logger UI round. Every row this produces gets an EXPLICIT
    segment — "top" for a plain/no-scheme exercise too, not omitted —
@@ -5496,6 +5544,124 @@ Respond ONLY with JSON, no markdown fences:
   return JSON.parse(text.replace(/```json|```/g, "").trim());
 }
 
+/* Task 6, Section 3: the mandatory diff-and-confirm surface for an
+   authored plan — the ONLY place data.plan.days actually gets written,
+   and only via the explicit "Confirm & apply" button below (see
+   applyPasted/confirmPendingPlan in CoachCard). Rendered whenever
+   pendingPlan is non-null; nothing here has a side effect on its own —
+   discarding (closing the tab, tapping Discard) leaves data untouched. */
+function PendingPlanDiff({ pendingPlan, onConfirm, onDiscard }) {
+  if (!pendingPlan) return null;
+  const { gated, diff } = pendingPlan;
+  const acceptedCount = (gated.days || []).length;
+  const rejectedCount = (gated.dayRejections || []).length;
+  return (
+    <div style={{ ...S.card, background: "#FFF7EC", marginTop: 10 }}>
+      <div style={{ fontWeight: 700, fontSize: 14, color: C.orange }}>Review before applying</div>
+      <div style={{ fontSize: 12.5, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
+        This reply authors full day{acceptedCount + rejectedCount !== 1 ? "s" : ""} — nothing is saved until you
+        confirm below.
+      </div>
+      {rejectedCount > 0 && (
+        <div style={{ marginTop: 10, background: "#FDECEC", borderRadius: 10, padding: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 12.5, color: C.red }}>
+            {rejectedCount} day{rejectedCount !== 1 ? "s" : ""} rejected, not applied
+          </div>
+          {gated.dayRejections.map((r, i) => (
+            <div key={i} style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>{r.reason}</div>
+          ))}
+        </div>
+      )}
+      {diff.map((d) => {
+        const empty = !d.diff.added.length && !d.diff.removed.length && !d.diff.changed.length && !d.diff.reordered.length;
+        return (
+          <div key={d.dayKey} style={{ marginTop: 10, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 10 }}>
+            <div style={{ fontWeight: 700, fontSize: 13 }}>{d.label}</div>
+            {empty && <div style={{ fontSize: 12, color: C.sub, marginTop: 4 }}>No changes from what's currently there.</div>}
+            {d.diff.added.map((a) => (
+              <div key={`add${a.exerciseId}`} style={{ fontSize: 12.5, color: C.green, marginTop: 4 }}>
+                + {a.name} — {a.sets} sets{a.load != null ? ` @ ${a.load} lb` : ""}
+                {a.rationale && <div style={{ color: C.sub, fontSize: 11.5, marginTop: 2 }}>{a.rationale}</div>}
+              </div>
+            ))}
+            {d.diff.removed.map((r) => (
+              <div key={`rm${r.exerciseId}`} style={{ fontSize: 12.5, color: C.red, marginTop: 4 }}>− {r.name}</div>
+            ))}
+            {d.diff.changed.map((c) => (
+              <div key={`ch${c.exerciseId}`} style={{ fontSize: 12.5, color: C.blue, marginTop: 4 }}>
+                ~ {c.name}: {c.fromSets}→{c.toSets} sets
+                {c.fromLoad !== c.toLoad ? `, ${c.fromLoad ?? "engine-recommended"}→${c.toLoad ?? "engine-recommended"} lb` : ""}
+              </div>
+            ))}
+            {d.diff.reordered.map((o) => (
+              <div key={`ord${o.exerciseId}`} style={{ fontSize: 12, color: C.sub, marginTop: 4 }}>
+                ↕ {o.name} moved position {o.fromOrder + 1} → {o.toOrder + 1}
+              </div>
+            ))}
+          </div>
+        );
+      })}
+      <div style={{ ...S.row, marginTop: 12 }}>
+        <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} onClick={onDiscard}>Discard</button>
+        <button style={{ ...S.pillBtn(C.green), flex: 1 }} disabled={acceptedCount === 0} onClick={onConfirm}>
+          {acceptedCount === 0 ? "Nothing to apply" : "Confirm & apply"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* Task 6, Section 3: "one-tap revert to any prior plan version." Reading
+   data.planVersions only — never writes except through revertToVersion's
+   own persist, which itself pushes a NEW version (source: "revert") so
+   the revert is part of the immutable history too, not a mutation of it. */
+function PlanHistoryCard({ data, persist }) {
+  const [open, setOpen] = useState(false);
+  const versions = [...(data.planVersions || [])].sort((a, b) => (a.at < b.at ? 1 : -1));
+  if (!versions.length) return null;
+
+  const revertToVersion = (version) => {
+    persist({
+      ...data,
+      plan: version.plan,
+      planVersions: pushPlanVersion(data, version.plan, null, "revert", version.id),
+    });
+  };
+
+  return (
+    <div style={{ ...S.card, background: "#F7F7FA" }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{ ...font, display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", background: "transparent", border: "none", cursor: "pointer", textAlign: "left", padding: 0 }}
+      >
+        <div style={{ fontWeight: 700, fontSize: 15 }}>Plan history ({versions.length})</div>
+        <ChevronRight size={18} color={C.sub} style={{ transform: open ? "rotate(90deg)" : "none" }} />
+      </button>
+      {open && (
+        <div style={{ marginTop: 12, borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
+          {versions.slice(0, 10).map((v) => (
+            <div key={v.id} style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 700 }}>
+                    {new Date(v.at).toLocaleString()}
+                    {v.source === "revert" && <span style={{ color: C.orange }}> · reverted</span>}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: C.sub, marginTop: 2 }}>
+                    {(TEMPLATES.find((t) => t.key === v.plan.template) || {}).name || v.plan.template}
+                    {v.plan.days && v.plan.days.length ? ` · ${v.plan.days.length} authored day${v.plan.days.length !== 1 ? "s" : ""}` : ""}
+                  </div>
+                </div>
+                <button style={S.smallPill()} onClick={() => revertToVersion(v)}>Revert to this</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CoachCard({ data, persist }) {
   const [apiKey, setApiKey] = useState(localStorage.getItem(API_KEY_LS) || "");
   const [showSettings, setShowSettings] = useState(!localStorage.getItem(API_KEY_LS));
@@ -5508,6 +5674,10 @@ function CoachCard({ data, persist }) {
   const [pasted, setPasted] = useState("");
   const [copyMsg, setCopyMsg] = useState("");
   const [authoring, setAuthoring] = useState(false);
+  // Task 6, Section 3: holds { gated, diff, brief } between "parse the
+  // paste" and "user confirms" for an authored (days-bearing) plan only —
+  // never auto-applied. null means nothing is pending.
+  const [pendingPlan, setPendingPlan] = useState(null);
   const weeks = trainingWeeks(data.sessions || []);
   const UNLOCK_WEEKS = 3;
   const unlocked = weeks >= UNLOCK_WEEKS;
@@ -5523,8 +5693,12 @@ function CoachCard({ data, persist }) {
     setErr("");
     const profile = currentProfile();
     const briefTier = authoring ? "full" : "checkin";
-    persist({ ...data, goalProfile: profile, briefTier });
     const brief = buildCoachBrief(data, profile, briefTier);
+    // Section 3: the brief a version record cites as "the brief that
+    // produced it" is whatever was last actually copied/opened — stored
+    // here since applyPasted only ever sees Claude's REPLY, never the
+    // outgoing brief itself.
+    persist({ ...data, goalProfile: profile, briefTier, lastBrief: brief });
     try {
       await navigator.clipboard.writeText(brief);
       setCopyMsg("Copied — paste it into any Claude chat.");
@@ -5544,8 +5718,8 @@ function CoachCard({ data, persist }) {
     setErr("");
     const profile = currentProfile();
     const briefTier = authoring ? "full" : "checkin";
-    persist({ ...data, goalProfile: profile, briefTier });
     const brief = buildCoachBrief(data, profile, briefTier);
+    persist({ ...data, goalProfile: profile, briefTier, lastBrief: brief });
     const url = "https://claude.ai/new?q=" + encodeURIComponent(brief);
     if (url.length > 7500) {
       // Pre-existing race, surfaced by Task 5's much larger payload (the
@@ -5563,42 +5737,85 @@ function CoachCard({ data, persist }) {
     window.open(url, "_blank");
   };
 
+  // Task 6, Section 3: `days` merges per-dayKey rather than wholesale-
+  // replacing like `prescriptions` does — an earlier paste's authored day
+  // for a dayKey THIS paste doesn't mention stays in effect. Omission
+  // means no change, same "loud on a real change, silent on omission"
+  // principle sessionRules already follows (mergeSessionRules).
+  const mergeAuthoredDays = (existingDays, acceptedDays) => {
+    if (!acceptedDays || !acceptedDays.length) return existingDays;
+    const byKey = new Map((existingDays || []).map((d) => [d.dayKey, d]));
+    acceptedDays.forEach((d) => byKey.set(d.dayKey, d));
+    return [...byKey.values()];
+  };
+
+  const buildPlanUpdate = (gated) => ({
+    ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: todayISO(),
+    prescriptions: gated.prescriptions || undefined,
+    sessionRules: gated.sessionRules || undefined,
+    days: mergeAuthoredDays(data.plan && data.plan.days, gated.days),
+    splitPattern: gated.splitPattern !== undefined ? gated.splitPattern : (data.plan && data.plan.splitPattern),
+  });
+
+  // Shared by the immediate-apply path (no `days`, behaves exactly as
+  // before Task 6) and confirmPendingPlan (an authored plan, only
+  // reachable after the user has seen the diff and explicitly confirmed
+  // it — see pendingPlan below). Every applied plan gets a new,
+  // immutable planVersions entry regardless of which path it came
+  // through (Section 3: "every applied plan stored as a versioned
+  // record"), citing data.lastBrief as the originating brief.
+  const persistAppliedPlan = (gated, source) => {
+    const plan = buildPlanUpdate(gated);
+    persist({
+      ...data,
+      goalProfile: currentProfile(),
+      plan,
+      focus: gated.focus,
+      coachNote: {
+        assessment: "Applied from pasted Claude plan.", gates: gated.gates, calorieDelta: gated.calorieDelta,
+        prescriptionRejections: gated.prescriptionRejections || [], prescriptionNotes: gated.prescriptionNotes || [],
+        dayRejections: gated.dayRejections || [], dayNotes: gated.dayNotes || [],
+        at: new Date().toISOString(),
+      },
+      planVersions: pushPlanVersion(data, plan, data.lastBrief, source),
+    });
+  };
+
   const applyPasted = () => {
-    setErr(""); setApplied(false);
+    setErr(""); setApplied(false); setPendingPlan(null);
     try {
       const raw = extractPlanJson(pasted);
       const metrics = coachMetrics(data);
       const gated = applyCoachGates(raw, metrics, injuryProfile, data);
       setResult({ ...gated, assessment: gated.assessment || "Plan applied from pasted Claude reply.", pushback: gated.pushback || [], nutritionNote: gated.nutritionNote || "See Claude's reply for the reasoning.", nextCheckIn: gated.nextCheckIn || "Re-run a check-in in 2\u20134 weeks with fresh logs." });
-      persist({
-        ...data,
-        goalProfile: currentProfile(),
-        plan: {
-          ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: todayISO(),
-          // Gated, accepted prescriptions are stored as-is \u2014 merging them
-          // into what the generator actually renders per day is Task 2's
-          // wiring, not this gate pipeline's job.
-          prescriptions: gated.prescriptions || undefined,
-          // Already merged with whatever was stored before (applyCoachGates
-          // / mergeSessionRules) \u2014 wholesale-assigning gated.sessionRules
-          // here is correct, not a contradiction of the merge-not-replace
-          // design: gated.sessionRules IS the merge result, carried forward
-          // unchanged when this paste didn't touch it at all.
-          sessionRules: gated.sessionRules || undefined,
-        },
-        focus: gated.focus,
-        coachNote: {
-          assessment: "Applied from pasted Claude plan.", gates: gated.gates, calorieDelta: gated.calorieDelta,
-          prescriptionRejections: gated.prescriptionRejections || [], prescriptionNotes: gated.prescriptionNotes || [],
-          at: new Date().toISOString(),
-        },
-      });
+      if (Array.isArray(raw.days) && raw.days.length) {
+        // Task 6, Section 3: NEVER auto-apply an authored plan -- hold
+        // for explicit confirmation (diff shown below) instead of
+        // persisting immediately. Triggered by the RAW paste attempting
+        // day authorship at all, not just gated.days surviving — even a
+        // plan where every day got rejected must still show the user
+        // why, not silently fall through to the immediate-apply path
+        // below with the rejections unseen. A bare (no-days) paste keeps
+        // the pre-Task-6 immediate-apply behavior, unchanged, below.
+        setPendingPlan({ gated, diff: diffAuthoredPlan(gated.days, data) });
+        setPasted("");
+        return;
+      }
+      persistAppliedPlan(gated, "paste");
       setApplied(true);
       setPasted("");
     } catch (e) {
       setErr("Couldn't parse a plan from that — paste Claude's full reply (it ends with a json block).");
     }
   };
+
+  const confirmPendingPlan = () => {
+    if (!pendingPlan) return;
+    persistAppliedPlan(pendingPlan.gated, "paste");
+    setApplied(true);
+    setPendingPlan(null);
+  };
+  const discardPendingPlan = () => setPendingPlan(null);
 
   const saveKey = () => { localStorage.setItem(API_KEY_LS, apiKey.trim()); setShowSettings(false); setErr(""); };
 
@@ -5714,6 +5931,7 @@ function CoachCard({ data, persist }) {
         </>
       )}
       {err && <div style={{ color: C.red, fontSize: 13, marginTop: 8, lineHeight: 1.4 }}>{err}</div>}
+      <PendingPlanDiff pendingPlan={pendingPlan} onConfirm={confirmPendingPlan} onDiscard={discardPendingPlan} />
 
       {result && (
         <div style={{ marginTop: 14 }}>
@@ -5769,6 +5987,9 @@ function CoachCard({ data, persist }) {
           </div>
         </div>
       )}
+      <div style={{ marginTop: 12 }}>
+        <PlanHistoryCard data={data} persist={persist} />
+      </div>
     </div>
   );
 }
