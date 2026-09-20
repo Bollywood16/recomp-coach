@@ -210,10 +210,10 @@ stay tracked against their owning task rather than quietly dropped.
 | # | Test case | Depends on | Owning task | Status |
 |---|-----------|------------|-------------|--------|
 | 2 | 6 sets prescribed on a single movement with `maxSetsPerMovement: 4` → capped; overflow spawns a second movement from the same pool. | `sessionRules.maxSetsPerMovement` + pool-splitting logic | Task 2 | **Passed** — `scripts/check-pool-splitting.js`, see the Task 2 commit 4 section below |
-| 4 | A forbidden-attribute exercise arriving via `days` substitution → Gate 9/2 rejects, original retained. | `days` array schema + Gate 9 (thin wrapper reusing Gates 1-8 per exercise) | Task 6 | Not started |
-| 7 | `estimatedMin` understated by 30% → Gate 10 rejects the day, other days apply. | `days[].estimatedMin` + Gate 10 (recompute-and-compare) | Task 6 | Not started |
-| 8 | A day omitting the `specialize` group entirely → Gate 12 rejects. | `days` schema + focus-group tracking per day + Gate 12 | Task 6 | Not started |
-| 9 | A trim that would cut RDL / goblet squat / hip thrust below the maintain floor → Gate 13 rejects. | `days` schema + maintain-floor concept + Gate 13 | Task 6 | Not started |
+| 4 | A forbidden-attribute exercise arriving via `days` substitution → Gate 9/2 rejects, original retained. | `days` array schema + Gate 9 (thin wrapper reusing Gates 1-8 per exercise) | Task 6 | **Passed** — `scripts/check-deferred-tests-4-7-8-9.js` |
+| 7 | `estimatedMin` understated by 30% → Gate 10 rejects the day, other days apply. | `days[].estimatedMin` + Gate 10 (recompute-and-compare) | Task 6 | **Passed** — `scripts/check-deferred-tests-4-7-8-9.js` |
+| 8 | A day omitting the `specialize` group entirely → Gate 12 rejects. | `days` schema + focus-group tracking per day + Gate 12 | Task 6 | **Passed** — `scripts/check-deferred-tests-4-7-8-9.js` |
+| 9 | A trim that would cut RDL / goblet squat / hip thrust below the maintain floor → Gate 13 rejects. | `days` schema + maintain-floor concept + Gate 13 | Task 6 | **Passed** — `scripts/check-deferred-tests-4-7-8-9.js`, all three named lifts covered (hip thrust directly, RDL on balanced's lowerB, goblet squat via its shared pool with legpress on ufLower) |
 
 **Real-data note for row 9 (Fix 1, TASK-0-BACKUP-MIGRATION-REVIEW.txt):**
 Fix 1's time-budget trim now gives specialize/emphasize groups a real

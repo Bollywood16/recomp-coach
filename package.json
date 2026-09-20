@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Single-file React PWA, static-hosted on GitHub Pages.",
   "scripts": {
-    "test": "node scripts/check-write-isolation.js && node scripts/check-day-resolution.js && node scripts/check-session-rules.js && node scripts/check-prescription-reconciliation.js && node scripts/check-pool-splitting.js && node scripts/check-set-schemes.js && node scripts/check-set-scheme-migration.js && node scripts/check-set-scheme-logger.js && node scripts/check-trim-priority.js && node scripts/check-backup-import-migration.js && node scripts/check-injury-swap-warnings.js && node scripts/check-authored-days.js && node scripts/check-authored-day-gates.js && node scripts/check-plan-versioning.js"
+    "test": "node scripts/check-write-isolation.js && node scripts/check-day-resolution.js && node scripts/check-session-rules.js && node scripts/check-prescription-reconciliation.js && node scripts/check-pool-splitting.js && node scripts/check-set-schemes.js && node scripts/check-set-scheme-migration.js && node scripts/check-set-scheme-logger.js && node scripts/check-trim-priority.js && node scripts/check-backup-import-migration.js && node scripts/check-injury-swap-warnings.js && node scripts/check-authored-days.js && node scripts/check-authored-day-gates.js && node scripts/check-plan-versioning.js && node scripts/check-deferred-tests-4-7-8-9.js"
   },
   "devDependencies": {
     "@babel/core": "^8.0.1",

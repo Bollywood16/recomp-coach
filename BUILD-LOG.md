@@ -287,3 +287,46 @@ renders, "Revert to this" restores the prior plan and adds a second,
 `npm test`: 362 assertions total (343 prior + 19 new), all passing.
 
 ---
+
+## Section 4 — Deferred tests 4, 7, 8, 9 (commit pending)
+
+All four rows in DEFERRED-TESTS.md's deferred-test table that depend on
+`days`/Gates 9-13 now have dedicated, explicitly-labeled coverage in
+`scripts/check-deferred-tests-4-7-8-9.js`, mapped 1:1 to each row rather
+than left as implicit coverage inside `check-authored-day-gates.js`'s
+general gate tests (per the standing rule: an owning task isn't done
+until its deferred tests pass — wanted this unambiguous).
+
+- **Row 4** needed a real decision: no exercise in the 75-item library
+  carries `DEFAULT_INJURY_PROFILE`'s own forbidden attribute
+  (`loaded_deep_hip_flexion`) — same reason Task 4's original test suite
+  used a synthetic fixture for this exact gap. Same approach here: a
+  synthetic `movementConstraints.forbidden` naming a real exercise's
+  real attribute (`elbow_flexion`, which `ezcurl` really carries) — this
+  proves the FORBIDDEN-ATTRIBUTE branch of Gate 2 specifically, distinct
+  from the contraindications branch already covered elsewhere in
+  Section 2. "Original retained" is verified as a fact, not asserted by
+  comment: `resolveDayExercises` against the day BEFORE and AFTER the
+  rejected substitution attempt produces byte-identical output, because
+  the day was never written to `data.plan.days` (Section 1's fallback
+  mechanism does the retaining, not Gate 9 itself).
+- **Row 9** covers all three lifts the spec names, not just one: hip
+  thrust directly (ufLower), RDL on balanced's `lowerB` day, and goblet
+  squat via the fact that it shares a `pool` with legpress (the maintain
+  movement actually present on ufLower's template) — confirms Gate 13's
+  pool-equivalence mechanism protects goblet squat's pool the same way
+  it protects hip thrust's.
+
+Deliberately broke the forbidden-attribute check (Gate 2's `forbiddenHit`
+line) to confirm row 4's test is load-bearing, not trivially passing —
+caught immediately (crashed on the now-`undefined` rejection rather than
+a graceful assertion failure, but unambiguously signaled the break).
+Restored, diff-clean. Rows 7/8/9 reuse gate mechanisms already
+deliberately-broken-and-restored in Section 2's own test file, so no
+separate break pass for those three.
+
+DEFERRED-TESTS.md's table updated: all four rows now read **Passed**.
+
+`npm test`: 378 assertions total (362 prior + 16 new), all passing.
+
+---
