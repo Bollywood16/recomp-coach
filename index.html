@@ -2260,7 +2260,34 @@ function gate1eSchemeConsistency(prescription) {
    is destructured directly in the signature (not read off an opaque ctx
    blob) so this function stays visible to
    scripts/check-write-isolation.js's discovery scan, per Task 1's stated
-   convention. */
+   convention.
+
+   Fix 3 (2026-09-20): this same function also backs a SECOND surface — a
+   user's own exercise swap. The swap picker (ExerciseCard's alternates
+   list), a swapped-in exercise's persistent card warning, and the Injury
+   Profile card's summary list (contraindicatedInActiveProgram, below) all
+   call gate2Injury directly and get exactly this result — but none of
+   them reject on it. They warn: name the contraindication, never block
+   the selection, never auto-remove or auto-swap it back (the user
+   decides). This is a deliberate asymmetry, not an inconsistency for a
+   future edit to "fix" by hard-blocking swaps too:
+     - A pasted prescription is an LLM's proposal, evaluated with no human
+       in the loop between the proposal and the write — Gate 2 rejecting
+       it outright is Task 4's whole premise ("Claude proposes, the app
+       disposes, and neither decides what is medically safe").
+     - A swap is the user themself, in the room, deliberately choosing
+       their own exercise — not an LLM's guess. Hard-blocking it would be
+       the app overriding a person's real-time judgment about their own
+       body, on the strength of a tag that — per contraindicationSourceNote
+       below — is sometimes itself just an unverified guess. And per
+       TASK-0-BACKUP-MIGRATION-REVIEW.txt's real data: the goblet-tagged
+       squat this asymmetry was written against had +20% progress over 7
+       weeks with zero logged pain before the tag even existed — exactly
+       the kind of swap that can be working, that a hard block would have
+       silently undone.
+   gate2Injury itself never forks for this — one implementation, one
+   reject/reason payload, every call site. Only what happens AFTER the
+   call (reject-and-drop vs. warn-and-let-through) differs. */
 function gate2Injury(prescription, { injuryProfile }) {
   if (!injuryProfile || !injuryProfile.recoveringMode) return { reject: false };
   const ex = EX_BY_ID[prescription.exerciseId];
@@ -2294,6 +2321,86 @@ function gate2Injury(prescription, { injuryProfile }) {
     return { reject: true, gate: 2, reason: `"${ex.name}" is contraindicated for ${label}, which is active while recovering.` };
   }
   return { reject: false };
+}
+
+/* Fix 3, point 4: an exercise's `tagSource` (see EXERCISE_ATTRS' own
+   comment) records how confidently its WHOLE verdict — attributes,
+   romProfile, and contraindications together, one tagSource per exercise,
+   not one per field — was arrived at. "Tagged" is not the same claim as
+   "clinically verified," and the warning copy must say so honestly
+   rather than reading as a medical directive. goblet is
+   conservative_default: no in-app or clinical signal existed either way,
+   so the stricter guess was made rather than assuming safe — not a
+   judgment call by anyone qualified to make one.
+
+   Keyed on tagSource alone, not on which specific Gate 2 branch fired:
+   goblet's own romProfile.squatDepth ("below_parallel") is what actually
+   trips DEFAULT_INJURY_PROFILE's squat_depth limit before gate2Injury
+   ever reaches the contraindications check below it — but that romProfile
+   value came from the exact same conservative-default guess as its
+   contraindications tag, so gating this note on "did contraindications
+   specifically fire" would have silently dropped the disclosure for the
+   one real exercise (goblet) this was written for. Caught by
+   scripts/check-injury-swap-warnings.js against real data before this
+   shipped — see that file's history for the reject-reason that surfaced
+   it. "descriptive" (a mechanical fact, no verdict inference) and no
+   tagSource at all (the exercise doesn't carry one, or Gate 2's own
+   "untagged" reason already explains the unknown) both correctly return
+   null: nothing to disclose beyond what's already said.
+
+   Still deliberately NOT about the forbidden/limited THRESHOLD values
+   themselves (injuryProfile.movementConstraints, entered by the user in
+   Settings) — only about whether THIS EXERCISE's own tagged value is
+   confidently correct. Those are two different uncertainties; this note
+   only speaks to the second one.
+
+   One function, reused by the swap picker, the persistent card warning,
+   and the Injury Profile card's list — so the qualifier can't drift into
+   reading differently in three places. */
+const CONTRAINDICATION_SOURCE_NOTE = {
+  conservative_default: {
+    short: "unverified guess, not clinician-reviewed",
+    long: "an unverified guess, not clinical judgment — no signal existed either way when this was tagged, so the stricter assumption was made rather than assuming it's safe",
+  },
+  from_app_caution: {
+    short: "inferred from in-app notes, not clinician-reviewed",
+    long: "inferred from caution notes already in this app's exercise library, not a clinician's direct review",
+  },
+  clinician_reviewed: {
+    short: "clinician-reviewed",
+    long: "confirmed by the clinician managing this injury",
+  },
+};
+function contraindicationSourceNote(ex, variant) {
+  const source = ex && ex.tagSource;
+  if (!source || source === "descriptive") return null;
+  const n = CONTRAINDICATION_SOURCE_NOTE[source];
+  return n ? n[variant || "long"] : null;
+}
+
+/* Fix 3, point (d): every contraindicated exercise currently sitting in
+   the active program (generator + swaps + bonus + reconciled
+   prescriptions — the exact same resolveDayExercises every render path
+   already agrees on), in one place, rather than only discoverable by
+   opening each day's cards one at a time. Read-only: this never removes
+   or changes anything (point c) — InjuryProfileCard just lists what
+   gate2Injury, run in warn mode, already found. Deduped by exerciseId
+   since the same swap can appear on more than one day. Empty while not
+   recoveringMode, matching gate2Injury's own short-circuit — there's
+   nothing to warn about when the gate itself is off. */
+function contraindicatedInActiveProgram(data) {
+  const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  if (!injuryProfile.recoveringMode) return [];
+  const program = getProgram(data);
+  const seen = new Map();
+  program.forEach((day) => {
+    resolveDayExercises(day, data).forEach(({ ex }) => {
+      if (seen.has(ex.id)) return;
+      const g2 = gate2Injury({ exerciseId: ex.id }, { injuryProfile });
+      if (g2.reject) seen.set(ex.id, { ex, reason: g2.reason, sourceNote: contraindicationSourceNote(ex, "long") });
+    });
+  });
+  return [...seen.values()];
 }
 
 /* Gate 3 — load sanity. Falls back to recommend()'s own safe-load
@@ -3449,6 +3556,10 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const [pain, setPain] = useState("");
   const bw = currentBodyweight(data);
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
+  // Fix 3 — Gate 2, run in WARN mode against the exercise currently
+  // rendered (post-swap). Same gate2Injury call the reject path uses; see
+  // its comment for why this never blocks the card or reverts the swap.
+  const contraGate = gate2Injury({ exerciseId: ex.id }, { injuryProfile });
 
   useEffect(() => {
     if (timer === null || timer <= 0) return;
@@ -3542,6 +3653,9 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
             {isBonus && <span style={S.tag("#EAF3FF", C.blue)}>Focus bonus</span>}
             {!isBonus && setDelta > 0 && <span style={S.tag("#E8F8EE", C.green)}>+{setDelta} set{setDelta > 1 ? "s" : ""}</span>}
             {!isBonus && setDelta < 0 && <span style={S.tag("#F0F0F3", C.sub)}>maintain</span>}
+            {/* Fix 3, point (b): visible collapsed too, every time this
+                card appears in the day — not only after opening it. */}
+            {contraGate.reject && <span style={S.tag("#FDECEC", C.red)}>⚠ Contraindicated</span>}
           </div>
           <div style={{ color: C.sub, fontSize: 13, marginTop: 3 }}>
             {ex.sets} × {ex.repMin}–{ex.repMax} at {rec.weight === 0 ? "BW" : `${rec.weight} lb${ex.perHand ? "/hand" : ""}`} · rest {rest.label}
@@ -3556,6 +3670,27 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
       {open && (
         <div style={{ marginTop: 14, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
           <div style={{ color: C.sub, fontSize: 13, lineHeight: 1.45, marginBottom: 10 }}>{rec.note}</div>
+
+          {/* Fix 3, point (b): persistent, not a one-time dismissible
+              notice — renders every time this card is opened for as long
+              as the contraindication is active, same pattern as
+              ClinicianReviewNotice / PainEscalationNotice. Point (c):
+              informational only, no action buttons here — nothing removes
+              or changes the swap. */}
+          {contraGate.reject && (() => {
+            const note = contraindicationSourceNote(ex, "long");
+            return (
+              <div style={{ ...S.card, background: "#FDECEC", display: "flex", gap: 10, alignItems: "flex-start", margin: "0 0 12px" }}>
+                <Flame size={18} color={C.red} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div style={{ fontSize: 12.5, color: "#3A3A3C", lineHeight: 1.45 }}>
+                  <b style={{ color: C.red }}>Contraindicated while recovering:</b> {contraGate.reason}
+                  {note ? ` This flag is ${note}.` : ""}
+                  {" "}It won't be swapped or removed automatically — change it yourself under Swap below if you'd
+                  rather not use it, or confirm with your clinician that it's fine as-is.
+                </div>
+              </div>
+            );
+          })()}
 
           {lastSess && (
             <div style={{ background: "#F7F7FA", borderRadius: 12, padding: "10px 12px", marginBottom: 12 }}>
@@ -3680,18 +3815,27 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
               <div style={{ fontSize: 12, fontWeight: 700, color: C.sub, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 8 }}>
                 {CAT_NAMES[slot.cat] || "Alternates"}
               </div>
+              {/* Fix 3, point (a): flagged-but-selectable, not filtered out.
+                  Filtering would hide the option and the reason together —
+                  prevention here means surfacing the contraindication AT
+                  selection time, not deciding for the user which exercises
+                  they're allowed to see. Same gate2Injury call as the
+                  reject path (see its comment); the button's onClick below
+                  is untouched — nothing here blocks the click. */}
               {alternates.map((alt) => {
                 const preview = recommend(
                   { ...alt, sets: slot.sets, repMin: slot.repMin, repMax: slot.repMax },
                   data.sessions
                 );
+                const altGate = gate2Injury({ exerciseId: alt.id }, { injuryProfile });
+                const altNote = altGate.reject ? contraindicationSourceNote(alt, "short") : null;
                 return (
                   <button
                     key={alt.id}
                     onClick={() => setSwap(alt.isOriginal ? null : alt.id)}
                     style={{
                       ...font, display: "flex", justifyContent: "space-between", alignItems: "center",
-                      width: "100%", background: "#F7F7FA", border: `1px solid ${C.line}`,
+                      width: "100%", background: "#F7F7FA", border: `1px solid ${altGate.reject ? C.red : C.line}`,
                       borderRadius: 12, padding: "10px 12px", marginBottom: 8, cursor: "pointer", textAlign: "left",
                     }}
                   >
@@ -3704,6 +3848,11 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                       )}
                       {alt.caution && (
                         <div style={{ fontSize: 12, color: C.orange, marginTop: 3 }}>{alt.caution}</div>
+                      )}
+                      {altGate.reject && (
+                        <div style={{ fontSize: 12, color: C.red, marginTop: 3, lineHeight: 1.4 }}>
+                          ⚠ {altGate.reason}{altNote ? ` (${altNote})` : ""}
+                        </div>
                       )}
                     </div>
                     <div style={{ color: C.blue, fontWeight: 700, fontSize: 13, whiteSpace: "nowrap", marginLeft: 8 }}>
@@ -4169,6 +4318,7 @@ function InjuryProfileCard({ data, persist }) {
   const mc = profile.movementConstraints || DEFAULT_INJURY_PROFILE.movementConstraints;
   const reportingGaps = painReportingGaps(data.sessions, profile);
   const unknownIds = unknownInjuryIds(profile);
+  const contraindicated = contraindicatedInActiveProgram(data);
 
   return (
     <div style={{ ...S.card, background: "#F7F7FA" }}>
@@ -4289,6 +4439,30 @@ function InjuryProfileCard({ data, persist }) {
               they're set to the values Gate 2 (Task 4) will enforce.
             </div>
           </div>
+
+          {/* Fix 3, point (d): reviewable in one place, rather than only
+              discoverable by opening each day's cards one at a time.
+              Read-only — see contraindicatedInActiveProgram's comment;
+              nothing here removes or changes anything (point c). */}
+          {contraindicated.length > 0 && (
+            <div style={{ marginTop: 18 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.sub, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 8 }}>
+                Contraindicated in your current program
+              </div>
+              {contraindicated.map(({ ex, reason, sourceNote }) => (
+                <div key={ex.id} style={{ background: "#FDECEC", borderRadius: 12, padding: "10px 12px", marginBottom: 8 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 700, color: C.red }}>{ex.name}</div>
+                  <div style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>
+                    {reason}{sourceNote ? ` This flag is ${sourceNote}.` : ""}
+                  </div>
+                </div>
+              ))}
+              <div style={{ fontSize: 11.5, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
+                Nothing here is swapped out automatically. Review and change it from its own card on the
+                Workout tab if you want to.
+              </div>
+            </div>
+          )}
 
           {history.length > 0 && (
             <div style={{ marginTop: 16 }}>

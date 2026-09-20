@@ -1,4 +1,4 @@
-# Handoff note (updated after Fix 2, 2026-09-20 session)
+# Handoff note (updated after Fix 3, 2026-09-20 session)
 
 **Done:** Tasks 0 (injuryProfile as protected, structured data), 1
 (exercise attribute tagging, 75/75 coverage), 2 (day-resolution
@@ -11,23 +11,21 @@ Review files in the repo root (`TASK-N-*.txt`) are the detailed record per
 task; this note is just the pointer.
 
 Also done: **Fix 1** (trim priority weights by emphasis level, floored per
-group — see `FIX-1-TRIM-PRIORITY-SUMMARY.txt` and commit `aed617b`) and
+group — see `FIX-1-TRIM-PRIORITY-SUMMARY.txt` and commit `aed617b`),
 **Fix 2** (one shared `migrateInjuryAndGobletData` function for both the
 boot path and `BackupCard.importData` — see
-`FIX-2-BACKUP-IMPORT-MIGRATION-SUMMARY.txt`), two of three fixes that came
-out of testing Task 0-3's work against a real pre-Task-0 backup export
-rather than seeded test data (full findings in
+`FIX-2-BACKUP-IMPORT-MIGRATION-SUMMARY.txt`), and **Fix 3** (Gate 2 vs.
+user swaps — warn, don't block; swap picker, persistent card warning,
+Injury Profile card summary, all sharing one gate2Injury call with
+tagSource-honest copy — see `FIX-3-GATE2-SWAP-WARNINGS-SUMMARY.txt`), all
+three fixes that came out of testing Task 0-3's work against a real
+pre-Task-0 backup export rather than seeded test data (full findings in
 `TASK-0-BACKUP-MIGRATION-REVIEW.txt`).
 
 **Next, in order:**
-- **Fix 3** — Gate 2 vs. user swaps: a swapped-in exercise carrying a
-  contraindication is never gated or flagged today. Scoped as warn, don't
-  block (the swap picker flags contraindicated alternates at selection
-  time; an already-swapped contraindicated exercise gets a persistent
-  card warning naming the contraindication; logged to the Injury Profile
-  card; never auto-removed). Not started.
 - **Task 6** and **Task 7** — not started; scope not yet reviewed against
-  the real-data findings above.
+  the real-data findings above (all three fixes from that review are now
+  done).
 
 **Task 2 (done)** (design in `TASK-2-RECONCILIATION-PROPOSAL.txt`,
 reviewed and approved before implementation, per that file's full record):
