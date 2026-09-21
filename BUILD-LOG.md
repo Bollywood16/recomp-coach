@@ -598,3 +598,193 @@ decision, same category as Section 5's equivalent note.
 `npm test`: 468 assertions total (431 prior + 37 new), all passing.
 
 ---
+
+## Section 8 — Full real-data verification (all four upperFocus days)
+
+No code changes. Rendered every day via the exact functions every real
+render path calls (`resolveDayExercises`, `fitDayToTime`, `recommend`,
+`dayFocusSummary`, `weeklySetsByGroup`, `contraindicatedInActiveProgram`),
+against `recomp-coach-backup-2026-09-06.json`, loaded through
+`scripts/lib/load-app.js` the same way every other real-data check in this
+run has.
+
+**Migration run first, boot-path-accurate — this matters and changes a
+downstream number.** Earlier real-data checks in this run (Section 7's
+`check-coach-brief-contract.js`, and my own Test C script) set
+`injuryProfile` directly to `cloneInjuryProfileDefaults()` and left
+`sessions` untouched — correct for what those checks were verifying, but
+not what the live app actually does on boot. `migrateInjuryAndGobletData`
+run for real against this export: `migrated: true`
+(`source.injuryProfile` is absent, `source.goalProfile` exists), AND —
+separately — `gobletBoxSquatMigration` fires too: the export's 8 sessions
+logged under `goblet` get renamed to `boxsquat` (defaulted, `resolved:
+false`), because there's no prior migration record. Practical effect: in
+the actual live app, `goblet` shows **zero** training history, not the 8
+weeks/+18.2% trend Test C's brief displayed (Test C's own methodology
+matched `check-coach-brief-contract.js`'s existing precedent exactly, so
+this isn't a new gap introduced there — it's a real, now-documented
+difference between "brief built the way Section 7's tests build it" and
+"brief built the way the live app would after a real boot"). Doesn't
+change Test C's finding — the tag-trust reasoning it tested is independent
+of which exercise happens to have logged history — but it means a live
+re-run against this same account today would show goblet as a *fresh*
+pick with an *unresolved* goblet/box-squat prompt still open, not an
+established favorite. Flagged here rather than silently left inconsistent.
+
+**Every day, rendered (`plan.sessionMin`: 60, `upperFocus`,
+`currentFocus`: shoulders emphasize / arms specialize / legs maintain /
+chest, back, core normal):**
+
+**ufUpperA "Upper A"** — trimmed 6 sets, dropped none, 59 min vs. 60
+budget. Order: Incline DB Curl(4), Cable Triceps Pressdown(4), Overhead
+Cable Triceps Ext./bonus(3→2, trimmed), Seated DB Shoulder Press(4),
+Cable Lateral Raise-high-rep/bonus(3→1, trimmed), Barbell Bench(3→2,
+trimmed), Chest-Supported Row(3→2, trimmed), Lat Pulldown(3→2, trimmed).
+Post-fit: arms 10, shoulders 5, chest 2, back 4. No caps/spawns (no
+movement over the 4-set cap here). No warnings fire for this day
+specifically (contraindication/escalation are program-wide, reported
+once below).
+
+**ufLower "Lower"** — trimmed 0, dropped none, 45 min vs. 60 (legs is
+maintain-tier — smallest base volume, never needed trimming). Order (with
+the real user's own swaps: legpress→goblet, pinsquat→legpress,
+cablecrunch→kneeraise): Hanging Knee Raise(3, swapped from cablecrunch,
+load 128 lb "Reduce" — real rep-range overshoot on a bodyweight-loaded
+movement, unrelated to injury gating), Goblet Squat(2, swapped from
+legpress, load 40 "Start" — zero history post-migration, see above),
+Leg Press(2, swapped from pinsquat, load 170 "Add weight"), Seated Leg
+Curl(2), Hip Thrust(2, "Back-off sets" tag), Standing Calf Raise(2). Post-
+fit: legs 10, core 3.
+
+**ufUpperB "Upper B"** — trimmed 6, dropped none, 59 min vs. 60. Order:
+Hammer Curl(4), Preacher/Cable Curl-bonus(3), Overhead Press(4), Lateral
+Raise(4→3, trimmed), Reverse Pec-Deck-bonus(3→1, trimmed), Pull-Up(3→2,
+trimmed), Incline DB Press(3→2, trimmed), Seated Cable Row(3→2, trimmed).
+Post-fit: arms 7, shoulders 8, back 4, chest 2.
+
+**ufArms "Delts & Arms"** — trimmed 8, dropped none, 60 min vs. 60
+(fits exactly). `maxSetsNotes`: EZ-Bar Curl capped 6→4, spawned Incline DB
+Curl for the 2-set overflow; EZ-Bar Skullcrusher capped 6→4, spawned
+Overhead DB Triceps Extension for the 2-set overflow. Post-fit order and
+sets: EZ-Bar Curl(4), EZ-Bar Skullcrusher(4), Overhead Cable Triceps
+Ext.(4), Cross-Body Hammer Curl-bonus(3→1, trimmed), Machine Shoulder
+Press(4), Cable Lateral Raise(4→3, trimmed), Lateral Raise-swap(4→1,
+trimmed), Incline DB Curl-spawned(2→1, trimmed), Overhead DB Triceps
+Ext.-spawned(2→1, trimmed). Post-fit: arms 15, shoulders 8. Numbers are
+byte-identical to Section 6's own real-data re-run — reproducible, not a
+one-off.
+
+**Weekly sets by group, all four days, post-trim**: arms 32, shoulders
+21, chest 4, back 8, core 3, legs 10. `weeklySetsByGroup(data)` and a
+manual per-day accumulation agree exactly — one predicate, not two that
+could disagree.
+
+**Warning surfaces, checked once, program-wide:**
+- **Contraindication badge** (`contraindicatedInActiveProgram`): fires
+  for `goblet` — `"Goblet Squat (no box, self-limited)"'s squatDepth
+  (below_parallel) exceeds the above_parallel limit while recovering`,
+  source note "an unverified guess, not clinical judgment." This is the
+  user's own real `legpress→goblet` swap (Fix 3's warn-don't-block path —
+  confirmed still warning, not blocking, exactly as designed). Per the
+  comment directly on `gate2Injury`, the `romProfile.squatDepth` limit
+  check fires before the `contraindications: ["hip_labrum"]` check ever
+  runs — both trace back to the same conservative-default tag, so the
+  source-note disclosure is keyed on `tagSource` rather than which branch
+  fired, deliberately, per that comment's own history.
+- **Clinician review notice**: fires — `clinicianReviewed: false` in both
+  the raw export and after migration (never set true anywhere in this
+  data). Persistent, non-dismissable, as designed.
+- **Pain escalation**: none. Zero of 168 sessions (before or after
+  migration — migration doesn't touch `pain`/`painRetro`) carry any pain
+  value. Confirmed across every cat under a frozen copy of the OLD
+  cat-based grouping AND every pattern under the NEW `painPattern`
+  grouping — both empty. Nothing to migrate for this account; see the
+  taxonomy section below for what that comparison actually verifies.
+- **Stale prescriptions**: none — `data.plan.prescriptions` doesn't exist
+  in this export (`plan` only has `template`/`sessionMin`/
+  `templateSince`), so `StalePrescriptionsNotice` short-circuits on an
+  empty array before it would even look for a mismatched dayKey.
+- **Migration notices**: both fire, as detailed above —
+  `injuryProfileMigration` ("Injury gating has been turned on") and
+  `gobletBoxSquatMigration` (unresolved, defaulted to boxsquat,
+  `GobletBoxSquatMigrationPrompt` would show).
+
+**Complaint-by-complaint, final pass (baseline: `TASK-0-BACKUP-
+MIGRATION-REVIEW.txt`'s original review, pre-Fix-1/pre-Section-6):**
+
+1. **"6 sets stacked on EZ-Bar Curl" — FIXED.** Still capped at 4, still
+   spawns Incline DB Curl for the overflow (Task 2 commit 4, unchanged
+   by anything in this run, re-confirmed against the same real data).
+
+2. **"Arms sequenced last, behind 12 delt sets" — FIXED (Section 6).**
+   Directly confirmed above: order is EZ-Bar Curl, EZ-Bar Skullcrusher,
+   Overhead Cable Triceps Ext., Cross-Body Hammer Curl — all four arm
+   movements — THEN Machine Shoulder Press, Cable Lateral Raise, Lateral
+   Raise. Arms sequences entirely before shoulders now, reversing the
+   original order.
+
+3. **"Biceps 7 vs triceps 4" — STILL PRESENT, now in the OPPOSITE
+   direction, and this is a new finding from this section, not previously
+   reported.** Current real numbers on `ufArms`: biceps (EZ-Bar Curl 4 +
+   Cross-Body Hammer Curl 1 + spawned Incline DB Curl 1) = **6**; triceps
+   (EZ-Bar Skullcrusher 4 + Overhead Cable Triceps Ext. 4 + spawned
+   Overhead DB Triceps Ext. 1) = **9**. Fix 1 alone (before Section 6)
+   produced 6 vs 5 — near parity, per `DEFERRED-TESTS.md`'s own "Fix 1
+   follow-ups" note, which explicitly warned this ratio was incidental
+   and "don't rely on it staying close as inputs change." Section 6's
+   reordering is exactly the kind of input change that note warned
+   about: it didn't touch the trim COUNT (8 sets trimmed, same as
+   before), but changing item order changed `fitDayToTime`'s tie-break
+   (`items.indexOf(b) - items.indexOf(a)` on equal `trimPriority`), which
+   changed WHICH low-priority items absorbed the cut. Nothing in the
+   codebase targets this ratio — the deferred note's warning has now
+   concretely played out, in the direction it didn't specifically
+   predict. Not a regression to fix under this run's scope (never a
+   designed property to begin with), but real and worth a maintainer's
+   eyes if arm-group balance ever becomes a stated requirement.
+
+4. **"Cable lateral raise at 12.5 lb despite 50% rep decay" — still does
+   not reproduce against this data, same conclusion as the original
+   review, re-confirmed.** The only logged `cablelat` session
+   (2026-09-04) is 4×20 @ 10 lb — zero decay, every set at the top of the
+   15-20 rep range. `recommend()`'s "Add weight" to 12.5 lb is exactly
+   correct for what's actually logged; the decay-detection branch this
+   complaint describes exists and is unit-tested (Task 4's Gate 3 suite)
+   but has no matching session in this export to exercise it end-to-end.
+
+5. **"60-min trim cutting triceps and hammer curl to 1 set each while
+   protecting all delt sets" — FIXED (Fix 1, re-confirmed here; Section 6
+   didn't change this part).** Shoulders no longer keep everything: Cable
+   Lateral Raise (4→3) and Lateral Raise (4→1) both take real cuts now —
+   shoulders' post-fit total (8) sits exactly at its emphasize-tier 65%
+   floor (12 pre-fit × 0.65 = 7.8 → 8), while arms' post-fit total (15)
+   sits above its specialize-tier 75% floor (19 × 0.75 = 14.25 → 14) with
+   one more trim point technically available. Both groups absorbed 4 of
+   the 8 trimmed sets each — the specific bug (arms punished, shoulders
+   fully protected, inverting the user's own emphasize<specialize
+   settings) is gone. Low-priority bonus/spawned items in BOTH groups
+   still get cut hardest, which is the intended behavior, not a
+   remaining version of the bug.
+
+**Pain-pattern taxonomy migration, against real data (Section 5's design,
+verified here rather than there):** replayed the frozen pre-Section-5
+cat-based grouping across every `cat` present in `ALL_KNOWN`, and the new
+`painPattern` grouping across all 11 `PAIN_PATTERNS`, both against this
+account's real (migrated) 168-session history. **Both come back empty —
+zero escalating cats under the old grouping, zero escalating patterns
+under the new one.** This account has never logged a `pain` or
+`painRetro` value on any of its 168 sessions (confirmed directly, not
+just inferred from the escalation result being empty), so there is
+nothing for either grouping scheme to disagree about on this specific
+account — consistent with Section 5's own real-data note. Nothing lost,
+nothing invented: an empty set maps to an empty set. The cross-cat gap
+Section 5 fixed (a hip-labral pattern split across `squat`+`hinge` cats
+never reaching the 2-of-4 trigger under old grouping) remains verified
+only against the synthetic fixture in
+`scripts/check-pain-pattern-migration.js` — this account has no real
+session history that would exercise it either way.
+
+No `npm test` change — this section is read-only verification, no code or
+test file touched.
+
+---
