@@ -788,3 +788,110 @@ No `npm test` change — this section is read-only verification, no code or
 test file touched.
 
 ---
+
+## Section 9 — Pre-ship audit
+
+**`npm test`: green, 18/18 scripts, exit 0.** Reported count needed a
+real check rather than trusting this log's own running arithmetic:
+summing every script's own printed `N assertions` line gives **449**
+across the 17 scripts that report a number that way.
+`check-write-isolation.js` (the 18th) is structural, not counter-based —
+it asserts 5 distinct things (no module-scope injuryProfile setter, every
+discovered `injuryProfile`-reading function is on the reviewed allowlist,
+none of them write it, `applyCoachGates` never spreads `rec`, and
+`injuryProfile` is never in `KNOWN_PLAN_KEYS`) — and has never printed a
+number, in this run or before it. **Bookkeeping note, not a functional
+problem**: this log's own prior running totals (Section 7 said "468") and
+this fresh sum (449) don't match. Traced it: per-script counts aren't
+static — several scripts got MORE assertions added in a LATER section
+than the one that first "banked" a running total against them (e.g.
+`check-trim-priority.js` was touched again in Section 6 after Section
+2's total had already counted it), and the "prior" figures were never
+retroactively recomputed against that. Every individual script's count
+and pass/fail status in this log is accurate at the section that reported
+it; the cumulative addition chain across sections isn't reliable as a
+running total and shouldn't be trusted as one going forward. 449 is the
+number to cite for this branch as it stands.
+
+**`.gitignore` coverage for `recomp-coach-backup-*.json`, checked across
+the WHOLE branch history, not just the current tip**: `git log --all
+--diff-filter=A --name-only -- '*recomp-coach-backup*'` returns nothing
+— that filename pattern has never been added in any commit, on any
+branch, ever. The explicit `recomp-coach-backup-*.json` rule was added in
+commit `6bd9722` (2026-09-06 01:23 UTC); the actual
+`recomp-coach-backup-2026-09-06.json` file on disk was created ~40
+minutes earlier (00:44 UTC same day) — a real window where the file
+existed locally without that specific gitignore line protecting it — but
+zero commits landed in that window, so nothing was ever at risk in
+practice. Current state and every historical commit agree: never
+tracked.
+
+**Grepped the full `main...HEAD` branch diff (11,881 diff lines, 30
+files) for anything that shouldn't ship:**
+- `console.log`/`console.error`/`console.warn` — every hit outside
+  `index.html` is inside a `scripts/*.js` node test file (expected: dev
+  tooling reporting pass/fail to a terminal, never shipped to a
+  browser). The two hits INSIDE `index.html` are both permanent,
+  intentional data-integrity self-checks that run once at module load
+  (`assertDuplicateDeclarationsMatch()`, the `INJURY_VOCABULARY`
+  cross-reference) and only log if the exercise library's own data is
+  internally inconsistent — silent in normal operation, not debug
+  scaffolding left behind.
+- No `debugger;`, no `TODO`/`FIXME`/`XXX` markers, no
+  `window.__RECOMP_TEST_HOOK__` (DEFERRED-TESTS.md floated this as an
+  option for Task 6 — never taken; `scripts/lib/load-app.js`'s sandbox
+  approach was used instead, which touches zero lines of `index.html`).
+- `localhost:8811` / `/tmp/pwtest` / `/tmp/httpserver.log` hits are all
+  inside `.claude/skills/run-recomp-coach/SKILL.md` — a Claude Code
+  dev-tooling runbook (how to spin up local Playwright verification),
+  not app code, never served to a user.
+- No API keys, tokens, or secrets of any kind — the two `password`/
+  `apiKey` hits are the (pre-existing, unchanged) Supabase-config input
+  field and the `askCoachLLM` parameter name, not a literal credential.
+- `package-lock.json` is a legitimate new file on this branch (needed
+  for reproducible `npm test`), not an accidental commit.
+
+**User-visible changes a returning user notices, phone-readable:**
+
+On next open (in order of what they'd actually see first):
+- A one-time banner: "Injury gating has been turned on."
+- If they've ever logged a Goblet Squat: a one-time prompt asking
+  whether those old sessions were Goblet Squat or Box Squat (the two
+  used to share one id — now split).
+- A new, persistent "confirm your injuries were clinician-reviewed"
+  notice — stays until they tap to confirm, doesn't block anything.
+- If any of their current swaps are flagged risky for their injuries: a
+  new warning card naming which one and why (doesn't remove the swap,
+  just warns).
+
+Elsewhere, once they look:
+- Some workout days may list exercises in a different order — whichever
+  muscle group is set to Specialize/Emphasize now leads, instead of
+  whatever order the template happened to list first.
+- Any single movement that used to pile up 5-6 sets now caps at 4, with
+  a second (new) exercise appearing to cover the rest.
+- Logging a set now offers optional back-off/drop-set structure, not
+  just one flat number.
+- The coach plan screen can show a review-and-confirm step with a
+  before/after diff before anything actually changes, plus a plan
+  history list with one-tap revert.
+- "Copy coach prompt" produces a longer, more detailed prompt than
+  before (more so on the full/paid tier than the free check-in tier).
+
+**Rollback procedure**: written into `DEFERRED-TESTS.md` (phone-followable
+exact commands, both the safe `git revert` path and a documented
+emergency force-push alternative). **Handoff note**: updated in
+`DEFERRED-TESTS.md` — Tasks 0-7 all done, known limitations listed,
+nothing left queued.
+
+**Untracked docs cleanup**: the 13 untracked `TASK-N-*.txt`/
+`RECOMP-COACH-*` files are the same kind of build documentation as the
+already-committed `FIX-2-*`/`FIX-3-*`/`TASK-2-*`/`TASK-3-*` files (and
+`HANDOFF.md` itself already points at them as "the detailed record per
+task") — committed as build documentation in the next commit, for
+consistency, rather than gitignored.
+
+Still true after this section: **nothing has been merged to `main`, and
+nothing in this session touched `main` or pushed anywhere.**
+
+---

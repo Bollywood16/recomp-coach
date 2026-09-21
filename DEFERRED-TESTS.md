@@ -1,14 +1,22 @@
-# Handoff note (updated after Fix 3, 2026-09-20 session)
+# Handoff note (updated after Section 9, 2026-09-21 session — pre-merge)
 
-**Done:** Tasks 0 (injuryProfile as protected, structured data), 1
-(exercise attribute tagging, 75/75 coverage), 2 (day-resolution
-consolidation, sessionRules wiring, prescription reconciliation,
-maxSetsPerMovement + pool-splitting), 3 (set schemes — back-off and drop
-sets, data model through logger UI), 4 (safety gates 1-8), 5 (coach brief
-export — tiered checkin/full payload, checkin-scope enforcement, uncapped
-injury/pain data). All signed off, all committed on `task-0-injury-profile`.
-Review files in the repo root (`TASK-N-*.txt`) are the detailed record per
-task; this note is just the pointer.
+**Done, all of it:** Tasks 0-7, all signed off, all committed on
+`task-0-injury-profile`, NOT YET MERGED to `main`. Task 0 (injuryProfile
+as protected, structured data), 1 (exercise attribute tagging, 75/75
+coverage), 2 (day-resolution consolidation, sessionRules wiring,
+prescription reconciliation, maxSetsPerMovement + pool-splitting), 3 (set
+schemes — back-off and drop sets, data model through logger UI), 4
+(safety gates 1-8), 5 (coach brief export — tiered checkin/full payload,
+checkin-scope enforcement, uncapped injury/pain data), 6 (authored `days`
+schema/persistence/gates 9-13, plan versioning + diff-and-confirm +
+revert, deferred tests 4/7/8/9, pain-pattern taxonomy, day ordering by
+emphasis + `sessionRules.trimPriority`), 7 (coach framing rewrite,
+`<program_days>`/`<days_contract>` grounding, two live negative-control
+tests against a fresh model). Review files in the repo root
+(`TASK-N-*.txt`, now committed as build documentation rather than left
+untracked — see the docs-cleanup commit) are the detailed record per
+task; `BUILD-LOG.md` is the continuous run's own day-by-day record for
+Sections 1-9; this note is just the pointer.
 
 Also done: **Fix 1** (trim priority weights by emphasis level, floored per
 group — see `FIX-1-TRIM-PRIORITY-SUMMARY.txt` and commit `aed617b`),
@@ -22,10 +30,29 @@ three fixes that came out of testing Task 0-3's work against a real
 pre-Task-0 backup export rather than seeded test data (full findings in
 `TASK-0-BACKUP-MIGRATION-REVIEW.txt`).
 
-**Next, in order:**
-- **Task 6** and **Task 7** — not started; scope not yet reviewed against
-  the real-data findings above (all three fixes from that review are now
-  done).
+**Known limitations, carried forward, not fixed in this run (see
+`BUILD-LOG.md` Section 8 for the concrete real-data numbers behind the
+first one):**
+- Biceps/triceps balance on the Delts & Arms day is NOT a designed
+  property and has now drifted twice (7v4 originally → 6v5 under Fix 1
+  alone → 6v9 under Fix 1 + Section 6's reordering). Nothing in the
+  codebase targets this ratio; don't assume it stays close.
+- `sessionRules.orderByFocus` is accepted as a known plan key but still
+  unwired — decorative today, same status as before Section 6.
+- Pain-pattern taxonomy's cross-cat fix (Section 5) is verified only
+  against a synthetic fixture — this specific real account has never
+  logged a pain value, so there's no real session history to confirm it
+  against in production.
+- `splitPattern` (Task 6) is stored and echoed back but not enforced
+  against anything — descriptive only, by design, not a gap.
+
+**Next, in order:** nothing — Tasks 0-7 and Sections 1-9 of this run are
+complete. What's left is entirely process, not build work: review this
+branch, merge to `main` when ready (see `DEFERRED-TESTS.md`'s own
+rollback procedure below for what to do if something ships broken), and
+decide whether the real account's still-unresolved
+`gobletBoxSquatMigration` prompt (see BUILD-LOG.md Section 8) needs
+resolving before or after that first real-account boot on the new code.
 
 **Task 2 (done)** (design in `TASK-2-RECONCILIATION-PROPOSAL.txt`,
 reviewed and approved before implementation, per that file's full record):
@@ -373,3 +400,64 @@ explicitly-named test hook (`window.__RECOMP_TEST_HOOK__`) assigned only
 when a query param is present — and if the hook route is taken,
 `check-write-isolation.js` must assert it provides no write path to
 `injuryProfile`.
+
+## Rollback procedure (written for a phone, pre-Section-9-merge)
+
+This app has no build step and no GitHub Actions workflow — it's a single
+`index.html`, static-hosted on GitHub Pages, served directly from
+whatever `main` currently points to. There is no separate "redeploy"
+step: pushing to `main` IS the deploy. Pages picks up the new commit
+within roughly a minute on its own. (One thing to verify once, not
+knowable from the repo files alone: Settings → Pages → confirm the
+source is set to the `main` branch, root — if it's actually a
+`gh-pages` branch or a `/docs` folder, substitute that below.)
+
+**Before merging this branch**, `main`'s current tip is commit
+`61f26a5` ("v14 workout features..."). That's the exact commit to roll
+back to if something ships broken. Copy that SHA somewhere off-repo
+too (a notes app) in case you're rolling back from a phone with no
+other terminal history to grep.
+
+**To roll back after merging (safe — adds a new commit, never rewrites
+history, safe to do from a phone with just git + push access):**
+
+```
+git checkout main
+git pull
+git revert --no-edit <bad-commit-or-merge-SHA>
+git push
+```
+
+Replace `<bad-commit-or-merge-SHA>` with whatever landed this branch —
+`git log main --oneline -5` on your phone will show it as the newest
+commit on top of `61f26a5`. If it was a normal merge commit (two
+parents), `git revert` will ask which parent to keep; add `-m 1` to
+keep `main`'s own line:
+
+```
+git revert --no-edit -m 1 <merge-SHA>
+git push
+```
+
+Pages redeploys automatically once the push lands — reload the site
+after ~60-90 seconds to confirm.
+
+**Emergency alternative (only if `revert` itself is broken or blocked —
+rewrites history, needs explicit confirmation, not a first choice):**
+
+```
+git checkout main
+git reset --hard 61f26a5
+git push --force-with-lease
+```
+
+`--force-with-lease` (not plain `--force`) refuses to push if someone
+else pushed to `main` since your last pull, so it won't silently
+clobber anything you haven't seen. Still: only use this path if a plain
+revert genuinely doesn't work, and only against `61f26a5` unless you've
+independently confirmed a different commit is the right target.
+
+**After either path**: the branch `task-0-injury-profile` itself is
+untouched by a `main` rollback — it still holds all the work, so nothing
+is lost. Re-merging later (once whatever broke is fixed) is just a
+normal merge again, not a re-do of the rollback.
