@@ -1,0 +1,159 @@
+FIX 1 — TRIM PRIORITY WEIGHTS BY EMPHASIS LEVEL, FLOORED PER GROUP
+Branch: task-0-injury-profile
+Commit: aed617b — "Fix 1: trim priority weights by emphasis level, floored per group"
+Status: IMPLEMENTED, TESTED, COMMITTED. Part 1 of 3 (Fixes 2 and 3 not started).
+
+================================================================================
+THE BUG
+================================================================================
+
+TASK-0-BACKUP-MIGRATION-REVIEW.txt complaint 5. fitDayToTime's time-budget
+trim ranked candidates by `focusBoost`, a boolean that collapsed
+"emphasize" and "specialize" into the same priority value. With both tied,
+a compound tie-break (then list position) decided which focused muscle
+actually got cut — and since the Delts & Arms day template lists delts
+before arms, arms (specialize — the user's HIGHER-priority group) lost
+more volume than shoulders (emphasize — lower priority), inverting the
+user's own settings.
+
+Real-data verification of the bug: shoulders 12 -> 12 (untouched), arms
+11 -> down to 1 set on three movements, despite specialize outranking
+emphasize.
+
+================================================================================
+THE MECHANISM
+================================================================================
+
+  const LEVEL_TRIM_FLOOR_PCT = { specialize: 0.75, emphasize: 0.65, normal: 0, maintain: 0 };
+
+  function emphasisRank(ex, focus) {
+    const g = CAT_TO_GROUP[ex.cat];
+    const lvl = (focus && g && focus[g]) || "normal";
+    return LEVEL_RANK[lvl] ?? 1;         // maintain:0, normal:1, emphasize:2, specialize:3
+  }
+  function trimPriority(ex, focus) {
+    return emphasisRank(ex, focus) * 10 + (isCompound(ex) ? 1 : 0);
+  }
+
+The x10 gap means the compound bonus (max +1) can never bridge a one-tier
+emphasis difference — a maintain-group compound is always trimmed before
+a specialize-group isolation. List position remains the final tie-break,
+unchanged.
+
+A strict lexicographic ordering alone overcorrects into the MIRROR-IMAGE
+bug — verified against real data during design before shipping anything:
+shoulders 12->4, arms 11->19. One group untouched, the other gutted to its
+bare per-exercise floor. Fixed by adding a per-GROUP floor:
+
+  groupTrimFloors(items, focus) computes, once, per group:
+    floor = max(sum of per-exercise absolute floors in that group,
+                round(group's own pre-trim set total * LEVEL_TRIM_FLOOR_PCT[level]))
+
+specialize keeps >=75% of its own pre-trim volume, emphasize >=65%,
+normal/maintain get no floor beyond the pre-existing per-exercise minimum
+(2 sets for a compound, 1 for isolation) — maintain yields first, by
+design. A firmer per-MOVEMENT guarantee (a maintain lift can't be dropped
+ENTIRELY) is Gate 13's job, not built yet — this fix doesn't introduce or
+worsen that gap, and DEFERRED-TESTS.md now records the real movements
+(hip thrust, calf raise) that would be exposed to it.
+
+gate7DurationTrim (the pasted-prescription duration trim) shares
+trimPriority/groupTrimFloors directly rather than a second, drifting
+implementation — it previously had NO emphasis awareness at all
+(compound-only), despite its own comment claiming it "mirrors
+fitDayToTime's own heuristic." buildGateContext now carries `focus`
+through to it (ctx.focus).
+
+================================================================================
+NUMBERS — BEFORE / AFTER, REAL BACKUP DATA (Delts & Arms, sessionMin 60)
+================================================================================
+
+                        shoulders (emphasize)   arms (specialize)
+  original bug                  12                     11
+  strict-tier prototype          4                     19    <- rejected, shown for the record
+  SHIPPED                        8                     15
+
+Both land inside the target range given during design (arms 13-15,
+shoulders 8-9) and both groups are still recognizably what their focus
+level says.
+
+Full row-level rendered output (fitMinutes 60, matches sessionMin exactly):
+
+  Machine Shoulder Press      4 sets   65 lb    Add reps
+  Cable Lateral Raise         3 sets   12.5 lb  Add weight
+  Lateral Raise (swap)        1 set    7.5 lb   Add weight
+  EZ-Bar Curl                 4 sets   40 lb    Add weight
+  EZ-Bar Skullcrusher         4 sets   30 lb    Add weight
+  Overhead Cable Triceps Ext. 4 sets   25 lb    Estimated
+  Cross-Body Hammer Curl      1 set    20 lb    Start
+  Incline DB Curl             1 set    15 lb    Start
+  Overhead DB Triceps Ext.    1 set    25 lb    Start
+
+Verified against the INTEGRATED implementation (not just the design
+prototype) via a real Playwright import of the actual backup file.
+
+================================================================================
+TESTS
+================================================================================
+
+npm test: 217 assertions pass total —
+  197 pre-existing (unmodified in behavior; check-day-resolution.js's two
+      reference functions updated only to thread `focus` through to
+      app.fitDayToTime, matching the real call sites)
+  + 20 new in scripts/check-trim-priority.js (new, wired into `npm test`):
+      1. emphasisRank/trimPriority ordering — a maintain-group compound
+         never outranks a specialize-group isolation; strict tier
+         ordering across all four levels; compound still wins within one
+         tier (old tie-break preserved).
+      2. groupTrimFloors — specialize/emphasize get a real share-of-
+         own-volume floor; normal/maintain fall back to the pre-existing
+         per-exercise floor only.
+      3. fitDayToTime and gate7DurationTrim produce IDENTICAL per-exercise
+         set counts for the same exercises/sets/focus/budget (the
+         shared-not-duplicated requirement, checked directly).
+      4. The exact real-data Delts & Arms regression (shoulders 8-9,
+         arms 13-15; rejects both the original 12/11 and the
+         overcorrected 4/19).
+      5. Maintain-floor stress case (Lower day, forced tiny budget):
+         no exercise below its per-exercise floor; core's kneeraise
+         (normal) survives over legs' hip thrust/calf (maintain) at the
+         full-drop stage.
+      6. Single emphasize, nothing specialized (the common case): every
+         compound stays fully intact, only the lone unemphasized
+         isolation lift absorbs a trim.
+
+Deliberate-break check (per your instruction, mirroring Task 2 commit 1's
+verification pattern): temporarily desynced gate7DurationTrim's sort from
+the shared trimPriority function (reverted to the old compound-only
+comparator) and re-ran the test suite. The new equivalence test (#3 above)
+failed immediately, catching the drift as intended. Reverted before
+committing; `diff` against the pre-break-test file confirmed byte-identical
+restoration.
+
+================================================================================
+NOT FIXED HERE (recorded in DEFERRED-TESTS.md)
+================================================================================
+
+- Biceps (6) vs triceps (5) on the Delts & Arms day remains INCIDENTAL,
+  not a designed balance rule — a side effect of which spawned/bonus
+  movements happen to absorb the remaining trim. Don't rely on it staying
+  close as focus levels, swaps, or session length change.
+- sessionRules.trimPriority remains an accepted-but-unread plan key,
+  exactly as before this fix (grepped: zero reads, before and after).
+  Wiring a coach-plan override for trim order is a separate feature with
+  its own design questions, out of scope for Fix 1.
+- Gate 13 (maintain floor at the per-MOVEMENT level, not just per-set) is
+  still not built. DEFERRED-TESTS.md row 9 now carries a real-data note:
+  hip thrust and calf raise are the two movements on this user's actual
+  Lower day that get dropped entirely before goblet squat / leg press /
+  leg curl, under extreme budget pressure. Concrete case for whoever
+  builds it.
+
+================================================================================
+NEXT
+================================================================================
+
+Fix 2 (migration notice missing on the import path) and Fix 3 (Gate 2 vs
+user swaps — warn, don't block) are scoped in the prior conversation but
+not started. Per instruction: implement as separate commits, stop after
+each.

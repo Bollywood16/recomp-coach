@@ -1,0 +1,187 @@
+TASK 4 — SAFETY GATES 1-8
+Branch: task-0-injury-profile
+Commit: 377157e "Task 4: Safety gates 1-8"
+
+================================================================================
+SCOPE (per your confirmed answer)
+================================================================================
+Gates 1-8 only. Tested against the 5 directly-applicable required cases
+(1, 3, 5, 6, 10) plus 2 synthetic Gate 2 fixtures. Tests 2, 4, 7, 8, 9
+explicitly deferred to Tasks 2/6 — tracked in DEFERRED-TESTS.md with the
+rule that an owning task isn't done until its deferred test(s) pass.
+
+Design constraints held throughout:
+  - Gate 2 takes no bypass parameter anywhere in its signature.
+  - All 8 gates are pure functions over (prescription, ctx) — none knows
+    or checks whether its prescription came from `prescriptions` (Task 2)
+    or `days` (Task 6).
+
+================================================================================
+THE 5 REQUIRED TEST CASES
+================================================================================
+1. Reverse Pec-Deck @40lb vs 10lb logged -> Gate 3 rejects, falls back,
+   surfaces reason. PASS.
+3. Forbidden-attribute exercise via prescriptions -> Gate 2 rejects. PASS
+   — verified via a bare gate call, the full paste-and-apply path
+   (extractPlanJson -> applyCoachGates), AND a live browser run.
+5. Untagged exercise while recoveringMode -> deny by default. PASS — also
+   confirmed the same exercise passes when NOT recovering (the gate is
+   conditional on recoveringMode, not a blanket untagged-exercise ban).
+6. Pasted plan cannot modify injuryProfile -> structurally impossible.
+   PASS — see the real gap found and fixed below.
+10. Legacy 4-field plan -> applies unchanged, no regression. PASS.
+
+Both synthetic Gate 2 fixtures (documented in TASK-1-FIXES-REVIEW.txt) used
+exactly as specified — a fake exercise carrying loaded_deep_hip_flexion,
+injected only inside the test (never shipped), and the matching pasted
+prescription through the real paste-and-apply path.
+
+================================================================================
+TWO REAL GAPS FOUND WHILE TESTING (not in the required list)
+================================================================================
+
+1. GATE 2 NEVER CHECKED ex.contraindications.
+   The build spec's own illustrative gate-logic pseudocode only shows two
+   checks — attributes ∩ forbidden, and romProfile vs. limited maxValue.
+   It never mentions contraindications at all, despite the exercise
+   schema having that field and Task 1's own worked example populating it.
+   Without checking it, every contraindications tag from Task 1 (bbrow,
+   trapdl, goblet) would be inert data, and the entire goblet/boxsquat
+   split — whose stated premise was "only the self-limited variant keeps
+   the contraindication" — would have had zero actual enforcement effect.
+
+   Added the check: reject if any of ex.contraindications matches an
+   injury in injuryProfile.injuries whose status isn't "resolved".
+   Verified in isolation (forbidden/limited constraints cleared) that
+   goblet is still rejected via contraindications alone, and correctly
+   stops being rejected once hip_labrum is marked resolved.
+
+2. applyCoachGates's blind `{...rec}` SPREAD COULD LEAK injuryProfile.
+   `rec` is arbitrary parsed JSON from a pasted LLM reply. The spread
+   `const gated = { ...rec, gates: [] }` would carry through ANY key rec
+   contains, including one named injuryProfile. Nothing downstream
+   currently reads gated.injuryProfile back out (persist() call sites in
+   CoachCard pick fields off `gated` individually), so this wasn't
+   exploitable today — but that was an accident of the current code
+   shape, not a structural guarantee. Fixed: `delete gated.injuryProfile`
+   immediately after the spread, with check-write-isolation.js now
+   asserting that line is still present (checks for the literal scrub,
+   not just the absence of a write pattern).
+
+Also found and fixed, a correctness issue in the gates themselves:
+
+3. recommend() NEEDS THE PRESCRIPTION'S OWN repMin/repMax.
+   EX_BY_ID[exerciseId] carries whichever repMin/repMax happened to be
+   merged in by the FIRST PROGRAM slot that references that exercise
+   (via slot()) — arbitrary relative to a specific prescription's own
+   target rep range. Gates 3 and 4 both call recommend() and were
+   initially passing the bare EX_BY_ID entry. Confirmed this produces a
+   materially wrong result: bench logged at 18 reps read as "maxed out,
+   add weight" under a baked-in repMax:10 from an unrelated slot, when the
+   actual prescription's own 15-20 rep range meant 18 reps was still
+   mid-progression (should recommend "Add reps", not "Add weight").
+   Fixed with exerciseForRecommend(ex, prescription), used by both gates.
+
+================================================================================
+ALL 8 GATES, WHAT THEY DO
+================================================================================
+1  Unknown exerciseId -> reject.
+2  Forbidden attributes, romProfile depth limit, contraindications (fix
+   above) -> reject. Untagged -> deny by default while recovering.
+3  Load >15% over last logged -> falls back to recommend()'s own safe
+   load, marks unverified. Suppressed if the movement pattern is
+   pain-escalating (see Gate 5).
+4  Last-session pain over threshold (during OR the 24h-after painRetro
+   field, on the same session row) -> forces the configured load
+   reduction regardless of the prescription. Dismissed/unanswered pain
+   never triggers this and is never treated as zero. Also suppressed
+   under Gate 5's escalation.
+5  Pain over threshold in >=2 of the last 4 sessions for a movement
+   pattern (grouped by `cat`), OR a stated (not spec-given — the spec
+   defines no precise rule) trending-upward baseline across that window
+   -> suppresses Gates 3/4's auto-adjustment for that pattern and
+   surfaces a persistent, non-dismissable PainEscalationNotice on the
+   Workout tab naming the affected pattern(s). Does not reject the
+   prescription itself — the movement can still be trained, just without
+   automatic corrections.
+6  Weekly volume ceiling, with a running tally across the whole batch of
+   prescriptions in one pasted plan (so a second exercise is checked
+   against what the first already consumed, not evaluated in isolation).
+7  Duration — trims lowest-priority sets first (mirrors fitDayToTime's
+   existing protect-compounds-first heuristic) rather than rejecting the
+   whole plan.
+8  Deload overrides every surviving prescription's sets (~60%) and load
+   (~90%) unconditionally, matching the existing DayPage/recommend()
+   deload conventions rather than a second scaling rule.
+
+================================================================================
+WIRING INTO THE REAL APP
+================================================================================
+applyCoachGates now recognizes an optional `prescriptions` array on a
+parsed pasted plan and runs it through the gates — backward compatible,
+since a legacy 4-field plan simply has no such key and is completely
+unaffected (verified by test 10). Accepted prescriptions persist to
+data.plan.prescriptions as inert data — merging them into what the
+generator actually renders per day is explicitly Task 2's wiring, not this
+gate pipeline's job; nothing in the Workout tab changes yet based on a
+gated prescription. CoachCard surfaces rejections ("Prescriptions
+rejected") and adjustment notes ("Prescriptions adjusted") in the existing
+gate-message UI style.
+
+================================================================================
+VERIFIED
+================================================================================
+- 41 assertions: 5 required + 2 fixtures + 3 gap-fix regression checks +
+  one dedicated test each for gates 1, 4 (three sub-cases: forced
+  reduction, painRetro trigger, dismissed-doesn't-trigger), 5, 6 (two
+  sub-cases: single rejection, running-tally across a batch), 7, 8. All
+  passing.
+- Full re-transpile through Babel, zero syntax errors, zero startup
+  console errors.
+- npm test (check-write-isolation.js) passes — gate2Injury and
+  gate4PainRule added to REVIEWED_READERS after confirming both only read
+  injuryProfile (both destructure it directly in their signature
+  specifically so this checker's discovery scan catches them).
+- Real browser (Playwright), zero console errors: Gate 3's fallback
+  (Reverse Pec-Deck 40lb -> 10lb) rendered and persisted correctly through
+  the actual paste-and-apply UI; Gate 2's rejection via the real, shipped
+  `goblet` exercise (not a fixture) also rendered and persisted correctly
+  — nothing accepted, reason shown.
+- One thing NOT independently re-verified in the browser: the synthetic
+  Gate 2 fixture (test_deep_flexion_lift) specifically, because injecting
+  it via page.evaluate() turned out not to reach the app's script scope
+  (a real, if minor, discovery about this app's execution model — see
+  below). Its logic is fully covered by the Node-level tests instead
+  (both a bare gate call and the full paste-and-apply path).
+
+================================================================================
+SIDE DISCOVERY: page.evaluate() can't reach the app's top-level bindings
+================================================================================
+Attempted to inject the synthetic Gate 2 fixture directly into the live
+page's EX_BY_ID/ALL_KNOWN via Playwright's page.evaluate() before pasting a
+plan that referenced it. This failed — EX_BY_ID was not reachable from
+that evaluate call, even though the app has no ES module wrapper and no
+IIFE around its top-level declarations that would obviously explain this.
+Worked around it by using the real, already-shipped `goblet` exercise
+(genuinely contraindicated) for the browser-level Gate 2 verification
+instead, and kept the fixture-based test at the Node level only. Not
+investigated further since it didn't block anything — noting it here in
+case it matters for Task 6's eventual day-authorship testing, where a
+similar injection approach might be tempting.
+
+================================================================================
+ALSO NOTED, NOT FIXED (not a Task 4 defect)
+================================================================================
+MUSCLE_GROUPS.legs.mav is 20, but the balanced template's own default
+program already prescribes ~26 leg sets/week with zero focus adjustment.
+Gate 6 falls back to `mav` as the cap when no sessionRules.
+weeklyGroupSetCaps override exists (since Task 2 hasn't wired up real
+per-user caps yet), so today Gate 6's default cap is stricter than the
+live program's own baseline for legs specifically. Recorded in
+DEFERRED-TESTS.md for whoever picks up Task 2.
+
+================================================================================
+NEXT
+================================================================================
+Holding here for review, per how every task in this build has gone.
+DEFERRED-TESTS.md is the map for what Tasks 2 and 6 still owe.

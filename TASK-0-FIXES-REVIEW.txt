@@ -1,0 +1,163 @@
+TASK 0 — FIXES FROM REVIEW
+Branch: task-0-injury-profile
+Commit: 92b15f4 "Task 0 fixes: fail-safe migration, cross-lift retro prompt, freeze backstop"
+(on top of 40dbf09 "Task 0: injuryProfile as protected, structured data")
+
+================================================================================
+FIX 1 GREP QUESTION — ANSWERED
+================================================================================
+Question: did the weeksTraining>=8 auto-override ever write
+goalProfile.injuryRecovery back to storage, or was it applied at read time
+only?
+
+Answer: read time only, never persisted. Grepped the pre-Task-0 source
+(commit 61f26a5): applyCoachGates's override (original lines ~2144-2149)
+only ever mutates `gated.template`; it never touches `injuryRecovery` or
+`goalProfile`. Every place goalProfile was persisted (CoachCard's
+currentProfile() and the two persist() calls in copyBrief/openInClaude/
+applyPasted/run) constructed `injuryRecovery` purely from CoachCard's own
+local `injury` React state, which only ever changed via the user's manual
+toggle click (setInjury(!injury)). So the override never corrupted or
+auto-set that flag — but per the fix, this doesn't make seeding from a
+manually-set `false` automatically safe, since we can't tell "user meant
+this" from "stale/forgotten toggle" without the strict check below.
+
+================================================================================
+FIX 1 — Migration fails safe (highest priority)
+================================================================================
+Changed: only a strict `goalProfile.injuryRecovery === false` carries
+forward as recoveringMode:false. Absent, null, 0, or any other falsy value
+defaults to recoveringMode:true.
+
+Added: InjuryMigrationNotice — one-time, dismissible banner ("Injury gating
+has been turned on. Adjust in the Log tab." / "...stayed off, carried over
+from your previous setting...") shown on the Workout tab. Recorded into
+injuryProfileHistory as a migration entry (device: "migration"). Persisted
+immediately via a direct window.storage.set call in the same load effect —
+does not depend on the user triggering some other write first.
+
+Verified (Node harness, replicating the exact migration branch):
+  goalProfile.injuryRecovery === false (explicit)   -> recoveringMode: false
+  goalProfile.injuryRecovery === true               -> recoveringMode: true
+  goalProfile present, injuryRecovery absent        -> recoveringMode: true
+  goalProfile.injuryRecovery === null               -> recoveringMode: true
+  goalProfile.injuryRecovery === 0 (falsy, not ===false) -> recoveringMode: true
+  no goalProfile at all                             -> migrating: false (no-op)
+
+================================================================================
+FIX 2 — Retro pain prompt evaluated across ALL lifts
+================================================================================
+Replaced findPendingPainRetro (single-lift, gated on reopening that exercise)
+with findAllPendingPainRetros (data.sessions, injuryProfile, today):
+  - scans every lift, not just the one being reopened
+  - takes the most recent unanswered session per lift (dedup by exerciseId)
+  - window widened from 1-2 days to 1-3 days
+  - respects a new painRetroDismissed flag so skipping doesn't re-nag
+
+Rendered via new PendingPainRetroPrompts component, once, at the top of the
+Workout tab (WorkoutFlow) — not per-exercise. Removed the old per-exercise
+retro UI and saveRetro handlers from both ExerciseCard and the Log tab's
+quick-log form (superseded, would have been redundant/inconsistent
+alongside the global prompt).
+
+Verified (Node harness):
+  - a lift 3 days old, unanswered -> surfaces (in the widened window)
+  - an older session for the same lift -> ignored (most-recent-per-lift only)
+  - an already-answered session -> excluded
+  - a dismissed session -> excluded
+  - a session 10 days old -> excluded (outside window)
+  - recoveringMode:false -> nothing surfaces regardless
+  - the exact scenario the fix was about: a lift on a ~7-day split, logged
+    2 days ago -> surfaces correctly WITHOUT the user reopening that
+    specific exercise (this was the actual bug; confirmed fixed)
+
+================================================================================
+FIX 3 — Object.freeze() backstop + write-isolation check script
+================================================================================
+Added deepFreeze(obj) — recursively Object.freeze()s an object and all
+its nested objects/arrays. Applied:
+  - to DEFAULT_INJURY_PROFILE itself, at declaration
+  - at buildCoachBrief's and applyCoachGates's entry points, where
+    data.injuryProfile enters the parser/gate path
+
+Verified (Node harness, real strict-mode execution):
+  - assigning frozen.recoveringMode = false        -> throws TypeError
+  - frozen.movementConstraints.forbidden.push(...)  -> throws TypeError
+  - frozen.injuries[0].status = 'resolved'          -> throws TypeError
+  - record contents unchanged after all three attempts (JSON-compared)
+
+Added scripts/check-write-isolation.js (wired to `npm test` via new
+package.json). Asserts, textually (no module system exists to enforce this
+via imports/exports):
+  1. no module-scope (top-level) binding named like set/write/mutate/
+     updateInjuryProfile exists outside InjuryProfileCard's closure
+  2. extractPlanJson and applyCoachGates — the actual parser/gate path a
+     pasted plan runs through today — never reference injuryProfile as a
+     write target (object-literal key or property mutation; reassigning
+     the local `injuryProfile` parameter to a frozen copy is explicitly
+     allowed, since that's this fix's own backstop, not a write to the
+     record)
+
+Sanity-checked the checker itself: injected a fake violation into a copy of
+applyCoachGates and confirmed the detection regex flags it, before
+confirming the real (clean) source passes. `npm test` currently passes.
+
+================================================================================
+FIX 4 — Confirmed _updatedAt stamping, re-tested with real save()/persist()
+================================================================================
+InjuryProfileCard.save() does not stamp _updatedAt itself, and doesn't need
+to: it calls the `persist` prop, which is App's persist() function — the
+single choke point every write in the app goes through. persist()
+unconditionally overwrites _updatedAt with a fresh timestamp on every call,
+regardless of what the caller passed. (The two paths that bypass persist()
+entirely — the migration's direct window.storage.set, and cloud-merge
+writes — both stamp it themselves too, confirmed by inspection.)
+
+Re-ran the gap-G merge test (from the original Task 0 review) using the
+ACTUAL save()/persist() construction logic copied verbatim from source,
+not hand-built objects:
+  - device "phone" saves recoveringMode:false
+  - device "laptop" saves recoveringMode:true + clinicianReviewed:true,
+    5ms later
+  - mergeData(phone, laptop) -> recoveringMode:true, clinicianReviewed:true
+    (laptop, the newer one, wins) — history has both entries (2, not 1)
+This confirms gap G's fix holds under the real code path, not just a
+hand-constructed approximation of it.
+
+================================================================================
+HAND-TESTED IN A REAL BROWSER
+================================================================================
+Method: local static file server (python3 -m http.server) + Playwright +
+headless Chromium (installed fresh in this environment — no project-level
+run skill existed yet; recommend /run-skill-generator to capture this for
+next time).
+
+Confirmed, with screenshots and zero console errors throughout:
+  - Log tab -> Injury Profile card expands, shows ClinicianReviewNotice,
+    shows "Recovering — movement gates active" / "Not in injury recovery"
+    header depending on state
+  - Clicking the recoveringMode toggle flips ON -> OFF correctly and
+    immediately (button label, header summary line both update)
+  - Workout tab shows ClinicianReviewNotice at top, day picker renders
+    normally beneath it, no layout breakage
+  - Insights tab -> CoachCard reflects the toggle correctly via a read-only
+    pill: "Recovering from injury: OFF · edit in Log tab"
+  - Opening an exercise (Barbell Bench Press) on the Workout tab shows the
+    "Pain during this session (0-10, optional)" input (recoveringMode
+    defaults true on a fresh profile); filling sets + pain and clicking
+    "Save session" saves cleanly with no errors
+
+Not yet exercised in the browser: the migration-notice banner itself
+(requires seeding legacy goalProfile-only storage, not just a fresh
+profile), and the PendingPainRetroPrompts banner (requires sessions old
+enough to fall in the 1-3 day window). Logic for both is unit-verified
+above; visual confirmation of these two specific banners is still open if
+you want it before moving further.
+
+================================================================================
+STANDING PRACTICE GOING FORWARD
+================================================================================
+Per your request, a review .txt file like this one will be written after
+each build/task from here on (Task 1, Task 4, etc.) — summarizing what
+changed, what was verified and how, and what's still open — without
+needing to be asked each time.

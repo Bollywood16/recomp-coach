@@ -1,0 +1,129 @@
+TASK 0 — INJURY PROFILE AS PROTECTED, STRUCTURED DATA
+Implementation summary for review, branch: task-0-injury-profile
+Commit: 40dbf09 "Task 0: injuryProfile as protected, structured data"
+(index.html only — 379 insertions, 27 deletions)
+
+================================================================================
+WHAT'S IN THIS COMMIT (line refs against current index.html)
+================================================================================
+
+INJURY PROFILE STORE
+---------------------
+- DEFAULT_INJURY_PROFILE (line 382) — matches the schema reviewed earlier:
+  recoveringMode, injuries[], movementConstraints{forbidden, limited,
+  painRule}, clinicianReviewed, lastReviewDate.
+- isSpecializationUnlocked(injuryProfile, metrics) (line 404) — the derived,
+  UNSTORED split of job (b): `!recoveringMode || weeksTraining >= 8`.
+  recoveringMode never appears inside it, so nothing can auto-lift Gate 2's
+  flag through this function.
+- getDeviceId() (line 411) — stable per-device label (localStorage, not
+  synced) used to tag injuryProfileHistory entries.
+- InjuryProfileCard (line 1938, rendered in the Log tab after BackupCard) —
+  the ONLY place injuryProfile is written. `save()` is a plain closure
+  variable, never assigned to a module-level binding. Provides:
+    - recoveringMode toggle (manual only, labeled as never auto-lifting)
+    - clinicianReviewed toggle + lastReviewDate
+    - per-injury edit / add / remove (label, side, status, since)
+    - read-only display of movementConstraints (direct editing deferred to
+      Task 1, once the attribute vocabulary exists — noted in the UI itself)
+    - a "show change history" list (device + timestamp per edit)
+- ClinicianReviewNotice (line 1920) — renders in WorkoutFlow (line 1259) and
+  inside CoachCard, wherever clinicianReviewed is false.
+
+MIGRATION
+---------
+- App's load effect (line 1096): one-time migration. If no injuryProfile
+  exists yet, seeds recoveringMode from the old goalProfile.injuryRecovery
+  boolean; otherwise defaults-merges the stored profile as-is.
+- applyCoachGates (line 2488) and buildCoachBrief (line 753) now take
+  injuryProfile directly. goalProfile.injuryRecovery is no longer read
+  anywhere in the codebase (confirmed via grep — only the migration
+  fallback and two explanatory comments reference the old field name).
+
+PAIN CAPTURE
+------------
+- findPendingPainRetro(sessions, exId, today) (line 967) — finds a prior
+  session for that lift, 1-2 days old, still missing painRetro.
+- Both logging flows (ExerciseCard — the Workout-tab lift form — and Log's
+  quick-log form) now:
+    - capture an optional `pain` (0-10) field on the session being saved
+    - surface a "any pain in the 24h after your [date] session?" prompt
+      that writes painRetro/painRetroAt back onto the PRIOR session
+    - both are shown only while injuryProfile.recoveringMode is true
+
+MERGEDATA (gap G — sync could silently clobber injuryProfile)
+---------------------------------------------------------------
+- injuryProfile added to mergeData's explicit newest-wins key list
+  (around line 301).
+- injuryProfileHistory unioned by (at, device) identity (lines ~289-296),
+  so a stale device's overwrite can no longer silently vanish — the
+  losing side's edit still appears in history even though it doesn't
+  become the live value.
+- BackupCard import/export updated to round-trip injuryProfile and its
+  history.
+
+================================================================================
+WHAT WAS VERIFIED (before committing)
+================================================================================
+
+No automated test suite yet — that's Task 4's job per the agreed build
+order. Verification done so far:
+
+1. Full script transpiled through Babel (@babel/preset-react, classic
+   runtime) with zero syntax errors.
+2. Compiled script loaded under a stubbed browser environment (mocked
+   window/localStorage/document/navigator/React/ReactDOM/fetch/storage) —
+   confirms no ReferenceErrors, redeclarations, or const-ordering issues
+   at module-eval time.
+3. Pure functions exercised directly against the stubbed environment:
+
+   isSpecializationUnlocked
+     - recovering, weeksTraining=3  -> false   (locked, correct)
+     - recovering, weeksTraining=8  -> true    (unlocked, correct)
+     - not recovering, weeksTraining=1 -> true (job (b) doesn't apply, correct)
+
+   findPendingPainRetro
+     - prior session 2 days old, unanswered -> returns it (correct)
+     - prior session 6 days old -> null, outside window (correct)
+     - prior session already has painRetro set -> null (correct)
+     - prior session same date as "today" -> null (correct, no same-day match)
+
+   mergeData
+     - local stale (older _updatedAt) with recoveringMode:false,
+       cloud newer with recoveringMode:true + clinicianReviewed:true
+       -> merged.injuryProfile takes the NEWER (cloud) values (correct —
+          this is the concrete check that gap G is closed: newest wins)
+     - injuryProfileHistory from both local and cloud (1 entry each,
+       different devices) -> merged history has BOTH entries (length 2,
+       not 1) — confirms the losing side's edit is not silently lost.
+
+   applyCoachGates
+     - recoveringMode:true, weeksTraining=3, template="superhero"
+       -> forced to "balanced" with an explanatory gate message (correct)
+     - recoveringMode:true, weeksTraining=10, template="superhero"
+       -> kept as "superhero", no override (correct, unlocked)
+     - recoveringMode:false, weeksTraining=1, template="superhero"
+       -> kept as "superhero", no override (correct — job (b) gated on
+          recoveringMode, as designed)
+
+   buildCoachBrief
+     - the real injuryProfile object now appears verbatim (JSON.stringify
+       match) inside the <constraints> block of the generated brief,
+       replacing the old hardcoded paragraph.
+
+NOT YET DONE
+------------
+- No hands-on UI test in an actual browser (no dev server available in
+  this environment) — InjuryProfileCard's rendering, the ClinicianReviewNotice
+  placement, and the pain-capture inputs have not been visually confirmed.
+  Flagging this explicitly rather than claiming it works.
+- No gate test suite yet (Task 4, per the agreed order).
+
+================================================================================
+OPEN ITEMS CARRIED FORWARD
+================================================================================
+- movementConstraints (forbidden/limited/painRule) are read-only in
+  InjuryProfileCard for now; direct editing is deferred until Task 1 defines
+  the attribute vocabulary those lists reference.
+- UI hands-on verification in a real browser still needed before Task 0 is
+  fully signed off.

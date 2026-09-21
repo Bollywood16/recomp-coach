@@ -1,0 +1,145 @@
+TASK 1 — EXERCISE LIBRARY MOVEMENT ATTRIBUTE TAGGING
+Branch: task-0-injury-profile
+Commit: 058c3e3 "Task 1: exercise library movement attribute tagging"
+
+================================================================================
+COVERAGE — EXACT COUNT PER SOURCE (programmatically verified, not hand-counted)
+================================================================================
+Extracted every `id:` from each source via a small parser script (not by
+reading and counting), then cross-checked the result against EXERCISE_ATTRS
+and against a live browser render — three independent checks, not one.
+
+  D            29 exercises  — all 29 tagged
+  LIBRARY      22 entries    — 17 new + 5 already tagged via D (machohp,
+                               cablelat, skull, ohte, ezcurl are declared in
+                               both D and LIBRARY; same id, tagged once)
+  LIBRARY_EXT  19 exercises  — all 19 tagged
+  BONUS         9 inline     — all 9 tagged (bonus_sidelat, bonus_reardelt,
+                               bonus_ohtri, bonus_preacher, bonus_dbpress,
+                               bonus_dbhammer, bonus_cablefly, bonus_pullover,
+                               bonus_walkinglunge)
+  -----------------------------------------------------------------
+  TOTAL UNIQUE IDS: 74        — 74/74 tagged, 0 gaps
+
+Verified three ways:
+  1. Set comparison: ALL_KNOWN's 74 ids == EXERCISE_ATTRS' 74 keys exactly
+     (no id present in one but not the other, either direction).
+  2. isExerciseTagged() (requires all four fields: attributes array,
+     romProfile object, contraindications array, non-empty pool string)
+     returns true for all 74 — not just "has a key present."
+  3. Live in a browser: TaggingCoverageCard (Log tab) renders "74/74 TAGGED".
+
+No leg-only bias: the coverage table above deliberately did NOT stop at the
+currently-constrained categories (squat/hinge) — every hpress/vpress/hpull/
+vpull/biceps/triceps/delts/quad/ham/calf/core/glute exercise is tagged too,
+specifically because an untagged upper-body exercise is what would slip
+through if/when the constraint set changes.
+
+================================================================================
+WHAT EACH EXERCISE GOT
+================================================================================
+- attributes: mechanical descriptors (loaded_hip_flexion, hip_hinge,
+  knee_dominant, horizontal_press, elbow_flexion, unilateral, etc.) — keyed
+  on mechanics per the spec's own framing, not names.
+- romProfile: only squatDepth / hingeRom / hipFlexionMax populated — the
+  two dimensions injuryProfile.movementConstraints.limited actually
+  constrains today. Omitted entirely for movements not on that ordinal
+  scale (isolation machines: leg extension, lat pulldown, lateral raise,
+  calf raise, etc.) rather than set to a meaningless value.
+- contraindications: reserved for risk independent of measurable depth —
+  currently only 3 of 74 carry one (see judgment calls below); depth risk
+  is left to romProfile + Gate 2's limit comparison (Task 4) instead of me
+  guessing a contraindication per squat/hinge variant.
+- pool: reuses the existing `cat` taxonomy (the same one the swap picker
+  already filters exercises by) except "delts" is split into
+  delts_lateral / delts_rear. This is additive only — the swap picker
+  still filters on `cat`, unchanged, so nothing in the live app's behavior
+  changed. pool is data for Task 2/6's pool-based substitution to consume
+  later.
+
+================================================================================
+JUDGMENT CALLS TO REVIEW (flagged explicitly, not silently resolved)
+================================================================================
+1. goblet (Goblet / Box Squat) — tagged VERBATIM from this build's own
+   Task 1 spec example: romProfile-compliant (squatDepth: above_parallel,
+   hipFlexionMax: 90) AND STILL contraindications: ["hip_labrum"]. My
+   reasoning for why this is coherent (not a contradiction): a box squat
+   has no hard mechanical depth stop the way pinsquat's safety pins do —
+   a self-monitored limit under fatigue isn't the same guarantee, so
+   Gate 2's forbidden-list check should still catch it even though its
+   romProfile passes the depth-limit check. This means: once Gate 2 (Task
+   4) lands, the "Lower B" day in the balanced template — which currently
+   prescribes goblet squats unconditionally — will need pool substitution
+   to replace it with legpress/hacksquat/smithsquat (all pool: "squat",
+   none contraindicated). That's a real, currently-latent behavior change
+   surfaced by accurate tagging, not a bug I introduced.
+
+2. bbrow (Bent-Over Barbell Row) and trapdl (Trap-Bar Deadlift) —
+   contraindications: ["prox_hamstring_tendinosis"] on both. NOT a new
+   judgment call: both already carry their own `caution`/`why` text in
+   LIBRARY/LIBRARY_EXT flagging hip/hamstring demand ("Only with PT
+   clearance — hip flexion depth" / "approach carefully or skip"). I
+   encoded what was already there, not invented it.
+
+3. legpress, hacksquat, smithsquat — NOT contraindicated, romProfile
+   squatDepth omitted (legpress/hacksquat) or set to above_parallel
+   (smithsquat, named "(limited depth)" + basedOn pinsquat). Reasoning:
+   these are what the live program ALREADY prescribes as the safe squat
+   pattern in 2 of 3 templates today (upperFocus, superhero), for this
+   exact user, right now. I had no basis to newly contraindicate something
+   already running safely.
+
+4. beltsquat and pullthrough — no depth-limiting signal in their name and
+   not currently prescribed anywhere in the live PROGRAMS (sit unused in
+   LIBRARY as alternates only). No existing in-app signal either way.
+   Rather than guessing safe, I tagged the conservative/deeper romProfile
+   value (squatDepth/hingeRom: below_parallel — i.e., NOT limited) so an
+   unreviewed unknown reads as "potentially exceeds the limit" rather than
+   silently passing Gate 2 later. Flagging this explicitly since it's a
+   judgment call, not a fact I could verify from existing app data.
+
+5. sissy (Spanish / Sissy Squat) — romProfile squatDepth: below_parallel.
+   This one IS a fact, not a guess: a sissy squat is deep knee/hip flexion
+   by definition, so this is descriptively accurate rather than a
+   conservative default.
+
+6. Zero exercises carry the forbidden attribute itself
+   (loaded_deep_hip_flexion). This is accurate, not a gap — nothing in the
+   current 74 is actually described as a full/ATG-depth loaded movement.
+   That forbidden entry exists in injuryProfile as a forward-looking net
+   for future/untagged additions (e.g. if a pasted plan proposes something
+   new), not because anything currently tagged needs it. Worth knowing so
+   its zero hit rate today isn't mistaken for the tag being dead/unused.
+
+================================================================================
+VERIFIED
+================================================================================
+- Programmatic: 74 ALL_KNOWN ids == 74 EXERCISE_ATTRS keys, set-equal, zero
+  missing/extra/typo'd; all 74 pass isExerciseTagged() (all four fields
+  present, not just "has some tag").
+- Live browser (Playwright): TaggingCoverageCard shows "74/74 TAGGED";
+  opening the Goblet/Box Squat exercise (now data-flagged) and its swap
+  picker both work with zero regressions and zero console errors — Gate 2
+  doesn't exist yet (Task 4), so nothing rejects anything yet; this commit
+  is data only.
+
+================================================================================
+NOT DONE (correctly out of scope for Task 1)
+================================================================================
+- No enforcement. isExerciseTagged()/exerciseTaggingGaps() are read-only
+  utilities for the coverage report; the actual Gate 2 intersection check
+  against movementConstraints.forbidden/limited is Task 4.
+- pool is not yet consumed by any picker/generator logic (the swap picker
+  still filters on `cat`, unchanged) — that's Task 2/6's job.
+- Direct editing of movementConstraints in InjuryProfileCard is still
+  read-only, as noted back in Task 0 — now that the attribute vocabulary
+  exists (attributes list above), that could be revisited, but wasn't
+  asked for in Task 1's scope and I didn't expand into it.
+
+================================================================================
+NEXT
+================================================================================
+Holding here for review before starting Task 4 (Safety gates 1-8), per how
+every other step in this build has gone — Task 4 is also the one you said
+needs the ten test cases passing against the real app before Tasks 2/3/5/6/7
+can start.

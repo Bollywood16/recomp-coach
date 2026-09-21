@@ -1,0 +1,229 @@
+REAL BACKUP IMPORT — MIGRATION REPORT, DAY COMPARISON, GATE 2 VS SWAPS
+Branch: task-0-injury-profile
+Source file: recomp-coach-backup-2026-09-06.json (repo root, gitignored, never committed)
+Status: REPORT ONLY. No app behavior changed as part of this investigation.
+
+================================================================================
+0. .gitignore
+================================================================================
+
+Added to .gitignore:
+  recomp-coach-backup-*.json
+
+Confirmed:
+  $ git status --short --ignored
+   M .gitignore
+  !! recomp-coach-backup-2026-09-06.json
+
+Untracked and ignored — will never show up as a candidate for staging/commit.
+
+File verified against every stated fact before anything was run against it:
+  exportedAt      2026-09-06T00:38:23.834Z            MATCH
+  version         8                                    MATCH
+  plan            template upperFocus, sessionMin 60,
+                  templateSince 2026-09-04              MATCH
+  focus           shoulders emphasize, arms specialize,
+                  legs maintain, rest normal            MATCH
+  sessions        168 rows, 27 distinct dates,
+                  29 distinct exercises,
+                  2026-07-06 through 2026-09-04          MATCH
+  swaps           legpress->goblet, pinsquat->legpress,
+                  cablecrunch->kneeraise,
+                  reardelt->latraise                     MATCH
+  injuryProfile   absent                                 MATCH (pre-Task-0 export)
+
+================================================================================
+1. MIGRATION REPORT
+================================================================================
+
+There are TWO separate "load a backup" code paths in this app, and they behave
+very differently:
+
+  - App-boot path (reads localStorage on startup, App's useEffect): has the
+    goalProfile.injuryRecovery -> recoveringMode migration logic, writes
+    injuryProfileMigration (the one-time dismissible notice) and
+    injuryProfileHistory, and does the goblet -> boxsquat rename.
+
+  - Import-backup path (BackupCard.importData — the "Import backup" button on
+    the Log tab, the ONLY way a user actually gets a downloaded JSON file back
+    into the app): none of that. It just does:
+      injuryProfile: incoming.injuryProfile
+        ? { ...cloneInjuryProfileDefaults(), ...incoming.injuryProfile }
+        : (data.injuryProfile || cloneInjuryProfileDefaults())
+
+This was run for real: Playwright, fresh app (cleared localStorage), clicked
+"Import backup" on the Log tab, uploaded the actual file. Ground truth from
+the persisted recompcoach:v2 blob after import:
+
+  recoveringMode      -> true
+  injuries            -> full default list (hip_labrum, prox_hamstring_tendinosis)
+  injuryProfileMigration  -> null (never set)
+  injuryProfileHistory    -> []
+  gobletBoxSquatMigration -> null (never set)
+  goblet sessions         -> 8, still tagged "goblet" (0 renamed to "boxsquat")
+  goalProfile (carried over, inert) -> {"injuryRecovery": true, ...}
+
+Migration notice: does NOT fire. Verified two ways — the persisted field is
+null, and a DOM check on the Workout tab confirms nothing renders (first pass
+gave a false positive from reading document.body.textContent, which also
+picks up the inline <script> tag's raw source text; re-checked with
+innerText, which only reflects visible rendered text — confirmed NOT FOUND).
+
+Goblet/box-squat migration: also does NOT fire on this path. Your 8 goblet
+sessions stay tagged "goblet" — consistent with what you described.
+
+Schema: nothing in the v8 shape breaks the current schema. All 29 exercise
+IDs used in sessions resolve in EX_BY_ID. phase: {}, coachNote, weights all
+merge harmlessly as inert/legacy extra data.
+
+THE REAL FINDING: the migration-notice mechanism was clearly built for
+exactly this scenario (a pre-Task-0 export carrying goalProfile but no
+injuryProfile) — but it's wired only to the boot/localStorage path, not the
+import-file path, which is the only path a restored backup ever actually
+travels in normal use. In your case the outcome is accidentally correct
+(goalProfile.injuryRecovery was true, and the fallback default also lands on
+true), so nothing *looks* wrong. But if that field had been false (gating
+explicitly opted off), importing this same shape of file into a fresh device
+would silently turn injury gating ON with zero notice — exactly the silent
+failure mode the boot-path code's own comments say they exist to prevent.
+That guard simply isn't present on the import path.
+
+This reads as an untested gap, not a deliberate design choice — I found no
+comment anywhere scoping the migration notice to "boot path only."
+
+================================================================================
+2. DAY COMPARISON — Delts & Arms (ufArms), your exact settings
+================================================================================
+
+Rendered via resolveDayExercises + fitDayToTime exactly as DayPage calls them:
+template upperFocus, sessionMin 60, focus/swaps as in the file, no
+substitutions.
+
+--- Pre-cap, pre-fit (what the generator wants before any trimming) ---
+
+  Machine Shoulder Press                    4 sets   (shoulders emphasize x1.4)
+  Cable Lateral Raise                       4 sets
+  Lateral Raise (reardelt -> latraise swap) 4 sets
+  EZ-Bar Curl                               6 -> capped to 4  (arms specialize x1.85)
+  EZ-Bar Skullcrusher                       6 -> capped to 4
+  Overhead Cable Triceps Ext.               4 sets
+  Cross-Body Hammer Curl (bonus, arms specialize)  3 sets
+  Incline DB Curl (spawned overflow from curl cap)  2 sets
+  Overhead DB Triceps Ext. (spawned overflow from skull cap)  2 sets
+
+maxSetsNotes (Task 2 commit 4's per-movement-cap banner):
+  "EZ-Bar Curl" capped at 4 sets (was 6) — spawned "Incline DB Curl (bench
+  back)" for the remaining 2 sets: best-ranked available "biceps" pool
+  alternative, passing all safety gates.
+
+  "EZ-Bar Skullcrusher" capped at 4 sets (was 6) — spawned "Overhead DB
+  Triceps Extension" for the remaining 2 sets: best-ranked available
+  "triceps" pool alternative, passing all safety gates.
+
+--- After fitting to 60 min (order preserved — this is what actually renders) ---
+
+  order  exercise                       sets    reps    load      tag
+  1      Machine Shoulder Press         4       8-12    65 lb     Add reps
+  2      Cable Lateral Raise            4       15-20   12.5 lb   Add weight
+  3      Lateral Raise (swap)           4       12-20   7.5 lb    Add weight
+  4      EZ-Bar Curl                    4       10-15   40 lb     Add weight
+  5      EZ-Bar Skullcrusher            3 (-1)  10-15   30 lb     Add weight
+  6      Overhead Cable Triceps Ext.    1 (-3)  10-15   25 lb     Estimated
+  7      Cross-Body Hammer Curl         1 (-2)  10-15   20 lb     Start
+  8      Incline DB Curl                1 (-1)  10-15   15 lb     Start
+  9      Overhead DB Triceps Ext.       1 (-1)  10-15   25 lb     Start
+
+Hard sets by group (post-fit): shoulders 12, arms 11 (biceps 6, triceps 5).
+Trimmed 8 sets total; nothing fully dropped.
+Estimated duration: 60 min vs sessionMin 60 — fits exactly.
+
+================================================================================
+3. COMPLAINT-BY-COMPLAINT
+================================================================================
+
+1) "6 sets stacked on EZ-Bar Curl"
+   FIXED. Capped at 4, overflow redistributed to a spawned pool alternative
+   (Incline DB Curl) instead of stacked on the same movement. Task 2 commit 4
+   working as designed.
+
+2) "Arms sequenced last, behind 12 delt sets"
+   STILL PRESENT. Order is machohp, cablelat, latraise (12 shoulder sets)
+   THEN all arm movements — unchanged. Not a bug in anything reviewed in
+   Tasks 0-3: resolveDayExercises preserves day.exercises array order, and
+   PROGRAMS.upperFocus.ufArms itself lists the three shoulder slots before
+   the three arm slots. No gate or generator logic reorders by group — this
+   is the generator correctly executing a day template that was authored
+   delts-first. If sequencing matters, it needs its own fix (e.g. order by
+   focus level); nothing built so far touches it.
+
+3) "Biceps 7 vs triceps 4"
+   PARTIALLY FIXED. Now 6 vs 5 (gap shrunk from 3 to 1) — but this is an
+   INCIDENTAL side effect of the cap-and-split mechanism happening to spawn
+   one triceps and one biceps alternate, plus duration-trim cutting the
+   newly-spawned/bonus items down to 1 each. Nothing in the codebase targets
+   this ratio directly — don't rely on it staying balanced as inputs change.
+
+4) "Cable lateral raise at 12.5 lb despite 50% inter-set rep decay"
+   DOESN'T REPRODUCE against this data. The only logged cablelat session
+   (2026-09-04) is 4x20 reps @ 10 lb — zero decay, every set at the top of
+   the rep range. recommend()'s "Add weight" call to 12.5 lb is exactly
+   correct for what's actually logged. Confirmed recommend() DOES have real
+   decay detection (decay >= 0.5 combined with belowMin triggers a "Reduce"
+   recommendation instead of "Add weight") — so the logic that would have
+   caught the original complaint exists structurally. Can't verify it against
+   the actual complaint scenario because that session isn't in this export;
+   if it happened on a date that got overwritten or wasn't included here,
+   there's nothing to check it against.
+
+5) "60-min trim cutting triceps and hammer curl to 1 set each while
+    protecting all delt sets"
+   STILL PRESENT — and this one reads as a real design bug, not just
+   correct-execution-of-questionable-settings. All 3 shoulder movements held
+   their full 4 sets; skull/ohte/ohdbext (triceps) and
+   bonus_dbhammer/inclinecurl (biceps) got cut to 1-3. The trim's priority
+   function is `focusBoost ? 2 : 0, plus 1 if compound`. Both shoulders and
+   arms have focusBoost = true here (both emphasized/specialized), so the
+   tie-breaks decide: compounds win (shoulders has the day's only compound,
+   Machine Shoulder Press) and, among ties, LATER list position loses first
+   — which is arms, since the template lists arms after delts. Result: arms
+   (specialize — the stated HIGHER-priority group) gets cut harder than
+   shoulders (emphasize — the lower-priority group), which inverts the
+   user's own settings. That's not "the generator executing wrong settings
+   correctly" — the settings say arms > shoulders, and the output does the
+   opposite. Worth a fix: trim priority should weight by emphasis LEVEL
+   (specialize > emphasize), not just a boolean.
+
+================================================================================
+4. GATE 2 VS. USER SWAPS — code as it stands today, no changes made
+================================================================================
+
+Does Gate 2 run against user swaps in the render path?
+  NO. Traced every call site of gate2Injury — exactly two:
+    (a) inside capAndSplitMovement, when the generator picks a spawned
+        pool-alternative for cap overflow;
+    (b) inside the pasted-prescription gate pipeline (applyGatedPrescriptions).
+  resolveSlot — the function that turns data.swaps.legpress = "goblet" into
+  the rendered exercise — does a plain swaps[slot.id] lookup with ZERO gate
+  calls. The goblet swap is never re-checked against injuries/
+  contraindications, regardless of recoveringMode.
+
+Intentional or untested gap?
+  Reads as an UNTESTED GAP, not an intentional design decision. No comment
+  anywhere argues "swaps are direct human action, so Gate 2 shouldn't apply
+  to them." The closest related comment (on why capAndSplitMovement skips
+  re-running Gates 1b/3/4/5/6) argues the opposite pattern: those gates are
+  skipped there specifically because that code path has no user-chosen
+  load/exercise to check. A user's own swap is exactly the kind of "explicit
+  exercise choice with a contraindication attached" that Gate 2's own doc
+  comments describe as its job.
+
+What does the user see?
+  Nothing. The swap picker (ExerciseCard's `alternates` list) is
+  ALL_KNOWN.filter(a => a.cat === slot.cat) sorted by rank — no
+  contraindication filtering at all, so goblet is offered as a normal swap
+  option. Once swapped, injuryProfile.recoveringMode in ExerciseCard is used
+  for exactly one thing — showing the optional "pain during this session"
+  input — never a warning. No badge, no blocked swap, no note, at selection
+  time or on the rendered card.
+
+No code changed for this section — report only, as requested.

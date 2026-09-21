@@ -1,0 +1,168 @@
+TASK 4 FIXES — ESCALATION RATCHET, CLEARANCE, ALLOWLIST, CAP FIX
+Branch: task-0-injury-profile
+Commit: 94a1056 "Task 4 fixes: escalation is a ratchet not a suppressor, allowlist pick, cap fix"
+
+================================================================================
+ITEM 1 — Escalation was removing protection (safety regression, now fixed)
+================================================================================
+Confirmed the bug exactly as described: Gate 5 checked ctx.escalatingCats
+and, if true, made Gates 3 and 4 return early with just a "suppressed"
+note — the load sanity check and the forced pain-rule reduction both
+switched off for the one movement most needing them.
+
+Fixed as a one-way ratchet:
+  - Gate 4's forced reduction is now UNCONDITIONAL. The escalating-check
+    early-return was deleted entirely from gate4PainRule — nothing in it
+    references escalation at all anymore, so nothing can suppress it.
+  - Gate 3's ceiling tightens from +15% to "never above last logged" while
+    escalating. Also handles the omitted-load case: if load isn't
+    prescribed but recommend() would suggest an increase at render time,
+    Gate 3 now injects an explicit capped load rather than leaving a hole
+    the ratchet wouldn't otherwise cover.
+  - Gate 5 additionally caps SETS at the last logged count for that
+    exercise while escalating — no added volume either.
+  - Wrote the rule directly above gate3LoadSanity in a comment that states
+    the invariant plainly ("escalation may only ever make the result MORE
+    conservative... never less") so it can't be silently re-inverted by a
+    future edit without deleting the comment first.
+
+Verified:
+  - A prescription proposing 200 lb (vs. last-logged 90) on an escalating
+    pattern where that exercise's own last session also had pain>3: Gate 3
+    caps at 90, THEN Gate 4 independently reduces further to 70 (round5
+    (90*0.8)) — confirms neither gate suppresses the other; they compound.
+  - Same scenario with load prescribed at exactly last-logged (90, so
+    Gate 3 doesn't touch it): Gate 4 alone still forces 70. Confirms Item
+    1's core claim in isolation.
+  - Omitted load on an escalating pattern where the last logged sets were
+    at repMax (would otherwise recommend +weight): capped at 90, not left
+    to progress silently at render time.
+  - Sets: proposing 5 when only 2 were last logged, escalating: capped at
+    2, setsCapped:true.
+  - Non-escalating case: completely unaffected — normal 15% rule applies,
+    unchanged from before this whole item.
+  - Real browser: pasted a plan proposing 200 lb on bench with a genuinely
+    escalating hpress pattern (2 of 4 sessions pain>3) — applied result
+    shows load capped at 90, sets capped at 1 (matching the 1-set-per-
+    session seed data), both notes rendered, zero console errors.
+
+================================================================================
+ITEM 2 — Escalation clearance defined
+================================================================================
+isPainEscalating rewritten to walk the full session history in
+chronological order rather than only inspecting a snapshot of the last 4
+— "currently escalating" is a question about the sequence since the last
+trigger, which a snapshot can't answer correctly once a trigger has fired
+and later sessions come in.
+
+Clearance: 3 CONSECUTIVE sessions with an answered pain value at or below
+threshold. Dismissed/unanswered sessions hold the streak (skipped
+entirely — neither advance nor reset it, matching your instruction
+exactly). An answered over-threshold value resets the streak to 0.
+
+Clearance is logged to injuryProfileHistory via a transition-detecting
+useEffect in PainEscalationNotice (comparing this render's escalating-cats
+set to the previous one via useRef) — kept out of isPainEscalating itself,
+which stays a pure, side-effect-free read, callable from both the gate
+context builder and the notice component without double-logging.
+
+Verified the full state machine: escalating right after trigger; still
+escalating after 1 and 2 clean answered sessions; clears exactly at the
+3rd; a dismissed session in the middle holds (neither advances nor
+resets); an answered high-pain session resets the streak to 0; recovers
+correctly after a reset given 2 more clean sessions (still escalating,
+correctly not yet cleared).
+
+================================================================================
+ITEM 3 — Trending-upward rule pinned
+================================================================================
+Written into the comment above isPainEscalating, one sentence: among the
+last 4 sessions for a pattern, if >=3 have an answered pain value,
+escalation triggers when the most recent answered value is >=2 points
+above the oldest answered value in that window. Labeled explicitly as "AN
+EXPLICITLY CHOSEN HEURISTIC WITH NO CLINICAL BASIS, deliberately biased to
+over-trigger rather than under-trigger" in the comment itself.
+
+Verified: 3 answered sessions rising 0->1->2 (all under threshold) still
+triggers via the trend rule alone; flat 1->1->1 does not.
+
+================================================================================
+ITEM 4 — Allowlist pick replaces delete-based denylist
+================================================================================
+applyCoachGates no longer does `{ ...rec, gates: [] }` at all. It now
+starts from `{ gates: [] }` and copies only KNOWN_PLAN_KEYS (template,
+focus, sessionMin, calorieDelta, prescriptions, pushback, assessment,
+nutritionNote, nextCheckIn) off `rec`. Anything else `rec` contains is
+dropped and surfaced as a gates[] message: "Ignored unrecognized field(s)
+in the pasted plan: X, Y." — the delete-based scrub from the last round is
+gone entirely, superseded by this.
+
+check-write-isolation.js retargeted: asserts (a) no `...rec` spread
+pattern exists anywhere in applyCoachGates's body, and (b) injuryProfile
+is never present in the KNOWN_PLAN_KEYS list. Sanity-tested both failure
+modes by injecting each violation into a scratch copy of the file and
+confirming the checker fails loudly on each, then confirmed the real
+source passes.
+
+Verified: a pasted plan with both an attacker-supplied injuryProfile key
+and a benign unrecognized field produces gated.injuryProfile === undefined
+AND a gates[] message naming both fields explicitly; known fields (e.g.
+sessionMin, calorieDelta) still apply normally alongside the message.
+
+================================================================================
+ITEM 5 — Gate 6 default cap decided
+================================================================================
+defaultGroupCap(group, weeklyGroupSets) = max(MUSCLE_GROUPS[group].mav,
+weeklyGroupSets[group] || 0) — never below the live program's own current
+baseline for that group.
+
+What this does and doesn't fix, made explicit rather than implied: for a
+group already at/above mav (legs: baseline ~26 vs mav 20), the cap is now
+26, so the rejection reason cites an honest number instead of one already
+violated by the unmodified baseline alone — but there's still no headroom
+above baseline for that group, since the running tally also starts from
+baseline. Verified this directly: a 1-set legext addition is still
+rejected, but the reason now says "above the 26-set cap" (correct, matches
+the actual sustainable ceiling for that group) rather than the old,
+already-violated 20. A group with real headroom below mav (arms) is
+unaffected — a 1-set curl addition passes exactly as before.
+
+Documented as a residual, acknowledged limitation in DEFERRED-TESTS.md:
+full resolution needs Task 2 to teach the generator that a prescription
+can REPLACE a baseline-counted exercise's sets rather than only ever
+adding to them — Task 4 has no such concept yet.
+
+================================================================================
+ITEM 6 — Escalation grouping limitation documented, not rebuilt
+================================================================================
+Added to DEFERRED-TESTS.md and to PainEscalationNotice's own displayed
+copy (verified live in the browser screenshot): grouping by `cat` is both
+too wide (any pain on one lift suppresses/tightens every lift sharing
+that cat) and too narrow (a hip labral issue spans both the squat and
+hinge cats, which this treats as two unrelated patterns, so neither alone
+may reach the 2-of-4 trigger) — under-detecting exactly the injury this
+app was built around. Flagged for whoever next touches the escalation
+gate; not rebuilt now, per your instruction.
+
+================================================================================
+VERIFIED
+================================================================================
+- 47 assertions across two suites: 18 unchanged from the required-case
+  suite (re-run to confirm no regression from any of items 1-5), plus 29
+  new covering items 1, 2, 3, and 5 specifically. All passing.
+- Full re-transpile through Babel, zero syntax errors.
+- npm test (check-write-isolation.js) passes; both retargeted assertions
+  (no ...rec spread, injuryProfile never in KNOWN_PLAN_KEYS) sanity-tested
+  against injected violations in a scratch copy before confirming the real
+  source passes clean.
+- Real browser, zero console errors: the persistent escalation notice
+  states its clearance condition and grouping caveat in its own copy; a
+  pasted plan proposing 200 lb + implicit extra sets on a genuinely
+  escalating pattern is correctly capped (load 90, sets 1) with both
+  gate notes rendered in the existing UI.
+
+================================================================================
+NEXT
+================================================================================
+Holding, per your instruction. Task 5 (brief export fixes) is next when
+you give the go-ahead.

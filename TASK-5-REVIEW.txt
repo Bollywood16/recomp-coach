@@ -1,0 +1,134 @@
+TASK 5 — FIX THE COACH BRIEF EXPORT
+Branch: task-0-injury-profile
+Commit: 35d59e0 "Task 5: fix the coach brief export"
+
+================================================================================
+COVERAGE (as requested — verified via the real exported brief text and,
+separately, live through the actual "Copy coach prompt" button)
+================================================================================
+
+  Lifts sent vs. lifts logged:        17/17  (test scenario; 0 dropped —
+                                               previously slice(-14) would
+                                               have silently dropped 3,
+                                               including bench)
+  Research corpus sent vs. total:     24/24  (previously up to 8/24 —
+                                               researchForPhase used to
+                                               filter+slice; now only
+                                               reorders, never excludes)
+  Exercise library sent vs. ALL_KNOWN: 75/75  (every entry carries tagSource)
+  totalSessions:                        6    (distinct calendar days,
+                                               correct — not the 18
+                                               exercise-rows logged across
+                                               them in the same test data)
+
+Note on the corpus count: the build spec says "21 entries." The actual
+RESEARCH_CORPUS has grown to 24 (r22, r23, r24 were added for load-
+selection/inter-set-decay findings, likely after the spec text was
+written). Sending the real, current count — not forcing 21.
+
+================================================================================
+1. .slice(-14) TRUNCATION — REMOVED
+================================================================================
+m.lifts is no longer capped at all. Root cause (confirmed in the original
+pre-implementation review, now fixed): coachMetrics.lifts is filtered from
+ALL_KNOWN in fixed declaration order, so slicing from the front dropped
+whichever lifts were declared earliest (bench, chest-supported row),
+regardless of how recently or heavily they were actually trained. 75
+exercises doesn't need a cap — verified the brief text itself (not just
+coachMetrics in isolation) carries every logged lift, including bench.
+
+================================================================================
+2. totalSessions — NOW DEDUPES BY DATE
+================================================================================
+Added countTrainingSessions(sessions) (same dedupe-by-key pattern
+trainingWeeks already uses, one level up, by week). Fixed both call sites
+per your instruction:
+  - coachMetrics.totalSessions
+  - Insights' Consistency card — this also needed sessionsPerWeek's
+    numerator fixed, since it was built from the same sessions.length.
+Verified live: a test dataset with 3 exercises logged per day across 6
+days (18 rows) now correctly shows "6 sessions across 3 weeks" in the
+real Insights tab, not 18.
+
+================================================================================
+3. BRIEF TEMPLATE UPDATES
+================================================================================
+- Declares prescriptions/sessionRules as optional, alongside the existing
+  four-field output contract — a legacy reply is unaffected either way.
+- New <exercise_library> section: every ALL_KNOWN exercise with
+  attributes/romProfile/contraindications/tagSource, plus an explicit
+  instruction to decline and explain (not substitute or invent) when
+  nothing in the library fits a slot's needs.
+- <research_context> now sends the full corpus. researchForPhase no
+  longer filters-then-slices(0,8) — it only reorders by phase-relevance
+  now (most relevant first), never excludes anything.
+- Full injuryProfile record: confirmed still serializing correctly through
+  <constraints> after all the Task 4 changes (verified via the actual
+  exported text, not assumed to still work).
+
+================================================================================
+4. tagSource sent, conservative_default flagged as unverified
+================================================================================
+Every exercise in <exercise_library> carries its tagSource. The brief
+text explicitly states: "a 'conservative_default' tag is an UNVERIFIED
+GUESS — no clinical or in-app signal existed either way, so treat it with
+less confidence than the other two, not the same." Verified this exact
+phrase is present in the exported brief, and that conservative_default
+entries (goblet, beltsquat, pullthrough — 3 of 75) are actually present
+and distinguishable in the sent payload.
+
+================================================================================
+TWO THINGS CHECKED, AS ASKED
+================================================================================
+- Pain data: was NOT sent at all before this. Fixed two ways:
+  - <set_quality> now appends logged pain per session line (during-session
+    and the 24h-after painRetro answer where present) — verified "pain
+    during: 2/10" appears correctly in the exported text.
+  - <constraints> now states which movement patterns (if any) are
+    currently pain-escalating, using the exact same isPainEscalating
+    check Gate 5 runs, with the same wording Gate 5 itself uses ("no
+    progression will be permitted... regardless of what you recommend").
+    Verified both the "none active" case and an actually-escalating case
+    (hpress pattern, 2-of-4 sessions pain>3) report correctly.
+
+- Post-Task-4 reality check found a real, related bug: CoachCard's "Open
+  in Claude" button calls the async copyBrief() without awaiting it.
+  copyBrief() sets its own "Copied — paste it into any Claude chat."
+  message on completion (after its clipboard-write microtask resolves);
+  without the await, that message landed a beat AFTER — and overwrote —
+  the more specific "Brief too long for a link" message this button sets
+  when the payload exceeds its 7500-char URL threshold. This was a rare
+  race before (briefs were small, rarely over the threshold) but is now
+  the COMMON case, since a brief with the full corpus and library
+  routinely runs 20-25K characters. Fixed by awaiting copyBrief() first.
+  Verified live: the correct "too long" message now displays and stays
+  displayed.
+
+================================================================================
+SCOPE NOTE
+================================================================================
+Task 7 (coach framing and evidence grounding) still owns the full system-
+prompt rewrite described in the build spec ("You are an evidence-based
+strength coach and exercise scientist..."). This task made the minimal,
+scoped changes the Task 5 spec text itself calls for (declare new fields,
+list attributes, decline-not-substitute) without pulling Task 7's framing
+rewrite forward. The current top-line framing sentence is unchanged from
+before.
+
+================================================================================
+VERIFIED
+================================================================================
+- Full re-transpile through Babel, zero syntax errors.
+- npm test (check-write-isolation.js) passes, unaffected by this task.
+- 16 new assertions (coverage counts above, brief-template checks, pain/
+  escalation reporting) plus the pre-existing gate/tagging suites, all
+  passing.
+- Real browser, zero console errors: Consistency card shows the corrected
+  count; the actual clipboard-copied brief (via "Copy coach prompt", not
+  a bare function call) contains everything above; "Open in Claude"'s
+  message race is fixed and verified with a screenshot.
+
+================================================================================
+NEXT
+================================================================================
+Holding for review, per how this build has gone throughout.

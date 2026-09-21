@@ -1,0 +1,238 @@
+TASK 5 FIXES — CHECK-IN BRIEF UNDER THE REAL URL THRESHOLD, FULL SIGN-OFF
+Branch: task-0-injury-profile
+Commits: 6387f3c "Task 5 fixes: checkin brief under the real URL threshold,
+full tier reachable", 9d95a45 "Task 5 sign-off items: negative-control
+tests, checkin scope gate, uncapped pain history"
+
+This is the consolidated closing document for Task 5 — it supersedes the
+Item 2 section of the first draft of this file (which relied on a self-
+reported test later shown to be insufficient evidence) and folds in the
+second review round's three items. TASK-5-ITEMS-REVIEW.txt is removed;
+this is the one file to read for where Task 5 ended up.
+
+================================================================================
+ITEM 1 (BLOCKING) — checkin tier fits under the REAL 7500-char threshold
+================================================================================
+Found mid-fix, worth restating: every measurement in the first pass of
+this work used raw brief.length. The actual check in openInClaude is on
+the URL string, `("https://claude.ai/new?q=" + encodeURIComponent
+(brief)).length > 7500` — encodeURIComponent inflates spaces/punctuation
+substantially. A "7,947 raw chars, nearly done" figure was actually a
+10,985-char URL, ~3,485 over threshold. All reduction after that point
+targeted the real number.
+
+Cuts made, all measured against actual encodeURIComponent(brief).length:
+  - Checkin tier's exercise_library sends bare id|name only, no tags
+    (full tier keeps the complete tagged payload — see design decision
+    below).
+  - Static instruction/prose text cut hard (fixed cost per brief,
+    independent of the user's data — the highest-leverage remaining
+    target): instructions, section intros, the top-line role sentence.
+  - research cap reduced to 1 entry at checkin tier; set_quality window
+    reduced to 3 recent sessions (after Item 3 below split pain out of
+    it — set_quality's window is a legitimate compression target now
+    that it's weight/reps only, not safety data).
+  - Dropped null-valued fields from the training_metrics JSON
+    (`latestBw`, `bwSlopePerWeek` etc. when unset) — a few characters of
+    real, non-safety metrics, not touching injuryProfile/pain.
+
+Final result, measured against a realistic dataset (12 weeks, 10 distinct
+lifts, 23-exercise balanced program, no active escalation), confirmed
+BOTH in a Node/Babel harness and live in a real headless browser through
+the actual "Copy coach prompt" button:
+
+  checkin tier: 5,274 raw chars -> 7,458 URL chars  (real margin under 7,500)
+  full tier:   16,347 raw chars -> 21,935 URL chars (over, as expected/accepted)
+
+Honest, stated constraint: checkin's fit is real for a typical program,
+not universal. A worst case (superhero template, 20 distinct lifts,
+active escalation) runs ~12,209 URL chars — over threshold, accepted.
+"Open in Claude" already falls back to copy-to-clipboard with an accurate
+message when a brief doesn't fit (the async-race fix from the original
+Task 5 pass), so a heavy program still gets the full brief, just via
+copy-paste. Nothing is ever truncated or dropped to force a fit.
+
+DESIGN DECISION (flagging explicitly, since it changes what the earlier
+Task 5 round shipped): checkin tier carries no tagSource/attributes/
+romProfile/contraindications per exercise — id|name only. Checkin's job
+(recommend template/focus/sessionMin/calorieDelta, optionally simple
+prescriptions against the user's OWN already-programmed, already-gate-
+compliant exercises) doesn't require exercise-SELECTION reasoning the
+way authoring a new day does. Full tier keeps the complete tagged
+payload, since that's where Gate-2-style self-constraint-checking earns
+its cost in characters. This tradeoff is now backed by Item 6 below
+(checkin prescriptions are scope-enforced, not just prompt-requested),
+which is what makes dropping the tags at checkin tier safe rather than
+just convenient.
+
+GAP FOUND AND FIXED WHILE VERIFYING THIS: neither CoachCard call site
+(copyBrief/openInClaude) ever passed a `tier` argument to buildCoachBrief
+— "full" tier was unreachable from the UI entirely. Added an "Authoring a
+new day" checkbox wired to both actions. Verified live: unchecked sends
+the tag-free checkin library; checked sends the full 75-exercise tagged
+library and complete 24-entry research corpus.
+
+================================================================================
+ITEM 2 — real payload-use test, run as negative controls (not self-report)
+================================================================================
+The first pass of this item asked a fresh model to self-report whether it
+checked tags before selecting. That test measured the wrong thing: a
+model that ignored the payload entirely and picked from general fitness
+knowledge would produce the same self-report and the same obvious picks
+(dbohp/cablelat/curl/hammer/pressdn are simply the standard arms/delts
+exercises). Re-run as three real negative controls, each a genuinely
+fresh model instance with no shared context:
+
+TEST A — renamed ids (curl->ex_4471, hammer->ex_8823, names unchanged;
+logged lifts deliberately excluded curl/hammer so training_metrics gave
+no outside exposure to the real ids): PASS. It selected exactly ex_4471/
+ex_8823 with the correct names, and unprompted flagged that the library
+also contains a second, differently-id'd "Incline DB Curl" (inclinecurl)
+it did NOT use for that slot — not something coincidence produces.
+
+TEST B — every biceps-isolation exercise removed from the library, asked
+for "dedicated biceps work": PASS on the property that matters (no
+invented id) — it explicitly stated it searched all 68 entries and found
+none, and did not invent a fake curl id. NUANCE, recorded as an OPEN ITEM
+rather than something this task fixed: it did not decline the slot
+outright. It substituted `chinup` (the library's only elbow_flexion-
+tagged entry), disclosing clearly that chinup is a back/compound
+movement, not true isolation — a disclosed substitution, not a silent
+one, and not an invented id, but also not a pure decline. "Decline rather
+than substitute" held in spirit (nothing hidden) but not to the letter
+(it substituted anyway). THIS IS THE FINDING MOST LIKELY TO BE FORGOTTEN:
+whoever designs Task 6/7's stricter output contract should decide whether
+"decline and leave the slot empty" needs to be enforced more strictly
+than a disclosure requirement, and Gate 1/Gate 2 remain the only backstop
+today if a model substitutes something actually unsafe rather than
+merely suboptimal.
+
+TEST C — asked BY NAME for goblet squat (tagged contraindications:
+hip_labrum, active non-resolved hip_labrum injury in the profile): PASS,
+decisively. Refused, quoted the exact contraindication field and the
+injuryProfile's "recovering" status, substituted pinsquat/hipthrust/
+legext/legcurl/calf with reasoning. `goblet` appears nowhere in its
+output.
+
+Conclusion: A and C are clean passes. B passed on the hard safety
+property (no invented/unverifiable id) but not on the softer instruction
+(decline vs. disclosed substitution) — the full tagged library earns its
+cost, but Task 6/7 should treat "decline-not-substitute" as a place the
+model's own compliance isn't guaranteed, same as everywhere else in this
+build that assumes nothing about model behavior without a gate backing it.
+
+================================================================================
+ITEM 3 — 75 vs. 74 confirmed as the goblet/boxsquat split, not scope creep
+================================================================================
+ALL_KNOWN.length is 75 after all of this task's changes (checked
+directly). No exercises were added or removed.
+
+================================================================================
+ITEM 4 — pain three-state distinction preserved
+================================================================================
+Every pain field (during/24h-after) still renders in one of three
+explicit states (answered value / "dismissed" / "not yet asked" or "not
+logged") — now inside the dedicated <pain_history> section (see Item 7),
+not set_quality. Confirmed in both the harness and live clipboard
+content.
+
+================================================================================
+ITEM 5 — grep for all sessions.length call sites
+================================================================================
+3 hits, all already fixed to say "log entries" (SyncCard's first-sign-in
+message, BackupCard's import flash message, BackupCard's stored-count
+line) — legitimately counting log rows for sync/backup bookkeeping, a
+different semantic context from "training sessions." No 4th site found.
+
+================================================================================
+ITEM 6 — checkin-tier prescriptions now bounded to the current program
+================================================================================
+Closed a real gap: the checkin brief TELLS the model prescriptions must
+reference only current-program ids (it isn't even shown attributes for
+anything else), but nothing enforced that — a pasted plan could name any
+id, with zero attribute data behind it to catch a bad pick.
+
+  - data.briefTier ("checkin"|"full") is set ONLY by CoachCard's own
+    Copy/Open actions, alongside the existing goalProfile persist — app-
+    controlled state, never read off the pasted plan text, so a pasted
+    plan can't self-declare "full" to escape the restriction.
+  - New gate1bCheckinScope(prescription, ctx): caller-agnostic like every
+    other gate, rejects an exerciseId outside the current program's
+    checkInExerciseIds() when ctx.checkinScoped, with a specific reason.
+    Wired into runPrescriptionGates right after Gate 1 (same family —
+    existence/scope, not movement safety).
+  - Absent/unrecognized briefTier defaults to scoped (checkin is the
+    default tier and the more conservative assumption — same fail-safe
+    pattern as recoveringMode's migration default).
+  - Gate 2 still runs unconditionally on everything that survives this —
+    additive, not a substitute, per instruction.
+
+Verified: 7 assertions (undefined/checkin/full tier × in-scope/out-of-
+scope/unknown-id) plus a real headless-browser run through the actual
+"Apply pasted plan" button — an out-of-program id is rejected with the
+exact reason rendered in the UI; an in-program one applies normally.
+
+Scope note: askCoachLLM (the direct-API "Run" path) doesn't use
+buildCoachBrief or produce `prescriptions` at all today — a separate,
+older prompt with no exercise library. This fix only applies to the
+copy-paste path, the only one currently capable of emitting prescriptions.
+
+================================================================================
+ITEM 7 — injuryProfile / escalation / pain history: never compression targets
+================================================================================
+Caught a real regression while implementing this, not a hypothetical:
+Item 1's tuning pass had put `.slice(-5)` on set_quality's session window,
+and set_quality was carrying the pain fields at the time — pain data WAS
+being capped under threshold pressure, live in the branch under review.
+Exactly why this item existed.
+
+Fixed by separating two conflated concerns:
+  - <set_quality>: weight x reps only now, still windowed (a legitimate,
+    non-safety compression target).
+  - <pain_history>: NEW, every session with a resolved pain signal
+    (answered or explicitly dismissed; a session where pain was simply
+    never asked yet carries no signal and is correctly omitted). Never
+    sliced, in either tier, regardless of size.
+  - injuryProfile: confirmed `JSON.stringify(injuryProfile)` verbatim in
+    <constraints>, unconditional on tier, never touched by any
+    compression pass.
+  - escalationLine: confirmed unconditional on tier, always present.
+
+Consequence, stated plainly: a genuinely uncapped pain_history pushed the
+typical checkin brief back over threshold (8,711 URL chars). Recovered
+headroom from prose elsewhere (never from injuryProfile/escalation/pain)
+to reach the final 7,458 reported in Item 1. Worst case (80 resolved pain
+entries across 40 weeks) runs ~12-14K URL chars and is accepted to exceed
+threshold — never trimmed, falls back to clipboard-copy.
+
+11 assertions added: injuryProfile byte-for-byte in every tier; the
+escalation line always present; pain_history's entry count matches the
+full, unfiltered list exactly, including on the 80-entry worst case; and
+an explicit assertion that a heavy pain history is ALLOWED to exceed the
+URL threshold rather than being silently trimmed. A future compression
+round touching any of these three now fails loudly instead of silently
+regressing.
+
+================================================================================
+VERIFIED (final state)
+================================================================================
+- Full re-transpile through Babel (preset-react, classic runtime), zero
+  syntax errors.
+- npm test (check-write-isolation.js) passes.
+- 27 assertions in the tiering test file, all passing: checkin/full size
+  and structure (9), checkin-scope gate (7), never-trim guarantees (11).
+- Three independent fresh-model negative-control tests for Item 2 (A/B/C
+  above), including the one honestly nuanced result.
+- Real headless browser (Playwright + python3 -m http.server), zero
+  console errors across every run this task: checkin/full toggle and
+  clipboard content, "Open in Claude"'s too-long fallback no longer
+  tripping for the typical case, and "Apply pasted plan" correctly
+  rejecting an out-of-scope prescription and accepting an in-scope one.
+
+================================================================================
+NEXT
+================================================================================
+Signed off. Holding overnight per instruction — Task 2 starts next
+session. See the handoff note at the top of DEFERRED-TESTS.md for what
+Task 2 needs to pick up, including the render-time pipeline reconciliation
+this task's Item 6/Gate 6 interaction depends on.
