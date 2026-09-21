@@ -496,3 +496,105 @@ confirms EZ-Bar Curl (arms) renders before Machine Shoulder Press
 `npm test`: 431 assertions total (418 prior + 13 new), all passing.
 
 ---
+
+## Section 7 — Coach framing and evidence grounding (Task 7) (commit pending)
+
+Interrupted by a session limit partway through; resumed in a new session to
+finish verification and close the section out. The code below was written
+before the interruption — this entry (and Test C) is written from that point
+forward.
+
+**Scope, per the deferred note in `TASK-5-REVIEW.txt`**: Task 5 made the
+minimal, scoped brief changes its own spec text required without pulling
+Task 7's framing rewrite forward. Task 7 owns that rewrite plus grounding
+the model's proposals against the corpus and against `days_contract`
+specifically.
+
+**`buildCoachBrief`'s system framing rewritten**: top-line framing now reads
+"You are an evidence-based strength coach and exercise scientist designing
+training for a specific individual. Design complete sessions..." (was a
+single generic sentence before). New requirements stated explicitly in the
+framing itself, not just implied by section structure: ground every
+decision in `<research_context>` and cite the specific entry when it drives
+a choice; say so rather than assert where the corpus doesn't cover
+something; where goal conflicts with constraints/time/research, program for
+the constraint, not the preference; respect tagged attributes; leave a slot
+out and explain why rather than substitute something unverifiable. Same
+framing text at both tiers (checkin and full) — only the `days_contract`
+detail is full-tier-only, per Section 2's checkin-scope reject for `days`.
+
+**New `<program_days>` section, both tiers**: lists the current template's
+real day ids and their exercise names. Fixes a real, pre-existing gap
+unrelated to Task 7's own scope but found while wiring `days_contract` in:
+`dayKey` has been required on every `prescriptions` entry since Task 2
+(`gate1cDayKey`), but no valid dayKey was ever actually listed anywhere in
+the brief for either tier — the model had no way to know what a real one
+looked like short of guessing from context.
+
+**New `<days_contract>` section, full tier only**: states the exact schema
+Gates 9-13 check (rationale required per exercise, `estimatedMin`/
+`weeklyGroupSets` recomputed with a 10% tolerance, Gate 12 specialize
+coverage and Gate 13 maintain-floor named directly), states DECLINE-DON'T-
+SUBSTITUTE in those words, and explicitly distinguishes a real substitution
+(`substitutedFor` + a stated reason) from guessing at a near-match. Absent
+entirely at checkin tier — `applyAuthoredDays` rejects `days` wholesale at
+checkin scope (Section 2), so a checkin-tier brief doesn't invite a
+proposal that's guaranteed to be dropped unexplained.
+
+`scripts/check-coach-brief-contract.js`: 37 assertions — the rewritten
+framing's key phrases, full-tier `days_contract` correctness (decline-
+don't-substitute stated explicitly, rationale required, Gates 12/13 named,
+real-substitution vs. guessing distinguished), its absence at checkin tier,
+`<program_days>` listing real dayKeys at both tiers (checked against
+`getProgram(data)` directly, not just tag presence), and Task 5's whole-
+corpus/whole-library requirements unregressed. This is a STRUCTURAL/CONTENT
+test — it verifies the brief text is correctly formed, not that a model
+given that text actually behaves as instructed. That's a different claim,
+checked separately below via two live negative controls against a fresh
+model with no shared context (same methodology as Task 5's original
+negative controls) — a model reasoning about its own instructions isn't a
+clean test of whether those instructions land on an independent reader.
+
+**Live negative control — Test B (wrong movement pattern), confirmed
+pre-interruption**: a fresh agent, given only the rendered brief and asked
+to author a day, was presented with a slot where the obvious library
+candidate (chin-up) is the wrong movement pattern for what the slot
+actually needed. It declined the slot outright rather than substitute,
+explicitly citing DECLINE-DON'T-SUBSTITUTE and correctly identifying why
+chin-up didn't fit. **Passed.**
+
+**Live negative control — Test C (contraindicated obvious pick), re-run
+this session**: built the actual real-data full-tier brief (via
+`buildCoachBrief` against `recomp-coach-backup-2026-09-06.json`, same
+construction `check-coach-brief-contract.js`'s real-data case uses) and
+handed it, verbatim and as sole context, to a fresh general-purpose agent
+with no access to this codebase or conversation, asked to author the
+`ufLower` ("Lower") day. The trap: `goblet` (Goblet Squat) is the
+strongest performance case in the whole leg pool by the numbers alone —
+8 logged weeks, latest e1RM 91, +18.2% trend, not stalled — genuinely the
+statistically obvious pick. Its own display name even reads "Goblet Squat
+(no box, self-limited)," implying it's already accommodated. But its tags
+say otherwise: `romProfile.squatDepth=below_parallel` and
+`contraindications: ["hip_labrum"]`, against an injuryProfile listing
+hip_labrum as `status: "recovering"` (unresolved) with a `squat_depth`
+limit of `above_parallel`. The agent excluded `goblet` entirely, named the
+tag/label contradiction explicitly in its prose ("trust the tags over the
+old label"), and used `pinsquat` (the one squat variant tag-verified
+`above_parallel`-compliant) for the day's primary knee-dominant slot
+instead. It also caught a second, unprompted case of the same shape:
+substituted the template's own `legpress` → `legext`, reasoning that
+`legpress` carries an app-flagged `loaded_hip_flexion` caution with no
+`romProfile` confirming a depth cap and `clinicianReviewed: false`, so it
+wouldn't assume compliance absent verification — filed as a real
+`substitutedFor` entry with `rationale`, not a silent drop. **Passed** —
+full transcript available on request, not reproduced here.
+
+**Not done in this section**: no live-browser Playwright check — this
+section only touches prompt text construction (`buildCoachBrief`), not any
+render path Playwright would exercise differently from the unit-level
+brief-construction checks already run. Logged as a deliberate scope
+decision, same category as Section 5's equivalent note.
+
+`npm test`: 468 assertions total (431 prior + 37 new), all passing.
+
+---

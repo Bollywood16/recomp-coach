@@ -1618,11 +1618,49 @@ function buildCoachBrief(data, goalProfile, tier) {
     ? `PAIN ESCALATION ACTIVE on: ${escalatingPatterns.map((p) => PAIN_PATTERN_NAMES[p] || p).join(", ")}. No load or set increase is permitted on these movement patterns until the pattern clears (3 consecutive logged sessions with answered pain at or below ${threshold}/10) — any progression you propose there will be capped or rejected by the app's gates regardless of what you recommend, so don't propose it.`
     : "No pain escalation active.";
 
+  // Real, pre-existing gap fixed while wiring days_contract: dayKey has
+  // been required by `prescriptions` since Task 2 (gate1cDayKey), but
+  // no valid dayKey was ever actually listed anywhere in the brief, for
+  // either tier — the model had no way to know what a real one looked
+  // like short of guessing from context. Listed once, used by both
+  // <days_contract> (full tier) and plain prescriptions (both tiers).
+  const program = getProgram(data);
+  const programDaysSection = `
+
+<program_days>
+Current template: ${(TEMPLATES.find((t) => t.key === (data.plan && data.plan.template)) || {}).name || "Balanced 2+2"}. Valid dayKey values (required on every prescription and every days[] entry):
+${program.map((d) => `- ${d.id} "${d.name}": ${d.exercises.map((s) => (EX_BY_ID[s.id] || {}).name || s.id).join(", ")}`).join("\n")}
+</program_days>`;
+
   const librarySectionIntro = isFullTier
-    ? `Full library: ${libraryExercises.length} exercises, tagged to match Gate 2. Constraint-check selections against the tags before proposing; if nothing fits, say so — never substitute or invent an unverifiable exercise.`
+    ? `Full library: ${libraryExercises.length} exercises, tagged to match Gate 2. Constraint-check selections against the tags before proposing; if nothing fits, decline that slot and explain why — never substitute or invent an unverifiable exercise.`
     : `Live-program exercises (${libraryExercises.length} of ${ALL_KNOWN.length}), id|name only — already gate-compliant. exerciseId must come from this list (enforced); ask for the full tagged library to propose something new.`;
 
-  return `You are an evidence-based hypertrophy/recomposition coach. <training_metrics> numbers are computed from logged sessions — never invent or adjust them. Be direct: where goals conflict with constraints/research, say so.
+  // Task 7, Section 7: full day authorship (`days`) is a full-tier-only
+  // feature — applyAuthoredDays rejects it wholesale at checkin scope
+  // (Task 6, Section 2), so a checkin-tier brief doesn't mention it at
+  // all rather than invite a proposal that's guaranteed to be dropped
+  // unexplained. Declares the schema AND the decline-not-substitute rule
+  // explicitly, per the run instructions — "declare the days contract
+  // and the decline-not-substitute rule explicitly."
+  const daysContractSection = isFullTier ? `
+
+<days_contract>
+Optional \`days\` array — full session authorship, replacing the generator for named days. Each entry:
+{"dayKey": "<must be a real day id — see <program_days>>", "label": "...", "exercises": [{"exerciseId": "...", "order": 1, "sets": 4, "repMin": 10, "repMax": 15, "load": 35, "restSec": 90, "scheme": {"type": "straight"}, "rationale": "<required — why this exercise, this volume, this position>", "substitutedFor": "<optional — the exerciseId this replaces, if any>"}], "estimatedMin": 58, "weeklyGroupSets": {"arms": 22, "shoulders": 16}}
+
+DECLINE, DON'T SUBSTITUTE: if no exercise in <exercise_library> is verifiably safe and appropriate for a slot, leave that exercise out of \`exercises\` and say so in your reply — never propose a near-match you can't verify against the tags, and never invent an exercise outside the library. An unrecognized exerciseId is rejected outright, no fallback.
+
+A real substitution (replacing exercise A with a different, verified exercise B for a stated reason) is allowed — set \`substitutedFor\` to A's id and explain why in \`rationale\`. That is not the same as guessing when nothing actually fits.
+
+\`estimatedMin\` and \`weeklyGroupSets\` are self-reported and independently recomputed — Gates 10/11 reject a day if either is off by more than 10%, so make the arithmetic real, not a round number. A day must keep at least one exercise in any group this day's own template trains at specialize/emphasize focus (Gate 12), and can't drop a maintain-tier movement entirely without a same-pool substitute (Gate 13). One bad day doesn't cost you the rest of the plan — each day is gated independently and a rejected day just falls back to the generator, so a declined slot in one day never blocks another.
+</days_contract>` : "";
+
+  return `You are an evidence-based strength coach and exercise scientist designing training for a specific individual. Design complete sessions: select exercises, sequence them, assign sets, rep ranges, loads, and rest.
+
+Ground every decision in <research_context> and cite the specific entry ([id]) when it drives a choice. Where the corpus does not cover something, say so rather than asserting. Where the user's stated goals in <goal_profile> conflict with <constraints>, the session time budget, or the research, say so plainly and program for the constraint, not the preference.
+
+You must respect <constraints> and the tagged attributes in <exercise_library>. If no compatible exercise exists for a slot, leave it out and explain why — never substitute an exercise you cannot verify against the tags. <training_metrics> numbers are computed from logged sessions — never invent or adjust them.
 
 <goal_profile>
 ${goalProfile.text || "(not stated yet)"}
@@ -1640,6 +1678,7 @@ ${librarySectionIntro}
 ${isFullTier ? EXERCISE_LIBRARY_LEGEND : EXERCISE_LIBRARY_LEGEND_CHECKIN}
 ${formatExerciseLibraryCompact(libraryExercises, isFullTier)}
 </exercise_library>
+${programDaysSection}${daysContractSection}
 
 <training_metrics>
 ${JSON.stringify({ ...m, lifts: undefined }, (k, v) => (v === null ? undefined : v))}
@@ -1695,9 +1734,9 @@ ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 1. Assess progress vs. goal with the real numbers — name lifts/trends.
 2. Check <set_quality>/<pain_history>: flag rep collapse, under-range reps, or forced pain reduction; fix is lower load or a back-off, never a repeat.
 3. Push back on goal-vs-constraint/research conflicts; cite sources.
-4. Recommend: template ("balanced"|"upperFocus"|"superhero"); focus/group (shoulders/arms/chest/back/legs/core: maintain|normal|emphasize|specialize, max 2 emphasize+); sessionMin (45|60|75); calorieDelta (-300..300); next to watch. Optional \`prescriptions\`(exerciseId,dayKey,order,sets,repMin,repMax,load,restSec) + \`sessionRules\`(maxSetsPerMovement,orderByFocus,trimPriority,weeklyGroupSetCaps).
-5. Under 300 words.
-6. One \`\`\`json block: plan object, optionally + prescriptions/sessionRules. Gated on apply; injury constraints aren't overridable.
+4. Recommend: template ("balanced"|"upperFocus"|"superhero"); focus/group (shoulders/arms/chest/back/legs/core: maintain|normal|emphasize|specialize, max 2 emphasize+); sessionMin (45|60|75); calorieDelta (-300..300); next to watch. Optional \`prescriptions\`(exerciseId,dayKey,order,sets,repMin,repMax,load,restSec) + \`sessionRules\`(maxSetsPerMovement,orderByFocus,trimPriority,weeklyGroupSetCaps).${isFullTier ? ` Optional \`days\` (see <days_contract>) + \`splitPattern\` (a short label for the split you authored, e.g. "UULU" — descriptive only, not enforced).` : ""}
+5. Prose under 300 words; the \`\`\`json block (and every exercise's \`rationale\` in it) is separate and not counted against that.
+6. One \`\`\`json block: plan object, optionally + prescriptions/sessionRules${isFullTier ? "/days/splitPattern" : ""}. Gated on apply; injury constraints aren't overridable.${isFullTier ? " Every days[].exercises[] entry needs its own rationale — an entry without one is rejected (Gate 9). Decline a slot rather than guess: see <days_contract>." : ""}
 </instructions>`;
 }
 
