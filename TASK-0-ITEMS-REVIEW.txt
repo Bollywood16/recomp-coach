@@ -1,0 +1,142 @@
+TASK 0 — ITEMS 1-4 FROM REVIEW
+Branch: task-0-injury-profile
+Commit: 4c4ef3f "Task 0 item fixes: 3-state pain tracking, reference-safe defaults, allowlist checker"
+(on top of 92b15f4 "Task 0 fixes: fail-safe migration, cross-lift retro prompt, freeze backstop")
+
+================================================================================
+ITEM 1 — Dismissal must not read as "no pain" (Gate 5 implication)
+================================================================================
+The data model already had three distinguishable states via two fields
+(painRetro / painRetroDismissed), but it wasn't documented as a deliberate
+contract, and there was no signal for repeated non-reporting. Fixed both:
+
+- Documented explicitly at findAllPendingPainRetros: answered (painRetro is
+  a number, 0 included — "No pain" is a real one-tap answer, distinct from
+  Skip/dismiss), dismissed (painRetroDismissed:true, painRetro stays null),
+  pending (neither yet). Gate 5 (Task 4) must treat dismissed and pending as
+  UNKNOWN, never as a confirmed zero.
+- Added painReportingGaps(sessions, injuryProfile): flags a lift with 3+
+  consecutive dismissed-and-unanswered retros (most-recent-first; a single
+  answered session, including an explicit 0, resets the streak). Surfaced in
+  InjuryProfileCard as its own warning block.
+
+Verified (Node harness):
+  3 consecutive dismissed on the same lift          -> flagged, streak: 3
+  an answered session in the middle of the streak   -> not flagged ([])
+  recoveringMode: false                             -> not flagged regardless
+
+================================================================================
+ITEM 2 — Frozen DEFAULT_INJURY_PROFILE reference-sharing
+================================================================================
+Real gap, confirmed: `{ ...DEFAULT_INJURY_PROFILE, ...found.injuryProfile }`
+is a shallow merge — any key absent from `found.injuryProfile` (e.g. an old
+or partial stored record missing movementConstraints) falls through to the
+frozen singleton's NESTED object by reference, not a copy. Today's mutator
+functions (updateInjury/removeInjury/addInjury) all use map/filter/spread —
+never in-place mutation — so this didn't cause an observable failure yet,
+but it's a landmine: a future direct mutation
+(`injuryProfile.movementConstraints.forbidden.push(...)`) would throw/no-op
+against what looks like an ordinary per-user object.
+
+Fixed: added cloneInjuryProfileDefaults() (JSON.parse(JSON.stringify(...)) —
+safe, the record is plain data, no functions/Dates). Switched all three
+places that construct a NEW injuryProfile for persistence to use it instead
+of the frozen singleton directly:
+  - App's migration (both branches)
+  - InjuryProfileCard.save()
+  - BackupCard's import (both branches)
+Pure read-only fallbacks (display code, and the deepFreeze call sites in
+buildCoachBrief/applyCoachGates) were left pointing at the frozen singleton
+directly — that's correct and intentional, not a gap.
+
+Verified (Node harness):
+  clone !== DEFAULT_INJURY_PROFILE (top-level)                 -> true
+  clone.movementConstraints !== DEFAULT's                       -> true
+  clone.injuries !== DEFAULT's                                  -> true
+  two separate clone() calls don't share nested objects         -> true
+  clone is NOT frozen (editable)                                -> true
+  editing an injury on a freshly-defaulted profile persists     -> true
+  original DEFAULT_INJURY_PROFILE.injuries[0] left untouched    -> true
+
+================================================================================
+ITEM 3 — Write-isolation checker made allowlist-based
+================================================================================
+Rewrote scripts/check-write-isolation.js: instead of hardcoding
+["extractPlanJson", "applyCoachGates"], it now:
+  1. Scans every top-level function declaration for one taking
+     `injuryProfile` as a named parameter (word-boundaried regex over the
+     raw parameter-list text).
+  2. Compares the discovered set against REVIEWED_READERS (currently:
+     isSpecializationUnlocked, findAllPendingPainRetros, painReportingGaps,
+     applyCoachGates, askCoachLLM). Anything discovered but NOT in that list
+     fails the check by name, forcing an explicit reviewed decision.
+  3. Every discovered-and-reviewed function, plus extractPlanJson (always
+     checked as the fixed parser entry point), is scanned for writing
+     injuryProfile (object-literal key or property mutation).
+  4. Also warns (non-fatal) if a REVIEWED_READERS entry no longer exists in
+     source, so the list doesn't silently accumulate dead entries.
+
+Documented the convention this depends on: any function consuming
+injuryProfile must take it as an explicitly named parameter (destructured
+out of a context object if needed), not buried in an opaque blob — noted so
+Task 4/6's gate functions keep following it.
+
+Sanity-tested both failure modes against injected violations in a scratch
+copy, then confirmed the real source passes:
+  - a new function taking injuryProfile, not yet reviewed -> FAILS by name
+  - a reviewed function (applyCoachGates) made to reference
+    `{ injuryProfile: ... }` as a write target                -> FAILS by name
+  - real, unmodified source                                    -> PASSES
+`npm test` passes.
+
+================================================================================
+ITEM 4 — Browser verifications + history cap confirmation
+================================================================================
+Migration banner (the most important UI in Task 0): seeded legacy
+goalProfile-only localStorage via Playwright for three cases —
+  - explicit goalProfile.injuryRecovery === false -> banner: "...stayed off,
+    carried over from your previous setting..."
+  - goalProfile present, injuryRecovery absent (ambiguous) -> banner:
+    "Injury gating has been turned on..."
+  - no goalProfile at all (fresh user) -> no banner (nothing to migrate)
+All three rendered correctly, zero console errors.
+
+Dismissal persistence: first attempt showed the banner reappearing after
+reload — investigated and found this was a bug in the TEST, not the app:
+Playwright's page.addInitScript re-runs before every navigation in a
+context, including reload(), so it was re-seeding the original legacy-only
+payload and clobbering the app's own write right before the reload's JS ran.
+Corrected the test to seed once via a plain goto+evaluate (no addInitScript)
+before a real reload — confirmed the stored injuryProfileMigration.dismissed
+is true immediately after clicking dismiss, and the banner correctly stays
+gone after a real reload. Captured this as a documented gotcha in the new
+run skill so it doesn't cost time again.
+
+PendingPainRetroPrompts: seeded sessions at 1, 3, and 10 days old across
+three different lifts. Surfaced exactly the 1-day and 3-day sessions;
+correctly excluded the 10-day one. Zero console errors.
+
+injuryProfileHistory 50-entry cap: confirmed it existed ONLY in
+InjuryProfileCard.save() and was missing from the migration's history append
+and from mergeData's union — both fixed in this commit (see item 2's diff
+for exact locations). This was a real gap in the original report, not
+previously verified.
+
+================================================================================
+PROCESS
+================================================================================
+Captured the Playwright + local-static-server setup as a project skill at
+.claude/skills/run-recomp-coach/SKILL.md — dev-server command, driver
+skeleton, state-seeding pattern via the single `recompcoach:v2` localStorage
+key, and the gotchas hit while building this (ambiguous text selectors,
+per-set input indexing, and the addInitScript/reload trap from Item 4).
+Task 1 and Task 4 verification should reuse this rather than rediscovering
+the setup.
+
+================================================================================
+NEXT
+================================================================================
+Starting Task 1 (exercise library attribute tagging). Per your reminder,
+tagging coverage must be complete across all four sources (D, LIBRARY,
+LIBRARY_EXT, and the 9 inline BONUS exercises) — will report an exact count
+per source, not just the currently-constrained leg movements.

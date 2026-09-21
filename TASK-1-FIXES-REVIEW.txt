@@ -1,0 +1,171 @@
+TASK 1 — FIXES FROM REVIEW (items 1-5)
+Branch: task-0-injury-profile
+Commit: 6bcb5c0 "Task 1 fixes: goblet/boxsquat split, injury vocabulary, tag provenance"
+
+================================================================================
+ITEM 1 — goblet/boxsquat split
+================================================================================
+Confirmed the mechanical correction: a box IS a hard mechanical stop, same
+enforcement category as pinsquat's safety pins. The actual problem was one
+entry conflating two movements with different risk profiles.
+
+Split:
+  - goblet: "Goblet Squat (no box, self-limited)" — no external stop,
+    romProfile.squatDepth: below_parallel (conservative — no signal either
+    way), contraindications: ["hip_labrum"], tagSource: conservative_default
+  - boxsquat: "Box Squat (external stop)" — romProfile.squatDepth:
+    above_parallel, enforce: "box", contraindications: [], tagSource:
+    descriptive
+
+Also dropped axial_load from both (flagged, not silently changed): a
+goblet/box-squat hold is anterior/front-rack, not through the spine. It was
+only in the original combined entry because it was copied verbatim from
+the spec's own illustrative example — splitting the entry was the right
+moment to fix a mechanical inaccuracy noticed along the way.
+
+balanced.lowerB's slot repointed from goblet to boxsquat (the presumed
+default, matching "this lift shows +20% over 7 weeks with no logged pain"
+context).
+
+Migration (not a guess): App's load effect defaults historical
+exerciseId:"goblet" sessions to "boxsquat" and records a one-time
+GobletBoxSquatMigrationPrompt (Workout tab, not dismissible without
+resolving) asking the user to confirm. "No, it was Goblet" rewrites the
+sessions back AND sets data.swaps.boxsquat="goblet", reusing the existing
+swap mechanism — so the live "Lower B" day repoints its name, weight
+history, and progression tag correctly, verified in a real browser (see
+below), not just in storage.
+
+Real bug found and fixed along the way: D-only exercises only reach
+ALL_KNOWN via a PROGRAMS slot() reference (D itself is never spread into
+ALL_KNOWN directly). Removing goblet's only slot reference orphaned it
+completely — zero path into ALL_KNOWN/EX_BY_ID, which would have silently
+broken both the swap picker and the "No" correction path. Fixed by adding
+goblet to LIBRARY too, matching the existing dual-declaration pattern that
+exists for exactly this reason (machohp/cablelat/skull/ohte/ezcurl already
+do this). Caught by the harness verification, not by inspection — worth
+noting since it's the kind of gap easy to miss by reading the diff alone.
+
+================================================================================
+ITEM 2 — Closed INJURY_VOCABULARY
+================================================================================
+Added INJURY_VOCABULARY = { hip_labrum, prox_hamstring_tendinosis }.
+
+- InjuryProfileCard's per-injury editor is now a <select> populated from
+  the vocabulary (choosing an option sets id+label together in lock-step),
+  with an "Other" option that keeps a free-typed label under a
+  non-colliding custom_<timestamp> id — visibly flagged in the UI as
+  unmatched against anything tagged, since nothing has been reviewed
+  against a genuinely new injury yet.
+- addInjury() now defaults to the first vocabulary entry not already
+  present, rather than a blank free-text row.
+- validateContraindicationVocabulary(): startup assertion (console.error,
+  loud) — every contraindication id across all 75 tagged exercises must
+  exist in the vocabulary. Runs once at module load, right after
+  EXERCISE_ATTRS is applied (had to move it there — calling it any earlier
+  would check before any tags existed and trivially pass).
+- unknownInjuryIds(injuryProfile): the reverse check, surfaced directly in
+  InjuryProfileCard as a warning block when a stored injury's id isn't in
+  the vocabulary (e.g. a legacy custom_<timestamp> entry from before this
+  change).
+
+Verified: both checks return zero mismatches against the real data; a
+synthetic unrecognized id ({id:"custom_123", ...}) correctly triggers
+unknownInjuryIds(). Hand-tested in a real browser: adding a third injury
+correctly defaulted to "Other" (both vocabulary entries already in use),
+showed the free-text description field, and the "Unrecognized injury id"
+warning rendered with the correct explanation.
+
+================================================================================
+ITEM 3 — tagSource provenance
+================================================================================
+Added tagSource: "descriptive" | "from_app_caution" | "conservative_default"
+| "clinician_reviewed" to every one of the 75 exercises. Rule used (stated
+explicitly in the code comment so it's not re-litigated ad hoc later):
+
+  - descriptive: a mechanical fact, or a value read directly off the
+    exercise's own stated name (rdl's "(mid-shin range)", pinsquat's
+    "(above parallel)") — no risk-verdict inference involved.
+  - from_app_caution: the safety VERDICT (contraindicated or not, or
+    "treated as compliant") was inferred from an INDIRECT signal — caution
+    text, a vague behavioral name like "(pain-free depth)", or "this is
+    what the live program already prescribes safely today" — not a
+    directly stated value. 6 of 75: bbrow, trapdl, legpress, hacksquat,
+    smithsquat, bonus_walkinglunge.
+  - conservative_default: no signal at all; the more-restrictive value was
+    used rather than a guess at safe. 3 of 75: goblet, beltsquat,
+    pullthrough.
+  - clinician_reviewed: defined, unused (clinicianReviewed is false).
+
+isExerciseTagged() now also requires a valid tagSource — a tag missing
+this field no longer counts as complete. TaggingCoverageCard surfaces the
+conservative_default count and names explicitly ("3 tagged on an
+unverified conservative default, not a fact: Cable Pull-Through, Belt
+Squat, Goblet Squat (no box, self-limited)"), so 75/75 tagged can no
+longer be misread as 75/75 verified. Verified live in a browser.
+
+================================================================================
+ITEM 4 — Two synthetic fixtures for Task 4's test suite
+================================================================================
+Documented here so they're concrete and can't be silently dropped when
+Task 4's test suite is written. Neither exists in code yet — Gate 2 doesn't
+exist yet either. These are the fixtures Task 4 must add:
+
+Fixture A — synthetic exercise carrying the forbidden attribute:
+  { id: "test_deep_flexion_lift", name: "[TEST] Deep Loaded Hip Flexion",
+    cat: "squat", start: 45, inc: 5,
+    attributes: ["loaded_deep_hip_flexion", "knee_dominant"],
+    romProfile: { squatDepth: "below_parallel" },
+    contraindications: [], pool: "squat", tagSource: "descriptive" }
+
+Fixture B — synthetic pasted plan proposing it, to exercise the actual
+paste-and-apply path (extractPlanJson -> Gate 9/2), not just a unit call:
+  {"template":"balanced","focus":{"shoulders":"normal","arms":"normal",
+   "chest":"normal","back":"normal","legs":"normal","core":"normal"},
+   "sessionMin":60,"calorieDelta":0,
+   "prescriptions":[{"exerciseId":"test_deep_flexion_lift","dayKey":"lowerA",
+   "order":1,"sets":3,"repMin":8,"repMax":12}]}
+
+Expected: Gate 2 rejects both (forbidden-attribute intersection with
+injuryProfile.movementConstraints.forbidden = ["loaded_deep_hip_flexion"]),
+with a reason surfaced, not a silent drop.
+
+================================================================================
+ITEM 5 — Duplicate-declaration assertion
+================================================================================
+assertDuplicateDeclarationsMatch(): compares every id declared in both D
+and LIBRARY (now 6: machohp, cablelat, skull, ohte, ezcurl, goblet) across
+name/cat/start/inc/perHand/assistable/basedOn. Confirmed zero mismatches —
+today's declarations really were identical, not just eyeballed-identical.
+Logs loudly (console.error) if a future edit lets any pair drift, rather
+than silently letting _dedupe pick a winner.
+
+================================================================================
+VERIFIED
+================================================================================
+- Full re-transpile through Babel, zero syntax errors.
+- 75 ALL_KNOWN ids == 75 EXERCISE_ATTRS keys exactly (was 74 before the
+  split — the count changing by exactly +1 is itself a confirmation the
+  split didn't silently drop or duplicate anything).
+- 0 untagged (isExerciseTagged, now also gated on tagSource).
+- Both new startup assertions (vocabulary, duplicate-declarations) return
+  zero mismatches against real data.
+- npm test (write-isolation checker) passes — unknownInjuryIds added to
+  REVIEWED_READERS after confirming it only reads injuryProfile.
+- Real browser, zero console errors throughout: the full goblet/boxsquat
+  migration (auto-default on load, prompt renders, "Yes" resolves in
+  place, "No" rewrites sessions + swaps + correctly repoints the live
+  Lower B day's name/weight/progression tag), the injury vocabulary select
+  (including "Other" + the unrecognized-id warning), and
+  TaggingCoverageCard's new conservative-default section.
+
+================================================================================
+NEXT
+================================================================================
+Starting Task 4 (Safety gates 1-8) now, per your go-ahead. Will hold the
+three reminders in mind throughout: Gate 2 takes no bypass parameter
+anywhere and is reused verbatim as Gate 9; Gate 5 treats dismissed/pending
+pain retros as UNKNOWN, never zero; Gate 3's rejection path calls
+recommend() rather than duplicating the safe-load logic. All ten spec test
+cases plus the two fixtures above will run against the real app in a
+browser, not unit tests alone.

@@ -1,0 +1,547 @@
+TASK 3 — SET SCHEMES (BACK-OFF AND DROP SETS): DESIGN PROPOSAL
+Branch: task-0-injury-profile
+Status: PROPOSAL — reviewed with user, not yet implemented. No logger code
+written against this yet.
+
+Scope per the build spec:
+
+  {"type":"straight"}
+  {"type":"backoff","topSets":2,"backoffSets":2,"backoffLoadPct":80}
+    — accepts backoffLoad (absolute lb) as an alternative to the percentage
+  {"type":"drop","drops":1,"dropPct":20,"appliesTo":"lastSet"}
+    — appliesTo: "lastSet" | "allSets"
+
+Requirements from the spec:
+  1. The logger records each segment as its own set row with its own actual
+     load. The e1RM engine and stall detector must not be corrupted by
+     drop-set segments.
+  2. Drop segments are EXCLUDED from weekly hard-set volume counts but
+     INCLUDED in fatigue tracking. Document the decision where it can't be
+     re-decided wrongly.
+  3. Session card renders schemes legibly:
+     "2 x 15 @ 12.5 lb, then 2 x 15 @ 10 lb"
+  4. Duration estimation accounts for schemes when fitting to sessionMin.
+
+Constraints that follow from earlier tasks, checked explicitly:
+  5. maxSetsPerMovement: does a back-off scheme's topSets+backoffSets count
+     against the cap as one movement's total? Confirm capAndSplitMovement
+     sees the scheme's real total, not just a `sets` field.
+  6. Gate 3's load sanity runs against the TOP load — verify backoffLoadPct
+     can't smuggle a high top load past it.
+  7. Gate 8's render-time-only deload scaling — confirm it scales scheme
+     segments coherently, not just the top sets.
+  8. Pain escalation (Gate 5) is a one-way ratchet toward conservative — on
+     an escalating pattern, should drop sets be prescribed at all? User's
+     position: no, escalation should strip schemes to straight sets.
+
+Grounding: read resolveDayExercises, resolveSlot, recommend(), bestSet(),
+weeklySeries(), weeklySetsByGroup, capAndSplitMovement, gate3LoadSanity,
+gate5PainEscalation, isPainEscalating, fitDayToTime, gate7DurationTrim
+before writing this. Line numbers below are as of commit b75ae75
+(Task 2 commit 4).
+
+================================================================================
+DATA MODEL
+================================================================================
+
+scheme lives on the resolved exercise (ex.scheme), arriving via
+day.exercises[].scheme (generator-authored) or prescriptions[].scheme
+(coach-authored, added to resolveDayExercises's existing OVERRIDE_FIELDS
+list so REPLACE/ADD reconciliation carries it through exactly like
+sets/repMin already do). Shape unchanged from the spec.
+
+Three different "how much" numbers fall out of a scheme, and conflating
+them is what would break requirements 1, 2, 4, and 5:
+
+  Number                          | Helper              | straight | backoff              | drop
+  ---------------------------------------------------------------------------------------------------------------
+  Hard-set count (Gate 6,         | hardSetsFor(ex)      | ex.sets  | topSets+backoffSets  | ex.sets (unaffected)
+  maxSetsPerMovement,
+  weeklySetsByGroup)
+  ---------------------------------------------------------------------------------------------------------------
+  Total logged segments           | totalSegmentsFor(ex) | ex.sets  | topSets+backoffSets  | ex.sets + drops *
+  (duration, logger pre-fill)     |                      |          |                      | (appliesTo==="allSets"
+                                   |                      |          |                      |   ? ex.sets : 1)
+  ---------------------------------------------------------------------------------------------------------------
+  Tonnage / "fatigue tracking"    | weeklySeries()'s     | already correct unconditionally, no code change needed
+                                   | existing .vol field  |
+
+That third row is why requirement 2's "included in fatigue tracking"
+needs ZERO code change — weeklySeries already does
+s.sets.reduce((a,x)=>a+w*r) over whatever rows exist. The only place that
+needs new logic is the hard-set side (hardSetsFor).
+
+Logged session rows gain one field:
+  { w, r, segment: "straight" | "top" | "backoff" | "drop" }
+Each physical segment (each backoff set, each drop continuation) is its
+own row, per requirement 1 — mechanical once totalSegmentsFor tells the
+logger how many rows to pre-fill and at what default weight each one
+gets (top load, backoffLoad ?? topLoad*backoffLoadPct/100,
+topLoad*(1-dropPct/100)).
+
+WHY segment HAS TO EXIST, not just be inferred later from load ratios —
+the sharper reason for requirement 1 than e1RM corruption alone:
+recommend()'s progression math (index.html:1683-1723) computes
+allTop/belowMin/decay from EVERY row in the last session, unfiltered.
+That logic already exists specifically to detect "load too heavy, reps
+collapsing across sets" and prescribe a backoff — its own note text says
+so ("back off rather than grinding"). Feed it a DELIBERATE backoff/drop
+session unfiltered and every scheme'd session looks like unintended decay
+and triggers a false "Reduce". So:
+  - bestSet()/weeklySeries() (e1RM, stall detection): filter out
+    segment==="drop" rows before picking the best set. Backoff rows stay
+    in — a backoff set's e1RM will essentially never beat the top set's,
+    but excluding drops matters because a drop segment can produce an
+    inflated Epley estimate from a high-rep, low-weight continuation.
+  - recommend()'s double-progression check: filter to
+    segment==="top" || segment==="straight" only. "Did every set hit the
+    rep ceiling" is a question about the working sets, never the
+    deliberately-lighter ones.
+
+================================================================================
+POINT 5 — capAndSplitMovement / weeklySetsByGroup
+================================================================================
+
+Both currently read ex.sets raw (index.html:1543 in capAndSplitMovement,
+index.html:1000 in weeklySetsByGroup's fitted.forEach). Fix: both call
+hardSetsFor(ex) instead. For a backoff scheme this means topSets+
+backoffSets IS authoritative — if that sums above maxSetsPerMovement, it
+gets capped and split exactly like a flat over-cap prescription does
+today. For drop, hardSetsFor ignores the scheme entirely, so a drop
+scheme can never be used to sneak volume past the cap.
+
+DECISION NEEDING SIGN-OFF: when a capped exercise carries a backoff
+scheme, which part gets trimmed first? Proposed: backoffSets down to 0,
+then topSets — mirrors the existing "protect the prioritized work" trim
+philosophy. Does the SPAWNED pool-mate ever inherit a scheme, or does
+overflow always render as a plain straight set? Proposed: always
+straight — the overflow is leftover volume, not a deliberate intensity
+choice.
+
+================================================================================
+POINT 6 — Gate 3 vs backoff/drop load smuggling
+================================================================================
+
+Gate 3 (index.html:1989-2027) only ever inspects prescription.load — the
+top load. Two live smuggling vectors on top of that check:
+  - scheme.backoffLoad (absolute) is never validated against anything.
+  - scheme.backoffLoadPct > 100 makes the "backoff" heavier than the
+    already-approved top — backward, and an unchecked increase riding on
+    a field nothing looks at.
+
+Fix: not a new rejecting gate (a derived-from-an-approved-number question
+isn't a safety judgment call, it's arithmetic) — a small clamp step run
+AFTER gates 3/4/5 finalize value.load, so a Gate-4 pain reduction or
+Gate-5 escalation cap on the top automatically cascades: clamp
+backoffLoadPct to <=100; if scheme.backoffLoad exceeds the final top
+load, replace it with the percentage-derived value and note it. One
+place enforces "no segment ever exceeds the scheme's own top load,"
+rather than every consumer needing to remember to check it. Proposed
+name: clampSchemeToTopLoad(value), called at the tail of
+runPrescriptionGates.
+
+================================================================================
+POINT 7 — Gate 8 render-time deload, scheme-coherent
+================================================================================
+
+Two parts:
+  - Load: fine for free IF backoff/drop loads are always derived at
+    render time from the (already deload-scaled) top load rather than
+    cached as a stale absolute number — the same clamp function from
+    point 6 handles this, since it re-derives from whatever value.load
+    currently is.
+  - Sets: DayPage's isDeload block only touches .sets today.
+
+A DECISION SURFACED ALONGSIDE POINT 8, NOT DECIDED SILENTLY: should
+deload also strip schemes to straight — same logic as escalation,
+arguably stronger, since deload is a blanket whole-program recovery week
+and drop sets are specifically an effort-to-failure-maximizing technique
+that works against that. Proposed: yes. Implementation: one line added
+to DayPage's existing isDeload block (scheme: {type:"straight"}
+alongside its existing sets reduction) — bolted onto the mechanism that
+already exists rather than a new one, so recommend(), session-card
+rendering, and duration estimation never need to know deload is active;
+they just never see a non-straight scheme that week.
+
+================================================================================
+POINT 8 — escalation strips schemes to straight
+================================================================================
+
+Agreed with the user's position. Implemented as an extension of
+gate5PainEscalation (index.html:2064-2076): whenever
+ctx.escalatingCats.has(ex.cat), force value.scheme = {type:"straight"}
+alongside its existing sets-cap. Documented in the "ESCALATION IS A
+ONE-WAY RATCHET" comment block that already governs gates 3/4/5, so this
+can't be re-inverted without deleting the comment that explains why —
+same treatment as the rest of that ratchet.
+
+A THIRD INTERACTION FOUND WHILE TRACING THIS, not asked for but real:
+gate5PainEscalation's lastSetCount = last.sets.length (index.html:2068)
+counts raw logged rows. Once drop segments are separate rows, a
+4-hard-set session with one drop logs as 5 rows — the escalation cap
+would silently admit 5 "sets" next time instead of capping at the true
+4. Needs to become a hard-set row count (segment !== "drop"), not
+.length. Same corruption class as the e1RM concern in requirement 1,
+just a third place it was hiding.
+
+================================================================================
+ALSO FOUND: DURATION (POINT 4) HAS ITS OWN TRIM-ORDER WRINKLE
+================================================================================
+
+fitDayToTime and gate7DurationTrim share the same
+dur = sets*(40+restSec) shape. Backoff needs no formula change (its sets
+are already full rested sets once hardSetsFor/totalSegmentsFor agree).
+Drop needs an additive term — proposing a DROP_SEGMENT_SEC constant
+(~20s: no independent rest, since minimal/no rest is the defining trait
+of a drop set, just enough added work time). This number has no spec
+anchor the way DEFAULT_MAX_SETS_PER_MOVEMENT did — flagged as arbitrary
+and open to adjustment. Separately, trimming a scheme'd exercise for
+time should shave in the order: drop segments first (cheapest, don't
+count as hard sets anyway), then backoffSets, then top/straight sets —
+same priority ordering as point 5's cap-trim, for the same reason.
+
+================================================================================
+RECAP — DECISIONS NEEDING SIGN-OFF BEFORE IMPLEMENTATION
+================================================================================
+
+1. Backoff's topSets+backoffSets is authoritative for hard-set count,
+   overriding any separately-specified sets field, rather than requiring
+   them to match / erroring if they disagree.
+2. Overflow trim order within a capped backoff scheme: backoffSets first,
+   then topSets; spawned pool-mate always gets a plain straight scheme.
+3. The "no segment exceeds the top load" clamp is a silent, unconditional
+   derivation step (not a rejecting gate) — always fixes rather than
+   flags for user confirmation, matching gates 3/4/5's existing "modify
+   and continue" pattern.
+4. Deload strips schemes to straight, same as escalation (point 8's logic
+   extended).
+5. Drop-segment duration cost: proposing ~20s work, no independent rest —
+   flagging since there's no existing anchor value like
+   DEFAULT_MAX_SETS_PER_MOVEMENT had.
+6. Gate 5's lastSetCount needs to switch from raw row count to hard-set
+   row count.
+
+================================================================================
+RESOLUTIONS (user review round 2)
+================================================================================
+
+All six decisions APPROVED, with three changes and two additions:
+
+1. Backoff-total authoritative — APPROVED WITH CHANGE. Reject a
+   prescription whose bare `sets` field disagrees with its backoff
+   scheme's own topSets+backoffSets, rather than silently preferring one.
+   Implemented as Gate 1e (gate1eSchemeConsistency).
+2. Trim order + spawned-always-straight — APPROVED as proposed.
+3. Clamp, not a rejecting gate — APPROVED WITH CHANGE. Always emit a note,
+   never silent, same as every other modify-and-continue path. A
+   backoffLoadPct over 100 especially — that's an author writing something
+   incoherent, not arithmetic drift, and it must be visible.
+4. Deload strips schemes to straight — APPROVED as proposed. Reasoning
+   noted as stronger than the escalation case (point 8): deload is a
+   blanket recovery week, drop sets are an effort-maximizing technique.
+5. DROP_SEGMENT_SEC ~20s — APPROVED as a named constant with a comment
+   stating it's an estimate with no research or spec anchor.
+6. lastSetCount -> hard-set row count — APPROVED, recorded as a Task 4
+   sign-off amendment in DEFERRED-TESTS.md (second one, alongside Gate 8's).
+
+Two additions:
+  A. Migration default: absent `segment` reads as "straight," never
+     "drop." Every filter must use EXCLUSION predicates (`!== "drop"`,
+     `!== "backoff" && !== "drop"`), never INCLUSION whitelists
+     (`=== "top"`) — an inclusion whitelist silently excludes every
+     pre-Task-3 session, since `undefined === "top"` is false. This
+     corrected a mistake in my own first-draft proposal text, which said
+     "filter to segment==='top'||'straight'" — exactly the wrong form.
+  B. Partial logging: confirmed saveSession's existing `.filter(r>0)`
+     already prevents phantom zero-rep rows (unchanged, out of scope this
+     round). A manually-added extra row gets no explicit segment tag,
+     which is safe under the exclusion-predicate design (undefined reads
+     as straight) — to be made explicit when the logger UI ships.
+
+Also requested: grep every consumer of a session's set rows before
+implementing, since four were found one at a time. Full audit below.
+
+================================================================================
+SET-ROW CONSUMER AUDIT (requested before implementation)
+================================================================================
+
+grep -n "sets\.map\|sets\.reduce\|sets\.length\|sets\.filter\|sets\.forEach\|
+sets\.find\|sets\.some\|sets\.every\|sets\.slice" index.html
+
+Correctness-critical (code changed):
+  1. bestSet() (e1RM/weeklySeries/stallScore) — excludes "drop".
+  2. recommend()'s progression math — excludes "backoff" and "drop"
+     (THE finding: unfiltered, a deliberate backoff/drop reads as
+     unintended decay, compounding a reduction on top of a reduction).
+  3. gate5PainEscalation's lastSetCount — excludes "drop" (decision 6).
+  4. buildCoachBrief's <set_quality> section — sent to the coaching LLM
+     with an instruction to flag rep decay as "too heavy, don't repeat."
+     Unfiltered, a deliberate backoff/drop reads to the MODEL exactly
+     like the collapse it's told to flag. Annotated inline
+     ("80x12(backoff)"), not filtered — the model should see the whole
+     session, correctly labeled.
+
+Correctness-adjacent, minor (code changed):
+  5. ExerciseCard's "LAST TIME" panel — colored a row orange when
+     s.r < ex.repMin. A backoff/drop segment is deliberately at a
+     different rep target; unfiltered, this flags correct execution as a
+     shortfall. Now skips the warning for backoff/drop rows.
+
+Confirmed safe by construction, no change needed (stated explicitly
+rather than silently assumed):
+  6. lastWorkingWeight() — Math.max over the session's weights. A
+     backoff/drop segment is by definition <= the top load once the
+     clamp (decision 3) holds that invariant structurally, so Math.max
+     can never select one.
+  7. weeklySeries's tonnage sum (.vol) — deliberately unfiltered; this IS
+     "fatigue tracking" per requirement 2.
+
+Display-only, no corruption risk, deferred to the logger-UI round for
+legible formatting (requirement 3):
+  8. Log tab's "Recent sessions" list.
+  9. ExerciseCard's own draft input array — the write side, requirement
+     1's implementation surface itself, not a historical consumer.
+
+================================================================================
+IMPLEMENTED THIS ROUND (commit c-tbd — see git log)
+================================================================================
+
+Data model:
+  - hardSetsFor(ex) / totalSegmentsFor(ex): the two derived numbers (see
+    the DATA MODEL section above). ex.sets is normalized to hardSetsFor's
+    answer ONCE, inside resolveDayExercises, right after prescription
+    reconciliation and before capAndSplitMovement — every downstream
+    reader (capAndSplitMovement, weeklySetsByGroup, dayFittedMinutes,
+    dayFocusSummary, DayPage) keeps reading plain .sets with zero
+    scheme-awareness of its own.
+  - scheme added to resolveDayExercises's OVERRIDE_FIELDS (REPLACE/ADD
+    reconciliation) so a prescription's scheme survives exactly like
+    sets/repMin already did.
+  - Gate 1e (gate1eSchemeConsistency): decision 1's mismatch rejection,
+    wired into runPrescriptionGates in the 1-family chain.
+
+Point 5 (capAndSplitMovement):
+  - Backoff-first trim: new shared trimOneHardSet(ex), used by BOTH
+    capAndSplitMovement's cap-trim and fitDayToTime/gate7DurationTrim's
+    time-trim, so the two trim mechanisms can't disagree about which part
+    of a scheme gets shaved.
+  - Spawned pool-mate: explicit scheme: undefined — overflow is leftover
+    volume, never a deliberate intensity choice.
+
+Points 6/7 (the clamp):
+  - clampSchemeToTopLoad(value): closes both smuggling vectors
+    (backoffLoadPct > 100, absolute backoffLoad exceeding the top),
+    clamps dropPct >= 100 too (same class of incoherence, not explicitly
+    named by point 6 but the same hole). Runs LAST in
+    runPrescriptionGates, after gates 3/4/5 settle value.load, verified
+    to cascade correctly past a Gate-4 pain-rule reduction (a
+    backoffLoad fine against the ORIGINAL load but not the REDUCED one is
+    still caught).
+
+Point 4/decision 4 (deload):
+  - deloadScale(ex, isDeload): extracted from what was an inline one-liner
+    in DayPage's isDeload block into its own named, directly testable
+    function — everything else this deep in the safety logic has a
+    deliberately-reintroduced-bug test behind it; this now does too.
+
+Point 8 + decision 6 (Gate 5):
+  - gate5PainEscalation strips any non-straight scheme to
+    {type:"straight"} unconditionally when escalating, alongside its
+    existing sets cap — documented in the ratchet's own comment block,
+    same treatment as the rest of it.
+  - lastSetCount now excludes segment==="drop" rows (decision 6),
+    recorded as a second Task 4 sign-off amendment in DEFERRED-TESTS.md.
+
+Point 4/requirement 4 (duration):
+  - DROP_SEGMENT_SEC (20s, named constant, comment states it's an
+    estimate with no anchor) and dropExtraSec(ex), added to BOTH
+    fitDayToTime's and gate7DurationTrim's dur() formulas.
+  - Did NOT implement a separate "strip drop before cutting a real set"
+    time-trim pre-pass from the proposal's "ALSO FOUND" section — wasn't
+    explicitly requested, and a ~20s-vs-100s+ effect didn't seem to
+    justify the added complexity/edge cases. Flagging in case it's
+    wanted; trimOneHardSet's existing backoff-first ordering still holds
+    for the per-set trim either way.
+
+Point 1 (segment-aware filtering, migration-safe throughout):
+  - bestSet(): excludes "drop".
+  - recommend(): working-set filter excludes "backoff" and "drop", with a
+    defensive fallback to all rows if a session somehow has no top/
+    straight row at all (guards a Math.max(...[]) === -Infinity edge
+    case this filter could otherwise produce).
+  - buildCoachBrief's <set_quality>: inline (backoff)/(drop) annotation.
+  - ExerciseCard's LAST TIME panel: skips the shortfall-warning color for
+    backoff/drop rows.
+
+Verification:
+  - scripts/check-set-schemes.js: 39 assertions (data model,
+    decision 1's rejection, decision 2's trim order and spawned-always-
+    straight, decision 3's clamp with cascade-past-Gate-4, decision 4's
+    deloadScale, decision 6 + point 8's Gate 5 behavior, point 4's
+    duration, point 1's bestSet drop-exclusion).
+  - scripts/check-set-scheme-migration.js: 5 assertions, Addition A.
+  - Six separate deliberately-reintroduced-bug checks, each confirmed to
+    fail for the predicted reason before being restored: the tally
+    subtraction analog for this task doesn't apply, but equivalents were
+    run for (a) recommend()'s inclusion-vs-exclusion filter — caught only
+    by a MIXED-session test, not a pure-legacy one, since a pure-legacy
+    session's empty inclusion-whitelist result is masked by the same
+    defensive fallback that protects the genuine no-top-row edge case (a
+    real gap in my first testing attempt, fixed before reporting this);
+    (b) bestSet's drop exclusion, using a drop segment engineered to
+    numerically beat the top set's e1RM; (c) Gate 5's lastSetCount
+    exclusion; (d) deloadScale's scheme-stripping.
+  - Live headless-browser regression check: existing (non-scheme)
+    exercise logging, Focus tab, and day rendering all unaffected, zero
+    console errors. Live end-to-end check of a backoff-scheme prescription
+    applied through the real paste-and-apply UI: rendered "4 x 6-10 at 95
+    lb" (topSets 2 + backoffSets 2, hardSetsFor's normalization working
+    through the full real pipeline), PRESCRIBED tag, correct "Replaces"
+    note, zero console errors. Per-segment legible display ("2x...,
+    then 2x...") is requirement 3, explicitly deferred to the logger-UI
+    round below.
+  - npm test: all 7 scripts pass, 199 assertions total across the whole
+    suite.
+
+Not touched this round, deliberately (per "stop before the logger UI
+changes"): ExerciseCard's input pre-fill (totalSegmentsFor-driven row
+generation with per-segment default weights), saveSession (segment
+tagging on save), and the legible session-card rendering (requirement 3).
+This is where the migration risk actually sits — new segment-tagged rows
+starting to interact with old untagged ones — so it gets its own review
+round before landing.
+
+================================================================================
+NEXT (superseded by the round below)
+================================================================================
+Non-logger-UI implementation complete and verified. Awaiting review before
+the logger UI round: ExerciseCard's pre-fill + saveSession segment tagging
++ requirement 3's legible rendering.
+
+================================================================================
+LOGGER UI ROUND (user review round 3) — DONE
+================================================================================
+
+Scope: ExerciseCard pre-fill per totalSegmentsFor with per-segment default
+loads (point 1); saveSession tags each row (point 2); requirement 3's
+legible rendering; segment visible and correctable in the UI (point 5);
+the Log tab's quick-log form gets the same treatment (point 6); Addition
+B's partial-logging confirmation, with a correction — an over-logged extra
+row defaults to the SAME segment as the row above, not "straight" as
+originally proposed.
+
+New pure functions (both directly unit-tested, no React needed):
+  - buildSegmentRows(ex, rec): one row per totalSegmentsFor(ex), each with
+    its own segment tag and default weight — top at rec.weight, backoff
+    at scheme.backoffLoad ?? rec.weight * backoffLoadPct/100, drop at
+    rec.weight * (1 - dropPct/100), inserted after the set(s) appliesTo
+    targets. Every row's segment is written EXPLICITLY, including "top"
+    for a plain/no-scheme exercise — simpler than two representations
+    (omitted vs "top") for the same thing, and harmless: every exclusion
+    predicate from the previous round already treats them identically.
+    Bodyweight guard: rec.weight === 0 keeps every segment at 0 rather
+    than round5's floor manufacturing a fake "5 lb" backoff/drop.
+  - formatSchemeSets(sets): groups consecutive same-segment rows,
+    "N x reps @ weight lb", joined by "then" — matches the spec's own
+    example EXACTLY, character for character, once verified. Deliberately
+    NO parenthetical segment label (an earlier draft added "(backoff)"/
+    "(drop)" annotations; removed to match the spec's literal example —
+    the "then"-separated grouping and differing numbers already carry the
+    structure, and requirement 3 asks for fewer words, not more). Falls
+    back to a slash-joined list when weight or reps vary within one
+    group, rather than silently picking one number.
+
+UI wiring:
+  - New SegmentPicker component (Top/Backoff/Drop pills), shown per row
+    ONLY when the exercise's own scheme makes more than one segment
+    possible (backoff or drop) — a plain exercise has nothing to get
+    wrong (every row is trivially "top"), and showing this on every set
+    of every exercise would be exactly the clutter requirement 3 asks
+    this UI to avoid. Wired into BOTH ExerciseCard and the Log tab's
+    quick-log form.
+  - ExerciseCard's pre-fill useEffect now calls buildSegmentRows instead
+    of a flat ex.sets copies-of-one-number. saveSession persists each
+    row's segment. "+ Add set" defaults the new row to the SAME segment
+    AND weight as the row above (point 4's correction from "straight") —
+    "one more like the last one" matches what adding an extra set
+    mid-scheme almost always means.
+  - The Log tab's quick-log form (point 6) now routes its exercise list
+    through resolveDayExercises instead of a hand-rolled resolveSlot-only
+    map — without this it had no scheme context to key the picker or
+    pre-fill off at all. Its blank-slate design (never auto-fills a
+    recommended weight, unlike ExerciseCard) is preserved: row count and
+    segment sequence come from buildSegmentRows(ex, {weight:0}), which
+    conveniently blanks every weight via the same bodyweight guard,
+    keeping this form's existing "manual, no auto-fill" character while
+    still seeding the right number of rows with the right tags.
+  - "LAST TIME" panel and the Log tab's "Recent sessions" list both now
+    render formatSchemeSets' one-liner (requirement 3) — the per-set
+    S1/S2/S3 breakdown stays underneath for anyone who wants the detail.
+
+Addition B (partial logging), confirmed rather than assumed:
+  - Under-logging: saveSession's existing `.filter(s => s.r > 0)` already
+    drops any row nobody filled in — unchanged, segment tagging rides
+    along harmlessly on a row that gets filtered out either way. No
+    phantom zero-rep rows.
+  - Over-logging: corrected per the review — same segment AND weight as
+    the row above, not "straight" regardless of context.
+
+REAL GAP FOUND WHILE BUILDING THE REQUIRED END-TO-END VERIFICATION, not
+hypothetical: clampSchemeToTopLoad (previous round's point 6/decision 3
+fix) short-circuited entirely whenever a prescription's `load` was
+omitted (the spec's own "let recommend() drive it" case) — meaning a
+backoffLoadPct of 150% would sail through completely unclamped whenever
+no explicit top load was prescribed, which is precisely the scenario
+needed to exercise recommend()'s history-driven path at all (a prescribed
+`load` makes ex.prescribedLoad win unconditionally forever, so
+recommend()'s progression math — the actual subject of this whole task —
+never even runs while one is active). Fixed: the percentage clamps
+(backoffLoadPct, dropPct) now run regardless of whether load is known;
+only the ABSOLUTE backoffLoad-vs-top comparison still needs a concrete
+top number to compare against, so that piece alone stays conditional.
+New regression tests for both the load-omitted and load-present paths,
+verified against a deliberately reverted fix (confirmed 3 assertions fail
+with the exact unclamped values before restoring).
+
+Verification:
+  - scripts/check-set-scheme-logger.js: 13 assertions (buildSegmentRows
+    across straight/backoff/both drop appliesTo values/the bodyweight
+    guard; formatSchemeSets against the spec's literal example, plain
+    sessions, legacy no-segment rows, varied data, empty input).
+  - scripts/check-set-schemes.js: +3 assertions for the clamp gap above.
+  - Two deliberately-reintroduced-bug checks this round (bodyweight
+    guard, the clamp gap), both confirmed to fail for the predicted
+    reason before being restored.
+  - REQUIRED END-TO-END LIVE VERIFICATION (this is the one that actually
+    proves the task, not a proxy for it): applied a backoff-scheme
+    prescription (topSets:2, backoffSets:2, backoffLoadPct:70, load
+    OMITTED so recommend()'s history path actually runs) to Incline DB
+    Curl through the real paste-and-apply UI. Opened the exercise fresh:
+    pre-fill showed exactly 4 rows at [15, 15, 10, 10] lb with the
+    correct segment pills pre-selected, segment picker visible and
+    tappable. Logged top sets at 15 reps (hit the ceiling) and backoff
+    sets at 6 reps (a normal, correctly-executed backoff pushed toward
+    failure at the lighter load) — exactly the input that read as
+    unintended decay before this task existed. Reopened the exercise:
+    "LAST TIME" showed "2 x 15 @ 15 lb, then 2 x 6 @ 10 lb" (character-
+    for-character the spec's format) with the backoff rows correctly NOT
+    flagged by the rep-floor warning; the card showed "ADD WEIGHT" at
+    17.5 lb with the note "You hit 15+ reps on every set at 15 lb. Move
+    up..." — completely unaffected by the backoff set's low rep count.
+    Then, to prove this is actually load-bearing and not a coincidence:
+    reverted recommend()'s exclusion filter, reran the IDENTICAL scenario
+    from the same saved state — the card flipped to "REDUCE" with "Your
+    reps fell from 15 to 6 at 15 lb — that's a 60% drop... Drop to
+    12.5 lb" — the exact compounding-reduction bug this whole task exists
+    to prevent, reproduced live from real UI interaction, not a synthetic
+    unit test. Restored the fix, reran, confirmed "ADD WEIGHT" again.
+    Zero console errors across every run.
+  - npm test: 8 scripts, 227 assertions total across the whole suite.
+
+================================================================================
+NEXT
+================================================================================
+Task 3 complete: all four requirements, all eight review-round
+constraints, both post-review additions. Next: the real-data day
+comparison (Task 2's earlier deferred request) once the backup export is
+available, then Task 6.

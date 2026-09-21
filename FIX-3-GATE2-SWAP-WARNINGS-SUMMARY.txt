@@ -1,0 +1,164 @@
+FIX 3 — GATE 2 VS. USER SWAPS: WARN, DON'T BLOCK
+Branch: task-0-injury-profile
+Status: IMPLEMENTED, TESTED, COMMITTED. Part 3 of 3 — the real-data
+findings from TASK-0-BACKUP-MIGRATION-REVIEW.txt are now fully addressed.
+
+================================================================================
+THE BUG
+================================================================================
+
+TASK-0-BACKUP-MIGRATION-REVIEW.txt, section 4. gate2Injury ran nowhere in
+the swap path: resolveSlot does a plain `swaps[slot.id]` lookup with zero
+gate calls. A swapped-in contraindicated exercise was invisible at every
+stage — not flagged in the swap picker, not warned about once swapped, not
+listed anywhere reviewable. Confirmed live against the real data: the
+legpress->goblet swap (8 logged sessions, recoveringMode true) sat
+completely unflagged.
+
+================================================================================
+THE FIX — SCOPE (a)-(d)
+================================================================================
+
+(a) SWAP PICKER. Every alternate in ExerciseCard's picker is checked with
+    gate2Injury at render time; a contraindicated one gets a red border and
+    a warning line under its name, but the button's onClick is untouched —
+    flagged-but-selectable, per your stated lean. Filtering would have hidden
+    the option and the reason together.
+
+(b) PERSISTENT CARD WARNING. Two tiers: a small "⚠ Contraindicated" badge in
+    the collapsed header (visible every time the card appears in the day
+    list, not only after opening it), plus a full non-dismissible warning
+    card in the open detail view — same visual pattern as the existing
+    ClinicianReviewNotice / PainEscalationNotice — every time the card is
+    opened, for as long as the contraindication is active.
+
+(c) NEVER AUTO-REMOVE. Both warning surfaces are read-only: gate2Injury's
+    result is only ever rendered, never acted on. Verified directly (not
+    just by code inspection): running the warn-mode check, and browsing
+    through the swap picker, injury card, and the exercise card open/closed,
+    leaves data.swaps / data.sessions / data.injuryProfile byte-identical.
+
+(d) INJURY PROFILE CARD. A new "Contraindicated in your current program"
+    section lists every contraindicated exercise anywhere in the active
+    program (contraindicatedInActiveProgram — generator, swaps, bonus, and
+    reconciled prescriptions, via the same resolveDayExercises every other
+    render path already agrees on), deduped by exerciseId, read-only.
+
+================================================================================
+CONSTRAINT 1 — ONE IMPLEMENTATION, NOT A FORK
+================================================================================
+
+gate2Injury itself is byte-for-byte unchanged. Every warn-mode call site —
+the swap picker, the persistent card, contraindicatedInActiveProgram — calls
+the exact same function with a bare {exerciseId} and only changes what
+happens with a `reject: true` result (render a warning) rather than what the
+function does. Confirmed structurally, not just asserted: grepped every
+gate2Injury( call site in index.html (6 total: the definition,
+capAndSplitMovement's pool-splitting reuse from Task 2, the
+prescription-pipeline reject path, and the three new warn-mode call sites) —
+no parallel "isContraindicated" reimplementation exists anywhere.
+
+================================================================================
+CONSTRAINT 2 — THE ASYMMETRY IS DOCUMENTED, NOT JUST PRACTICED
+================================================================================
+
+Added directly to gate2Injury's own doc comment in index.html (the first
+place a future edit to this gate would look): a pasted prescription is an
+LLM's proposal with no human in the loop before the write, so Gate 2
+rejecting it outright is Task 4's whole premise. A swap is the user
+themself, in the room, choosing their own exercise — hard-blocking it would
+be the app overriding a person's real-time judgment on the strength of a tag
+that (per point 4 below) is sometimes itself just an unverified guess. Cites
+the real goblet data (+20% progress over 7 weeks, zero logged pain before
+the tag existed) as the concrete case this asymmetry protects. States
+explicitly that this is deliberate, not an inconsistency to "fix" later by
+hard-blocking swaps too.
+
+================================================================================
+POINT 4 — TAGSOURCE-HONEST COPY (wording approved 2026-09-20)
+================================================================================
+
+contraindicationSourceNote(ex, variant) — one function, reused by all three
+warn surfaces — maps an exercise's tagSource to an honest qualifier:
+  conservative_default (goblet): "an unverified guess, not clinical
+    judgment — no signal existed either way when this was tagged, so the
+    stricter assumption was made rather than assuming it's safe"
+  from_app_caution (bbrow, trapdl): "inferred from caution notes already in
+    this app's exercise library, not a clinician's direct review"
+  clinician_reviewed: "confirmed by the clinician managing this injury"
+    (unused today, defined so nothing needs editing the day it isn't)
+  descriptive / no tagSource: no note — nothing to disclose (a mechanical
+    fact, or Gate 2's own "untagged" reason already explains the unknown)
+
+REAL BUG FOUND WHILE BUILDING THIS, FIXED BEFORE SHIPPING: the note was
+originally gated on `ex.contraindications.length > 0` — wrong. For the
+user's actual legpress->goblet swap, Gate 2 rejects goblet via its
+romProfile squat_depth LIMIT check, which runs before the contraindications
+check in gate2Injury and fires first — so the contraindications-length gate
+missed it entirely, silently dropping the honesty note for the one real
+exercise this was written for. Caught immediately by
+scripts/check-injury-swap-warnings.js against the real backup file, not by
+inspection. Fixed by keying the note on `ex.tagSource` alone (a tagSource
+covers an exercise's WHOLE verdict — attributes, romProfile, and
+contraindications together, one tagSource per exercise, not one per field —
+confirmed against EXERCISE_ATTRS' own comment), independent of which
+specific Gate 2 branch actually fires. Documented at length in
+contraindicationSourceNote's own comment so this isn't silently reintroduced.
+
+================================================================================
+TESTS
+================================================================================
+
+npm test: 296 assertions pass total (257 pre-existing, unmodified in
+behavior + 19 new in scripts/check-injury-swap-warnings.js, wired into
+`npm test`):
+  1. gate2Injury's result is byte-identical whether framed as a prescription
+     call or a bare swap check — proves no fork.
+  2. contraindicationSourceNote's three tiers (conservative_default,
+     from_app_caution, none-for-descriptive/untagged) against real
+     EX_BY_ID entries (goblet, bbrow, bench).
+  3. contraindicatedInActiveProgram: empty when not recoveringMode (matches
+     gate2Injury's own short-circuit); finds a synthetic goblet swap while
+     recovering; carries gate2Injury's own reason verbatim; dedupes a
+     contraindicated exercise swapped into two different slots down to one
+     entry.
+  4. Real data end to end: the actual legpress->goblet swap (8 logged
+     sessions, recoveringMode true) is found, named correctly, carries the
+     honesty note — and running the check leaves data.swaps,
+     data.sessions, and data.injuryProfile byte-identical before and after
+     (point c verified as a fact about the call, not asserted by comment).
+
+Deliberate-break checks (same discipline as Fix 1/2):
+  - The contraindications-length gating bug above was FOUND by the real-data
+    test itself (not a deliberate break — an actual bug), then fixed and
+    reverified.
+  - contraindicatedInActiveProgram's `if (!injuryProfile.recoveringMode)
+    return []` guard: broken (forced to never short-circuit) and re-ran —
+    all 19 assertions still passed. Not a test gap: gate2Injury has its own
+    identical short-circuit, so this guard is genuine defense-in-depth, not
+    load-bearing on its own. Restored anyway (still correct, still cheap).
+  - contraindicatedInActiveProgram's dedup: broken for real this time
+    (swapped the `Map` keyed by exerciseId for a plain array with no
+    dedup at all) — the dedup assertion failed immediately, showing the
+    exact duplicate goblet entry. Restored; diff-clean before committing.
+
+Live browser verification (Playwright, real backup file, unmodified —
+injuryRecovery: true, so recoveringMode seeds true via Fix 2's migration):
+imported the real file into a fresh app, navigated to the Lower day,
+confirmed all four UI surfaces render exactly the approved copy —
+"⚠ CONTRAINDICATED" collapsed badge (uppercase via the same S.tag CSS every
+other badge uses), the full persistent warning with the honesty qualifier
+and non-auto-removal instruction, the swap picker's flagged-but-selectable
+line, and the Injury Profile card's "CONTRAINDICATED IN YOUR CURRENT
+PROGRAM" section naming Goblet Squat. Re-read localStorage after browsing
+through all of it: swaps.legpress is still "goblet", session count still
+168 — nothing auto-reverted. Zero console errors.
+
+================================================================================
+NOT FIXED / NOT IN SCOPE HERE
+================================================================================
+
+Nothing — this closes out the three fixes scoped against the real-data
+review (Fix 1: trim priority; Fix 2: backup-import migration; Fix 3: Gate 2
+vs. swaps). Task 6 and Task 7 remain, per DEFERRED-TESTS.md, with their
+scope not yet reviewed against the real-data findings.

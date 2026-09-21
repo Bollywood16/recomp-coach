@@ -1,0 +1,13 @@
+{
+  "name": "recomp-coach",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Single-file React PWA, static-hosted on GitHub Pages.",
+  "scripts": {
+    "test": "node scripts/run-tests.js"
+  },
+  "devDependencies": {
+    "@babel/core": "^8.0.1",
+    "@babel/preset-react": "^8.0.1"
+  }
+}

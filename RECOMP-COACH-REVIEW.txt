@@ -1,0 +1,237 @@
+RECOMP COACH — PRE-IMPLEMENTATION REVIEW
+Structure map, spec/code mismatches, and proposed data model for Tasks 0, 1, 4
+(prepared before any code changes, per RECOMP-COACH-BUILD.md build order)
+
+================================================================================
+1. WHERE THINGS LIVE TODAY (index.html, 2814 lines, single-file React app)
+================================================================================
+
+Spec concept          | Actual location                                   | Notes
+-----------------------|---------------------------------------------------|------
+Exercise library       | Three separate literals merged at load: `D`       | Not one array — Task 1
+                       | (line 62, core lifts referenced by PROGRAMS       | must tag all four
+                       | slots), `LIBRARY` (175), `LIBRARY_EXT` (205,      | sources.
+                       | ranked alternates with why/caution text), plus    |
+                       | 9 inline exercises defined inside `BONUS` (368).  |
+                       | All merged+deduped into ALL_KNOWN/EX_BY_ID        |
+                       | (254-255, 384).                                   |
+
+Session generator      | Spread across getProgram() (364) -> resolveSlot() | No single "generator"
+                       | (806, applies swaps + adjustSets emphasis         | function — it's a
+                       | scaling) -> bonusForDay() (399, specialize-only   | render-time pipeline,
+                       | bonus lifts) -> fitDayToTime() (428, time         | re-run on every paint.
+                       | trimming) -> rendered in DayPage (1262).          |
+
+Plan parser            | extractPlanJson() (743) — pulls a fenced json     | Wired up in
+                       | block and JSON.parses it. applyCoachGates()       | CoachCard.applyPasted()
+                       | (2144) runs the only existing gates.              | (2247).
+
+Safety gates           | applyCoachGates() (2144): template-override if    | Much coarser than
+                       | injuryRecovery && weeksTraining<8, unknown-       | Gates 1-8 — there's no
+                       | template fallback, focus-level clamp,             | per-exercise concept
+                       | calorieDelta clamp, sessionMin clamp.             | yet, since the schema
+                       |                                                    | has no per-exercise
+                       |                                                    | fields to gate.
+
+Brief exporter         | buildCoachBrief() (700).                          | Confirmed root causes
+                       |                                                    | for failures #5 and #6
+                       |                                                    | below.
+
+Injury constraint text | Hardcoded prose, buildCoachBrief line 717:        | Exactly what the spec
+                       | "Known injury history: hip labral tear +          | assumes — one hardcoded
+                       | proximal hamstring tendinosis..."                  | paragraph, not derived
+                       |                                                    | from any structured
+                       |                                                    | record.
+
+================================================================================
+2. WHERE THE SPEC'S ASSUMPTIONS DON'T MATCH THE CODE
+================================================================================
+
+A. There is no Settings screen.
+   Tabs are Workout/Log/Progress/Focus/Insights/Fuel (App, 1101-1117). The only
+   existing injury control is a boolean toggle inside CoachCard (which lives
+   INSIDE the Insights tab, line 2331) bound to data.goalProfile.injuryRecovery.
+   Task 0 says "editable only from the Settings screen" — that screen doesn't
+   exist and needs to be decided (new tab vs. extending the Log tab, which
+   already hosts SyncCard/BackupCard as the closest thing to a settings area,
+   line 1919-1920).
+
+B. No pain logging exists anywhere.
+   Set schema is {w, r} (or {w,r,assist,bw} for assisted lifts) — see
+   ExerciseCard.saveSession (1399) and Log.saveSession (1796). Gates 4 and 5
+   assume a queryable pain value per lift/session, but there's nowhere to
+   enter one. This is a hard prerequisite for Gate 4/5, not something Task 4
+   can gate against as-is — it needs a data-model addition (proposed under
+   Task 0 below), otherwise Gates 4-5 have nothing to read.
+
+C. recoveringMode would be a second, disconnected switch.
+   Today "injury mode" is goalProfile.injuryRecovery, a manual boolean that
+   ALSO auto-overrides based on weeksTraining>=8 (2146-2147). injuryProfile.
+   recoveringMode needs to replace it outright, not sit alongside it, or the
+   app ends up with two independently-toggleable "am I injured" flags.
+
+D. `pool` mostly already exists — it's called `cat`.
+   The swap picker (ExerciseCard, line 1415: ALL_KNOWN.filter(a => a.cat ===
+   slot.cat)) already does cat-based pool substitution, and CAT_TO_GROUP/
+   MUSCLE_GROUPS (353, 345) already maps cat -> group. Recommend making
+   `pool` an alias for `cat` rather than a new taxonomy, with one deliberate
+   exception: cat:"delts" today conflates lateral raises with rear-delt work
+   (Reverse Pec-Deck), which are mechanically unrelated for gating purposes —
+   that one needs splitting.
+
+E. Failure #5 (bench/CS-row missing from brief) — root cause found.
+   buildCoachBrief line 702: `m.lifts = m.lifts.slice(-14)`. coachMetrics.
+   lifts is built by filtering ALL_KNOWN in its fixed declaration order
+   (bench and csrow are declared first, line 63-64) — not by training
+   recency. `.slice(-14)` chops from the front of that stable order, so
+   foundational lifts silently drop off once a user has >14 distinct trained
+   exercises, regardless of how recently/heavily they're trained. Fix is
+   sorting by recency before slicing (or just not truncating — 21 isn't
+   large).
+
+F. Failure #6 (141 sessions) — root cause found.
+   Every row in data.sessions is one EXERCISE logged on one date
+   ({id, date, exerciseId, sets}), not one workout day — confirmed at both
+   write sites (1399-1400, 1796-1797). coachMetrics.totalSessions =
+   sessions.length (2132) and Insights' "Consistency" card (2505) both count
+   exercise-rows as sessions. Fix: dedupe by date, same pattern the code
+   already uses elsewhere (trainingWeeks, line 480). Two call sites to fix,
+   not one.
+
+G. Cloud-sync merge doesn't know about record-level freshness for anything
+   outside a hardcoded whitelist.
+   mergeData() (278) only does real "newest _updatedAt wins" merging for
+   swaps/nutrition/focus/plan/phase. Anything else (goalProfile today,
+   injuryProfile tomorrow) just takes whichever device's `local` copy happens
+   to be non-empty — not time-based. If injuryProfile is meant to be
+   authoritative clinician data, a stale device could silently clobber a
+   newer, clinician-reviewed profile on next sync unless it's added to that
+   explicit list. The spec doesn't mention sync at all; this is a real gap.
+
+H. Dead code: `const PROGRAM = PROGRAMS.balanced` (146) is unused — don't
+   confuse it with PROGRAMS/getProgram(data), the actual live path.
+
+================================================================================
+3. PROPOSED DATA MODELS
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1 injuryProfile (Task 0)
+--------------------------------------------------------------------------------
+
+const DEFAULT_INJURY_PROFILE = {
+  recoveringMode: true,
+  injuries: [
+    { id: "hip_labrum", label: "Hip labral tear", side: "left", status: "recovering", since: "2026-01" },
+    { id: "prox_hamstring_tendinosis", label: "Proximal hamstring tendinosis", side: null, status: "recovering", since: null },
+  ],
+  movementConstraints: {
+    forbidden: ["loaded_deep_hip_flexion"],
+    limited: [
+      { attribute: "squat_depth", maxValue: "above_parallel", enforce: "safety_pins" },
+      { attribute: "hinge_rom", maxValue: "mid_shin" },
+    ],
+    painRule: { threshold: 3, window24h: true, action: "reduce_load_pct", value: 20 },
+  },
+  clinicianReviewed: false,
+  lastReviewDate: null,
+};
+
+- Stored at data.injuryProfile, merged/defaulted at load the same way
+  focus/plan already are (App, 1024-1025), and added to mergeData's explicit
+  newest-wins key list (fixes gap G above).
+- Replaces goalProfile.injuryRecovery — recoveringMode becomes the one
+  source of truth; the existing week-8 auto-lift logic (2146) reads it
+  instead.
+- Write isolation, concretely: this codebase has no module system —
+  everything is a top-level function/const. The strongest enforceable
+  boundary is: the mutator is defined INSIDE the settings component's
+  closure and never assigned to any module-level binding. extractPlanJson,
+  applyCoachGates/the future gate runner, and everything in the parser path
+  receive `data` (read-only) and never receive a setter. No exported
+  setInjuryProfile exists at module scope at all — there's structurally
+  nothing for the parser to call.
+- pain field: add optional `pain` (0-10, nullable) to the session row
+  written by ExerciseCard.saveSession/Log.saveSession, shown only when
+  recoveringMode is true. This is new UI surface, small, but it's a hard
+  prerequisite for Gates 4/5 — bundle it into Task 0 rather than discover it
+  mid-Task-4.
+- Settings location: needs a decision — new tab, or extend the Log tab's
+  existing settings area.
+
+--------------------------------------------------------------------------------
+3.2 Exercise attribute schema (Task 1)
+--------------------------------------------------------------------------------
+
+Rather than hand-editing ~55 entries across three literals, apply a single
+lookup table over EX_BY_ID at load:
+
+const EXERCISE_ATTRS = {
+  goblet:   { attributes: ["loaded_hip_flexion", "axial_load", "knee_dominant"],
+              romProfile: { hipFlexionMax: "90", squatDepth: "above_parallel" },
+              contraindications: ["hip_labrum"], pool: "squat" },
+  pinsquat: { attributes: ["axial_load", "knee_dominant"],
+              romProfile: { squatDepth: "above_parallel" }, contraindications: [], pool: "squat" },
+  rdl:      { attributes: ["hip_hinge", "posterior_chain_load"],
+              romProfile: { hingeRom: "mid_shin" },
+              contraindications: ["prox_hamstring_tendinosis"], pool: "hinge" },
+  // ...
+};
+Object.entries(EXERCISE_ATTRS).forEach(([id, a]) => { if (EX_BY_ID[id]) Object.assign(EX_BY_ID[id], a); });
+
+- `pool` defaults to the exercise's existing `cat` (no new taxonomy) except
+  the delts split noted in 2D.
+- Untagged detection: `const isTagged = (ex) => Array.isArray(ex.attributes)`.
+  Settings coverage report = `ALL_KNOWN.filter(ex => !isTagged(ex))`.
+- Deny-by-default: `!injuryProfile.recoveringMode ? pass : (!isTagged(ex) ?
+  deny : intersectionCheck(ex, injuryProfile))`.
+
+--------------------------------------------------------------------------------
+3.3 Gate design (Task 4)
+--------------------------------------------------------------------------------
+
+One pipeline, gates as ordered pure functions, never throw, always return a
+reason:
+
+const GATES = [gate1UnknownId, gate2Injury, gate3LoadSanity, gate4PainRule,
+               gate5PainEscalation, gate6VolumeCeiling, gate7Duration, gate8Deload];
+
+function runGates(prescription, ctx) {
+  // ctx = { injuryProfile, sessions, weeklySetsByGroup, sessionRules, deloadActive }
+  const rejections = [];
+  let value = prescription;
+  for (const gate of GATES) {
+    const r = gate(value, ctx);
+    if (r.ok === false) {
+      rejections.push({ gate: r.gate, reason: r.reason });
+      if (r.blocking !== false) return { accepted: null, rejections };
+    }
+    if (r.value) value = r.value; // e.g. gate4's forced load reduction, gate7's trim
+  }
+  return { accepted: value, rejections };
+}
+
+- Gate 2 takes no bypass parameter in its signature, anywhere — reused
+  verbatim as Gate 9 for `days` substitutions, so there's one implementation,
+  not two that could drift.
+- Gate 3 (load sanity) and the existing recommend() bidirectional-load
+  engine (829) need reconciling: Gate 3 checks a PROPOSED load against
+  logged history; recommend() already computes a fallback load from the
+  same history — Gate 3's rejection path should just call recommend() rather
+  than duplicating the "what's the safe load" logic.
+- Gate 12's "pull an additional movement from the pool" (Task 2, not 4, but
+  shares machinery) can reuse the existing `alternates` resolution in
+  ExerciseCard (1413-1417) rather than new pool-resolution code.
+
+================================================================================
+OPEN DECISIONS BEFORE IMPLEMENTATION
+================================================================================
+1. Where does the Settings/injury-profile editing screen live? (new tab vs.
+   extending the Log tab's existing settings area)
+2. Confirm: injuryProfile.recoveringMode fully replaces
+   goalProfile.injuryRecovery (no dual flag).
+3. Confirm: adding an optional pain (0-10) field to session rows, shown only
+   in recoveringMode, is in scope for Task 0 (needed for Gates 4/5 to have
+   anything to read).
+4. Confirm: pool = existing `cat` field, with a one-time split of "delts"
+   into lateral vs. rear-delt pools.
