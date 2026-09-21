@@ -173,4 +173,15 @@ if (failures.length) {
   console.error("WRITE-ISOLATION CHECK FAILED:\n" + failures.map((f) => " - " + f).join("\n"));
   process.exit(1);
 }
-console.log(`Write-isolation check passed: no module-scope injuryProfile setter; ${ALWAYS_CHECK.length} always-checked + ${discovered.size} discovered reader(s) (${[...discovered].join(", ")}) never write injuryProfile.`);
+// A real count of discrete checks performed, not a hardcoded number — so it
+// tracks itself as REVIEWED_READERS grows, the same way every other check
+// script's own total is a genuine sum rather than a guess. Printed with the
+// same "N assertions" phrasing every other scripts/check-*.js file uses so
+// scripts/run-tests.js's total-summing regex picks this file up too, instead
+// of silently excluding it the way this log's own running total had been
+// doing (found during Section 9's pre-ship audit — see BUILD-LOG.md).
+const checkCount = 1 /* setter scan */
+  + discovered.size /* each discovered fn must be on the reviewed allowlist */
+  + (ALWAYS_CHECK.length + discovered.size) /* each checked fn must not write injuryProfile */
+  + 2; /* no ...rec spread in applyCoachGates; injuryProfile not in KNOWN_PLAN_KEYS */
+console.log(`Write-isolation check passed: ${checkCount} assertions — no module-scope injuryProfile setter; ${ALWAYS_CHECK.length} always-checked + ${discovered.size} discovered reader(s) (${[...discovered].join(", ")}) never write injuryProfile; applyCoachGates picks fields explicitly (no ...rec spread) and injuryProfile is never in KNOWN_PLAN_KEYS.`);

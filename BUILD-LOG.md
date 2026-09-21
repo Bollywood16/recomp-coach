@@ -724,24 +724,18 @@ MIGRATION-REVIEW.txt`'s original review, pre-Fix-1/pre-Section-6):**
    original order.
 
 3. **"Biceps 7 vs triceps 4" — STILL PRESENT, now in the OPPOSITE
-   direction, and this is a new finding from this section, not previously
-   reported.** Current real numbers on `ufArms`: biceps (EZ-Bar Curl 4 +
-   Cross-Body Hammer Curl 1 + spawned Incline DB Curl 1) = **6**; triceps
-   (EZ-Bar Skullcrusher 4 + Overhead Cable Triceps Ext. 4 + spawned
-   Overhead DB Triceps Ext. 1) = **9**. Fix 1 alone (before Section 6)
-   produced 6 vs 5 — near parity, per `DEFERRED-TESTS.md`'s own "Fix 1
-   follow-ups" note, which explicitly warned this ratio was incidental
-   and "don't rely on it staying close as inputs change." Section 6's
-   reordering is exactly the kind of input change that note warned
-   about: it didn't touch the trim COUNT (8 sets trimmed, same as
-   before), but changing item order changed `fitDayToTime`'s tie-break
-   (`items.indexOf(b) - items.indexOf(a)` on equal `trimPriority`), which
-   changed WHICH low-priority items absorbed the cut. Nothing in the
-   codebase targets this ratio — the deferred note's warning has now
-   concretely played out, in the direction it didn't specifically
-   predict. Not a regression to fix under this run's scope (never a
-   designed property to begin with), but real and worth a maintainer's
-   eyes if arm-group balance ever becomes a stated requirement.
+   direction: biceps (EZ-Bar Curl 4 + Cross-Body Hammer Curl 1 + spawned
+   Incline DB Curl 1) = **6**; triceps (EZ-Bar Skullcrusher 4 + Overhead
+   Cable Triceps Ext. 4 + spawned Overhead DB Triceps Ext. 1) = **9**.
+   Never a designed property (`DEFERRED-TESTS.md`'s own "Fix 1
+   follow-ups" note already warned "don't rely on it staying close as
+   inputs change"), so this isn't a regression to fix. **Correction,
+   made after review — the original version of this paragraph wrongly
+   attributed the 6v9 split to Section 6's reordering changing
+   `fitDayToTime`'s tie-break. That specific causal claim was written
+   without being tested and turned out to be false; see the "Post-review
+   fixes" section below for the controlled experiment that disproves it
+   and the actual (still open, lower-stakes) explanation.**
 
 4. **"Cable lateral raise at 12.5 lb despite 50% rep decay" — still does
    not reproduce against this data, same conclusion as the original
@@ -890,6 +884,188 @@ already-committed `FIX-2-*`/`FIX-3-*`/`TASK-2-*`/`TASK-3-*` files (and
 `HANDOFF.md` itself already points at them as "the detailed record per
 task") — committed as build documentation in the next commit, for
 consistency, rather than gitignored.
+
+Still true after this section: **nothing has been merged to `main`, and
+nothing in this session touched `main` or pushed anywhere.**
+
+---
+
+## Post-review fixes — blocker + two follow-ups, before merge
+
+Three items came back from review of Sections 8/9. No merge, no push,
+`main` untouched.
+
+### 1. BLOCKER — does the goblet/box-squat prompt actually fire on a real boot?
+
+Section 8 found that `migrateInjuryAndGobletData` silently renames this
+account's 8 `goblet`-logged sessions to `boxsquat` on migration. Task 1's
+own design for exactly this (see index.html's comment on the split, and
+`GobletBoxSquatMigrationPrompt`) was never meant to be silent — it's
+supposed to default to `boxsquat` provisionally and then ASK, once,
+before the app is used further. Section 8 confirmed the rename via
+`migrateInjuryAndGobletData` directly but never confirmed the PROMPT
+actually reaches the screen — that gap is exactly what made the finding
+read as a silent, unresolved rename rather than a defaulted-but-asked
+one. Verified for real this time, in an actual browser, against the
+actual export, through the actual boot path — not the sandboxed
+node-loader Section 8 and everything before it used (that loader never
+invokes React components at all, so it structurally could not have
+answered this question):
+
+- Served `index.html` locally, seeded `localStorage["recompcoach:v2"]`
+  directly with `recomp-coach-backup-2026-09-06.json`'s `data` payload
+  (exactly what `window.storage.get(STORAGE_KEY)` reads on a real boot —
+  `window.storage` is a one-line `localStorage` wrapper, nothing to
+  mock), then loaded the app fresh so `App`'s boot `useEffect` ran
+  `migrateInjuryAndGobletData` for real.
+- **It fires.** The Workout tab (the app's default landing tab) shows,
+  second card from the top:
+
+  > **Which squat have you been doing?**
+  > "Goblet / Box Squat" is now two separate exercises with different
+  > safety tags — self-limited (no box) vs. externally stopped (a box).
+  > Your logged history was assumed to be Box Squat so nothing else
+  > changes for now, but this needs your confirmation.
+  >
+  > `[ Yes, Box Squat ]`  `[ No, it was Goblet (no box) ]`
+
+  Screenshot on file (`/tmp/pwtest/01-workout-tab.png` this session —
+  not committed, ephemeral verification artifact). Confirmed by reading
+  localStorage directly right before the click: `goblet=0, boxsquat=8`
+  — i.e. the defaulted rename has already happened by the time the user
+  sees this, exactly as designed ("nothing else changes for now, but
+  this needs your confirmation" is accurate copy, not aspirational).
+- Clicked **"No, it was Goblet (no box)"**. Result, read back from
+  localStorage: all 8 sessions rewritten `boxsquat` → `goblet`
+  (`goblet=8, boxsquat=0` after, `total=168` unchanged — no session
+  lost or duplicated), `swaps.boxsquat` set to `"goblet"` (so the live
+  program's `boxsquat`-named slot logs under `goblet` going forward
+  too — the correction isn't just retroactive), `gobletBoxSquatMigration`
+  marked `resolved: true, defaultedTo: "goblet"`, and the prompt itself
+  correctly disappears on the next render. Zero console errors
+  throughout.
+- Confirms the design is real and reachable, not just implemented-but-
+  unreached: default is provisional and reversible, the user is asked
+  once before continuing, and answering "no" is a real, complete,
+  bidirectional correction — not a cosmetic label flip.
+
+**Not a gap. No code change needed. Blocker cleared.**
+
+### 2. The 6v9 mechanism — does render order actually reach into trim decisions?
+
+Short answer: **position is only ever a tie-break below emphasis rank —
+exactly as designed, and this account's earlier 6v9 report doesn't
+actually come from Section 6's reordering at all.** The previous version
+of this log's Section 8 got the causal story wrong; corrected here with
+the controlled experiment that disproves it.
+
+`trimPriority(ex, focus, order) = emphasisRank(ex, focus, order) * 10 +
+(isCompound(ex) ? 1 : 0)` — read directly, this is a pure function of an
+exercise's `cat` and the day's `focus` levels. Array position is not an
+input to it, full stop. Position enters exactly once, in
+`fitDayToTime`'s candidate sort: `trimPriority(a,...) -
+trimPriority(b,...) || items.indexOf(b) - items.indexOf(a)` — the
+second clause only ever runs when the first is EXACTLY zero (a true
+tie). That's the entirety of order's reach into trim decisions; nothing
+else in the trim path reads position.
+
+For `ufArms`, six items land on the exact same `trimPriority` (30 —
+arms/specialize, non-compound): EZ-Bar Curl, EZ-Bar Skullcrusher,
+Overhead Cable Triceps Ext., Cross-Body Hammer Curl, and the two spawned
+overflow items. Among exactly these six, position genuinely does decide
+cut order — that part of the original claim was right.
+
+Where it went wrong: I never actually ran the pre-Section-6 order
+through `fitDayToTime` and compared — I inferred the causal story from
+the mechanism being plausible, not from a result. Ran it for real this
+time: reconstructed the day's exercise list in raw template-declaration
+order (no Section 6 sort at all, everything else — Fix 1's floors,
+`capAndSplitMovement`'s capping, today's real focus/swaps/migrated
+sessions — identical), fed both the pre-sort and the real post-sort
+lists through the actual `fitDayToTime` side by side. **Byte-identical
+result, both orders**: same six items trimmed by the same amounts,
+`biceps: 6, triceps: 9` either way.
+
+The reason: `capAndSplitMovement` always `push`es its two spawned items
+(Incline DB Curl, Overhead DB Triceps Ext.) onto the END of the array,
+AFTER Section 6's sort has already run — so the spawned pair sits last
+in both orderings. And Section 6's sort is stable, so it only ever moves
+whole same-priority BLOCKS around relative to each other; it never
+reorders items WITHIN a tied block. The tie-break only ever compares two
+tied items' positions RELATIVE to each other, and that relative order
+— ezcurl, skull, ohte, dbhammer, [inclinecurl, ohdbext always last] — is
+identical whether the shoulders block sorts before or after the arms
+block. Section 6 changed WHERE the six-item arms block sits in the
+array; it never changed the six items' order relative to EACH OTHER,
+which is the only thing the tie-break can see.
+
+So: this account's 6v9 split is not a Section-6 side effect. Re-checked
+against Section 6's own real-data table in its BUILD-LOG entry above —
+it already shows this exact per-exercise breakdown, meaning 6v9 was true
+immediately after Section 6 landed, not something that emerged later.
+What's actually still unexplained is the gap between that and
+`DEFERRED-TESTS.md`'s much earlier "6 vs 5" note from right after Fix 1
+shipped (2026-09-06) — since trim counts depend only on focus levels,
+swaps, and session length (never on logged history), that figure should
+be reproducible from the same inputs and isn't, from this one narrow
+rerun. Plausible explanation not yet confirmed: that note may describe a
+verification run against a slightly different snapshot of this account's
+real swaps/focus at the time, before this session's controlled
+comparison existed to check it against. Not a merge blocker — the ratio
+was never a designed property under either number, and nothing about
+the actual trim MECHANISM is in question anymore, only a documentation
+figure from three weeks before this run started. Flagged rather than
+chased further, since it wasn't asked for and doesn't change anything
+that ships.
+
+**Answer to the actual question asked: order acts as a tie-break below
+emphasis rank, nothing more — confirmed structurally (the formula has no
+position term) and empirically (a controlled before/after comparison
+produces identical output). Accept 6v9.**
+
+### 3. Assertion count can't drift again
+
+New `scripts/run-tests.js`: runs every `scripts/check-*.js` file in the
+same order `package.json`'s old `&&` chain used, streams each one's
+output through as before, and sums a real `TOTAL` from the "`<N>
+assertions`" line each script prints on success — computed fresh from
+the actual run's actual output, every time, not hand-added across
+sections in this log. A script that passes but prints no such line now
+FAILS the whole run loudly (rather than being silently excluded from the
+total the way `check-write-isolation.js` had been this whole time — see
+below) — the drift this was built to prevent can't recur by a future
+script quietly opting out of being counted, either.
+
+`check-write-isolation.js` itself never printed a count at all (it's
+structural — 5 categories of checks, not a fixed list of `ok()` calls),
+which is the actual root cause of Sections 1-8's drifting "running
+total": every prior cumulative figure in this log silently never
+included it, all the way back to before this continuous run started.
+Fixed at the source: it now computes and prints a real count of its own
+discrete checks (1 setter scan + one allowlist-membership check per
+discovered `injuryProfile`-reading function + one no-write check per
+checked function + 2 fixed checks = 22 today, tracking itself as
+`REVIEWED_READERS` grows) in the same `"N assertions"` phrasing every
+other script uses, so `run-tests.js`'s regex picks it up instead of
+having to special-case it.
+
+`package.json`'s `test` script is now just `node scripts/run-tests.js`.
+
+Verified the orchestrator's own failure paths before trusting it:
+deliberately broke `check-session-rules.js` twice (forced a non-zero
+exit; separately, made it pass but print no assertions line) — both
+correctly stopped the run and exited non-zero, with a message naming
+the exact failure mode. Restored, diff-clean.
+
+**New total: 471 assertions across 18/18 scripts** (the 449 this log
+could previously sum by hand, plus write-isolation's own 22, now
+counted for the first time).
+
+```
+npm test
+...
+TOTAL: 471 assertions across 18/18 scripts, all passing.
+```
 
 Still true after this section: **nothing has been merged to `main`, and
 nothing in this session touched `main` or pushed anywhere.**
