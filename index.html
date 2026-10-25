@@ -1832,6 +1832,9 @@ ${programDaysSection}${daysContractSection}
 
 <training_metrics>
 ${JSON.stringify({ ...m, lifts: undefined }, (k, v) => (v === null ? undefined : v))}
+${m.bwSlopePerWeek == null
+    ? `Bodyweight trend: NONE — only ${m.weighIns} weigh-in${m.weighIns !== 1 ? "s" : ""} logged (a trend needs at least ${BW_TREND_MIN_WEIGHINS}). Don't reason from a bodyweight trend you don't have; a calorieDelta above +${CALORIE_INCREASE_NEEDS_TREND} will be rejected until there is one — recommend daily weigh-ins instead.`
+    : `bwSlopePerWeek = ${m.bwSlopePerWeek} lb/week from ${m.weighIns} weigh-ins.`}
 weeklySets = hard sets per muscle group per week as the app currently generates the week (after focus, bonus lifts, stored prescriptions and time-fit) — plan against this baseline.
 ${TRAINING_METRICS_LIFTS_LEGEND}
 ${formatLiftsCompact(m.lifts, libraryIds)}
@@ -4156,6 +4159,7 @@ function buildPlanPreview(data, gated, today) {
     ...(gated.dayRejections || []).map((r) => ({ ...r, kind: "day" })),
     ...(gated.orderRejections || []).map((r) => ({ ...r, kind: "day" })),
     ...(gated.fitRejections || []).map((r) => ({ ...r, kind: "day" })),
+    ...(gated.nutritionRejections || []).map((r) => ({ ...r, kind: "plan" })),
   ];
   const projected = { ...data, focus: gated.focus || data.focus, plan: planUpdateFrom(data, gated, today || todayISO()) };
   const before = weeklySetsByGroup(data);
@@ -6411,6 +6415,12 @@ function Progress({ data, persist }) {
 
 const API_KEY_LS = "recompcoach:apikey";
 
+/* coach-apply-overhaul P3-13: a bodyweight slope needs at least this many
+   weigh-ins; without one, a calorie INCREASE above this is held (the
+   app can't tell whether you're losing too fast, holding, or gaining). */
+const BW_TREND_MIN_WEIGHINS = 4;
+const CALORIE_INCREASE_NEEDS_TREND = 150;
+
 function coachMetrics(data) {
   const sessions = data.sessions || [];
   const trained = ALL_KNOWN.filter((ex) => sessions.some((s) => s.exerciseId === ex.id));
@@ -6431,7 +6441,7 @@ function coachMetrics(data) {
   });
   const w = [...(data.weights || [])].sort((a, b) => (a.date < b.date ? -1 : 1));
   let bwSlope = null;
-  if (w.length >= 4) {
+  if (w.length >= BW_TREND_MIN_WEIGHINS) {
     const half = Math.floor(w.length / 2);
     const avg = (a) => a.reduce((x, y) => x + y.lbs, 0) / a.length;
     const spanDays = (new Date(w[w.length - 1].date) - new Date(w[0].date)) / 86400000 || 1;
@@ -6442,6 +6452,7 @@ function coachMetrics(data) {
     totalSessions: countTrainingSessions(sessions),
     latestBw: w.length ? w[w.length - 1].lbs : null,
     bwSlopePerWeek: bwSlope,
+    weighIns: w.length, // P3-13: how many weigh-ins the slope (if any) rests on
     stalledLifts: lifts.filter((l) => l.weeksLogged >= 3 && l.stalled).length,
     // P2-11: what the deload decision actually uses, denominator included.
     stallCheck: stallSummary(stallScore(data)),
@@ -6574,6 +6585,14 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
   gated.focus = f;
   const cd = Number(gated.calorieDelta) || 0;
   gated.calorieDelta = Math.max(-300, Math.min(300, cd));
+  // P3-13: no bodyweight trend -> a calorie increase above +150 is a
+  // rejection (blocks the whole apply, P0-2) with a weigh-in prompt, not a
+  // silent clamp. Decreases and small increases are unaffected.
+  gated.nutritionRejections = [];
+  if (metrics && metrics.bwSlopePerWeek == null && gated.calorieDelta > CALORIE_INCREASE_NEEDS_TREND) {
+    gated.nutritionRejections.push({ gate: "nutrition",
+      reason: `calorieDelta +${gated.calorieDelta} needs a bodyweight trend, and there isn't one yet (${metrics.weighIns ?? 0} weigh-in${metrics.weighIns === 1 ? "" : "s"} logged; a trend needs ${BW_TREND_MIN_WEIGHINS}). Log your weight daily in the Log tab, then re-run the check-in — or ask for +${CALORIE_INCREASE_NEEDS_TREND} or less.` });
+  }
   if (![45, 60, 75].includes(gated.sessionMin)) gated.sessionMin = (metrics.currentPlan && metrics.currentPlan.sessionMin) || 60;
 
   // sessionRules: merge onto whatever was already stored (see
@@ -7091,6 +7110,13 @@ function CoachCard({ data, persist }) {
               ? "Full mode: complete tagged library and full research corpus — this is large and \"Open in Claude\" will likely fall back to copy-to-clipboard."
               : "Check-in mode: your live program's exercises and the most relevant research only, kept small enough for a one-tap link."}
           </div>
+          {(data.weights || []).length < BW_TREND_MIN_WEIGHINS && (
+            <div style={{ background: "#FFF7EC", borderRadius: 10, padding: 10, marginTop: 10, fontSize: 12.5, lineHeight: 1.45 }}>
+              <b style={{ color: C.orange }}>No bodyweight trend yet</b> — {(data.weights || []).length} weigh-in{(data.weights || []).length !== 1 ? "s" : ""} logged,
+              {" "}{BW_TREND_MIN_WEIGHINS} needed. Weigh in daily (Log tab). Until there's a trend, a coach plan that raises calories by more than
+              +{CALORIE_INCREASE_NEEDS_TREND}/day won't apply.
+            </div>
+          )}
           <textarea
             style={{ ...S.input, minHeight: 60, resize: "vertical", marginTop: 10 }}
             placeholder="Paste Claude's full reply here to apply the plan…"
