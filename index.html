@@ -1798,6 +1798,7 @@ ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 2. Check <set_quality>/<pain_history>: flag rep collapse, under-range reps, or forced pain reduction; fix is lower load or a back-off, never a repeat.
 3. Push back on goal-vs-constraint/research conflicts; cite sources.
 4. Recommend: template ("balanced"|"upperFocus"|"superhero"); focus/group (shoulders/arms/chest/back/legs/core: maintain|normal|emphasize|specialize, max 2 emphasize+); sessionMin (45|60|75); calorieDelta (-300..300); next to watch. Optional \`prescriptions\`(exerciseId,dayKey,order,sets,repMin,repMax,load,restSec) + \`sessionRules\`(maxSetsPerMovement,orderByFocus,trimPriority,weeklyGroupSetCaps).${isFullTier ? ` Optional \`days\` (see <days_contract>) + \`splitPattern\` (a short label for the split you authored, e.g. "UULU" — descriptive only, not enforced).` : ""}
+   Exercise order: the app orders each day itself (a specialize group holding >=40% of a day's sets goes first; then compounds before isolation; then focus rank; regressing lifts earlier). A prescription/day \`order\` is honored only if it keeps those two hard rules (specialize-first block; specialize isolation before normal/maintain isolation) — otherwise that day, and so the whole plan, is rejected. Omit \`order\` unless you need it.
 5. Prose under 300 words; the \`\`\`json block (and every exercise's \`rationale\` in it) is separate and not counted against that.
 6. One \`\`\`json block: plan object, optionally + prescriptions/sessionRules${isFullTier ? "/days/splitPattern" : ""}. Gated on apply; injury constraints aren't overridable.${isFullTier ? " Every days[].exercises[] entry needs its own rationale — an entry without one is rejected (Gate 9). Decline a slot rather than guess: see <days_contract>." : ""}
 </instructions>`;
@@ -2153,8 +2154,126 @@ function resolveAuthoredExercise(ae, data) {
     ...resolved,
     restSec: ae.restSec, prescribedLoad: ae.load, scheme: ae.scheme,
     order: ae.order ?? 0, rationale: ae.rationale, substitutedFor: ae.substitutedFor,
+    coachOrder: typeof ae.order === "number" ? ae.order : undefined, // P1-5 (g)
     authored: true,
   };
+}
+
+/* ===== Exercise order engine (coach-apply-overhaul P1-5) =====
+   Deterministic; replaces the old index-stable emphasis sort. Per day:
+     (a) Specialization override — if one "specialize" group holds >= 40%
+         of the day's sets, that group's exercises go first (compound,
+         then isolation), then the rest of the day by (b)-(e).
+     (b) Compounds before isolation.
+     (c) Within each class, focus rank: specialize > emphasize > normal >
+         maintain.
+     (d) Tie-break 1: a regressing lift (trendPct <= -5% over >= 3 weeks)
+         goes earlier.
+     (e) Tie-break 2: the stable exercise tag (exerciseId). Never array
+         index — no tie depends on insertion order.
+     (f) Rehab lifts (REHAB_EXERCISE_IDS, a code constant no coach output
+         can change) keep their TEMPLATE position on generator days; focus
+         rules never move them, everything else fills around them.
+     (g) A coach `order` (prescription or authored day) permutes the rows
+         that carry one among the positions those rows occupy. Honored
+         only if the result still satisfies (a) and "specialize isolation
+         before non-focus isolation"; otherwise `violation` is set, the
+         render falls back to the engine order, and the apply rejects the
+         day with that reason (never a silent re-sort). */
+const REHAB_EXERCISE_IDS = new Set(["hipthrust", "rdl", "legcurl"]);
+const ORDER_SPECIALIZE_SHARE = 0.4;
+const REGRESSING_TREND_PCT = -5;
+const REGRESSING_MIN_WEEKS = 3;
+
+function isRegressing(sessions, exId) {
+  const t = trendPct(weeklySeries(sessions || [], exId));
+  return !!t && t.weeks >= REGRESSING_MIN_WEEKS && t.pct <= REGRESSING_TREND_PCT;
+}
+
+const focusLevelOf = (ex, focus) => (focus && focus[CAT_TO_GROUP[ex.cat]]) || "normal";
+
+/* The (a) group, or null: the specialize group with the largest share of
+   the day's sets, if that share is >= 40%. Ties broken by group name. */
+function specializationOverrideGroup(exs, focus) {
+  const total = exs.reduce((a, ex) => a + (ex.sets || 0), 0);
+  if (!total) return null;
+  const byGroup = {};
+  exs.forEach((ex) => {
+    const g = CAT_TO_GROUP[ex.cat];
+    if (g && focusLevelOf(ex, focus) === "specialize") byGroup[g] = (byGroup[g] || 0) + (ex.sets || 0);
+  });
+  const best = Object.keys(byGroup)
+    .filter((g) => byGroup[g] / total >= ORDER_SPECIALIZE_SHARE)
+    .sort((a, b) => byGroup[b] - byGroup[a] || a.localeCompare(b));
+  return best[0] || null;
+}
+
+function orderViolationOf(exs, focus, overrideGroup) {
+  const isRehab = (ex) => REHAB_EXERCISE_IDS.has(ex.id);
+  if (overrideGroup) {
+    const lastG = exs.reduce((m, ex, i) => (CAT_TO_GROUP[ex.cat] === overrideGroup ? i : m), -1);
+    const firstOther = exs.findIndex((ex) => CAT_TO_GROUP[ex.cat] !== overrideGroup && !isRehab(ex));
+    if (firstOther !== -1 && firstOther < lastG) {
+      return `${MUSCLE_GROUPS[overrideGroup].name} is specialized and holds >= 40% of this day's sets, so all of it must come first — "${exs[firstOther].name}" is ordered before "${exs[lastG].name}".`;
+    }
+  }
+  const iso = (ex) => !isCompound(ex) && !isRehab(ex);
+  const lastSpecIso = exs.reduce((m, ex, i) => (iso(ex) && focusLevelOf(ex, focus) === "specialize" ? i : m), -1);
+  const firstNonFocusIso = exs.findIndex((ex) => iso(ex) && ["normal", "maintain"].includes(focusLevelOf(ex, focus)));
+  if (lastSpecIso !== -1 && firstNonFocusIso !== -1 && firstNonFocusIso < lastSpecIso) {
+    return `Specialized isolation must come before non-focus isolation — "${exs[firstNonFocusIso].name}" is ordered before "${exs[lastSpecIso].name}".`;
+  }
+  return null;
+}
+
+function orderDay(entries, ctx) {
+  const focus = (ctx && ctx.focus) || DEFAULT_FOCUS;
+  const sessions = (ctx && ctx.sessions) || [];
+  const exs = entries.map((e) => e.ex);
+  const overrideGroup = specializationOverrideGroup(exs, focus);
+  const regressing = new Map(exs.map((ex) => [ex.id, isRegressing(sessions, ex.id)]));
+  const key = (ex) => [
+    overrideGroup && CAT_TO_GROUP[ex.cat] === overrideGroup ? 0 : 1, // (a)
+    isCompound(ex) ? 0 : 1,                                          // (b)
+    -(LEVEL_RANK[focusLevelOf(ex, focus)] ?? 1),                     // (c)
+    regressing.get(ex.id) ? 0 : 1,                                   // (d)
+  ];
+  const cmp = (a, b) => {
+    const ka = key(a.ex), kb = key(b.ex);
+    for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i];
+    return a.ex.id.localeCompare(b.ex.id);                           // (e)
+  };
+
+  // (f) Rehab pins: generator days only. A pinned row keeps its template
+  // slot index (clamped; collisions slide to the next free position).
+  const templateIds = ctx && ctx.templateDay ? ctx.templateDay.exercises.map((s) => s.id) : null;
+  const pinIdx = (e) => {
+    if (!templateIds || !REHAB_EXERCISE_IDS.has(e.ex.id) || e.ex.swapped) return -1;
+    return templateIds.indexOf(e.slot && e.slot.id);
+  };
+  const pinned = entries.filter((e) => pinIdx(e) !== -1).sort((a, b) => pinIdx(a) - pinIdx(b));
+  const free = entries.filter((e) => pinIdx(e) === -1).sort(cmp);
+  const slots = new Array(entries.length).fill(null);
+  pinned.forEach((e) => {
+    let i = Math.min(pinIdx(e), entries.length - 1);
+    while (slots[i]) i = (i + 1) % entries.length;
+    slots[i] = e;
+  });
+  let fi = 0;
+  for (let i = 0; i < slots.length; i++) if (!slots[i]) slots[i] = free[fi++];
+  const engine = slots;
+
+  // (g) Coach order: permute coach-ordered, non-pinned rows within the
+  // positions they occupy in the engine order.
+  const isCoach = (e) => typeof e.ex.coachOrder === "number" && pinIdx(e) === -1;
+  if (!engine.some(isCoach)) return { list: engine, violation: null };
+  const positions = engine.map((e, i) => (isCoach(e) ? i : -1)).filter((i) => i !== -1);
+  const coachRows = positions.map((i) => engine[i])
+    .sort((a, b) => a.ex.coachOrder - b.ex.coachOrder || a.ex.id.localeCompare(b.ex.id));
+  const coached = [...engine];
+  positions.forEach((pos, k) => { coached[pos] = coachRows[k]; });
+  const violation = orderViolationOf(coached.map((e) => e.ex), focus, overrideGroup);
+  return violation ? { list: engine, violation } : { list: coached, violation: null };
 }
 
 /* Muscle groups that have at least one stored coach prescription on this
@@ -2191,8 +2310,9 @@ function resolveDayExercises(day, data) {
     const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
     const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
     const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
-    splitList.maxSetsNotes = notes;
-    return splitList;
+    // Authored days: the coach's `order` is the coach order (g); no rehab
+    // template pins (no templateDay) — the coach authored the whole day.
+    return finishDayOrder(splitList, notes, { focus: data.focus || DEFAULT_FOCUS, sessions: data.sessions });
   }
   // coach-apply-overhaul P0-1: for a (day, group) the coach has prescribed,
   // the prescriptions define that group's volume on that day — no bonus
@@ -2232,9 +2352,10 @@ function resolveDayExercises(day, data) {
   // order by their own explicit `order` field instead; a prescription's
   // ADD is still appended after this sort, unchanged from before —
   // prescriptions carry no `order` field of their own to sort by today.
-  const genOrder = generatorList.map((_, i) => i);
-  genOrder.sort((i, j) => trimPriority(generatorList[j].ex, focus) - trimPriority(generatorList[i].ex, focus) || i - j);
-  const list = genOrder.map((i) => generatorList[i]);
+  // (coach-apply-overhaul P1-5: the emphasis-desc genOrder sort that lived
+  // here is replaced by orderDay, run once at the very end over the
+  // complete list — generator, bonus, prescription ADDs and pool spawns.)
+  const list = [...generatorList];
   const prescriptions = ((data.plan && data.plan.prescriptions) || []).filter((p) => p.dayKey === day.id);
   const OVERRIDE_FIELDS = ["sets", "repMin", "repMax", "restSec", "scheme"];
   prescriptions.forEach((p) => {
@@ -2244,6 +2365,7 @@ function resolveDayExercises(day, data) {
     const overrides = {};
     OVERRIDE_FIELDS.forEach((k) => { if (p[k] !== undefined) overrides[k] = p[k]; });
     if (p.load !== undefined) overrides.prescribedLoad = p.load;
+    if (typeof p.order === "number") overrides.coachOrder = p.order; // P1-5 (g)
     if (matchIdx.length === 1) {
       const i = matchIdx[0];
       const mergedEx = { ...list[i].ex, ...overrides, prescribed: true, prescriptionApplied: "replace" };
@@ -2257,7 +2379,7 @@ function resolveDayExercises(day, data) {
         repMin: overrides.repMin ?? base.repMin ?? DEFAULT_REP_RANGE.min,
         repMax: overrides.repMax ?? base.repMax ?? DEFAULT_REP_RANGE.max,
         restSec: overrides.restSec, prescribedLoad: overrides.prescribedLoad,
-        scheme: overrides.scheme,
+        scheme: overrides.scheme, coachOrder: overrides.coachOrder,
         slotId: base.id, swapped: false, focusBoost: false,
         prescribed: true, prescriptionApplied: "add",
       };
@@ -2281,8 +2403,17 @@ function resolveDayExercises(day, data) {
   const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
-  splitList.maxSetsNotes = notes;
-  return splitList;
+  return finishDayOrder(splitList, notes, { focus, sessions: data.sessions, templateDay: day });
+}
+
+/* Shared tail of both resolveDayExercises branches: order the complete
+   list once (P1-5), then re-attach the side-channel properties callers
+   read off the returned array. */
+function finishDayOrder(entries, maxSetsNotes, ctx) {
+  const { list, violation } = orderDay(entries, ctx);
+  list.maxSetsNotes = maxSetsNotes;
+  if (violation) list.orderViolation = violation;
+  return list;
 }
 
 /* Working weight = heaviest weight used in the most recent session of a lift */
@@ -3743,6 +3874,7 @@ function buildPlanPreview(data, gated, today) {
   const rejections = [
     ...(gated.prescriptionRejections || []).map((r) => ({ ...r, kind: "prescription" })),
     ...(gated.dayRejections || []).map((r) => ({ ...r, kind: "day" })),
+    ...(gated.orderRejections || []).map((r) => ({ ...r, kind: "day" })),
   ];
   const projected = { ...data, focus: gated.focus || data.focus, plan: planUpdateFrom(data, gated, today || todayISO()) };
   const before = weeklySetsByGroup(data);
@@ -5935,6 +6067,22 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
     gated.days = result.accepted;
     gated.dayRejections = result.rejections;
     gated.dayNotes = result.notes;
+  }
+
+  // coach-apply-overhaul P1-5 (g): a coach `order` is honored only if the
+  // day it produces still satisfies the order engine's hard rules. Checked
+  // against the plan exactly as it would be stored (planUpdateFrom), so a
+  // rejection here blocks the whole apply (P0-2) — never a silent re-sort.
+  if (data) {
+    const projected = { ...data, focus: gated.focus, plan: planUpdateFrom(data, gated, todayISO()) };
+    gated.orderRejections = [];
+    getProgram(projected).forEach((day) => {
+      const list = resolveDayExercises(day, projected);
+      if (list.orderViolation) {
+        gated.orderRejections.push({ gate: "order", dayKey: day.id,
+          reason: `${day.name}: the coach's exercise order can't be used — ${list.orderViolation}` });
+      }
+    });
   }
   return gated;
 }

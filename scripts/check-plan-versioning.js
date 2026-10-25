@@ -51,17 +51,16 @@ const baseData = (overrides) => ({
 /* ===== 1. diffAuthoredDay ===== */
 {
   const data = baseData();
-  // ufArms template: machohp, cablelat, reardelt, ezcurl, skull, ohte
-
-  // Identical authored day (same ids, sets, order) -> empty diff.
-  const identical = [
-    { exerciseId: "machohp", order: 1, sets: 3, rationale: "a" },
-    { exerciseId: "cablelat", order: 2, sets: 3, rationale: "b" },
-    { exerciseId: "reardelt", order: 3, sets: 3, rationale: "c" },
-    { exerciseId: "ezcurl", order: 4, sets: 3, rationale: "d" },
-    { exerciseId: "skull", order: 5, sets: 3, rationale: "e" },
-    { exerciseId: "ohte", order: 6, sets: 2, rationale: "f" },
-  ];
+  // Identical authored day (same ids, sets, order) -> empty diff. Built
+  // from the day as it currently RENDERS (coach-apply-overhaul P1-5: the
+  // order engine, not template position, decides that order — with all
+  // groups at normal, ufArms renders machohp first (compound), then the
+  // isolation rows by exerciseId).
+  const ufArmsDay = app.getProgram(data).find((d) => d.id === "ufArms");
+  const identical = app.resolveDayExercises(ufArmsDay, data)
+    .map((e, i) => ({ exerciseId: e.ex.id, order: i + 1, sets: e.ex.sets, rationale: String.fromCharCode(97 + i) }));
+  ok("sanity: rendered ufArms has the 6 template exercises", identical.length === 6 && identical[0].exerciseId === "machohp",
+    JSON.stringify(identical.map((e) => e.exerciseId)));
   const identicalDiff = app.diffAuthoredDay("ufArms", identical, data);
   check("identical authored day (same ids/sets/order) produces an empty diff", identicalDiff, { added: [], removed: [], changed: [], reordered: [] });
 

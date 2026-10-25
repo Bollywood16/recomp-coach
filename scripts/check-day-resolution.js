@@ -56,7 +56,7 @@ const app = loadApp([
   "dayFittedMinutes",
   "dayFocusSummary",
   "resolveDayExercises",
-  "trimPriority",
+  "orderDay",
 ]);
 const { DEFAULT_FOCUS } = app;
 
@@ -84,10 +84,10 @@ function REFERENCE_dayPageEntries(day, data) {
   // the same reason commit 4's capAndSplitMovement call was: a real,
   // legitimate behavior change, not something this reference should stay
   // frozen against.
-  const order = genList.map((_, i) => i);
-  order.sort((i, j) => app.trimPriority(genList[j].ex, focusObj) - app.trimPriority(genList[i].ex, focusObj) || i - j);
-  const list = order.map((i) => genList[i]);
-  return applyCap(list, data);
+  // coach-apply-overhaul P1-5: that sort is replaced by the order engine
+  // (orderDay), which runs once over the COMPLETE capped list — mirrored
+  // here the same way, for the same reason.
+  return app.orderDay(applyCap(genList, data), { focus: focusObj, sessions: data.sessions, templateDay: day }).list;
 }
 
 function REFERENCE_dayFittedMinutes(day, data) {

@@ -67,13 +67,20 @@ const baseData = (overrides) => ({
   const firstArmsIdx = list.findIndex((e) => armsIds.includes(e.id));
   const firstShoulderIdx = list.findIndex((e) => shoulderIds.includes(e.id));
   ok("arms (specialize) exercises sequence before shoulders (emphasize) exercises, reversing the template's own declaration order", firstArmsIdx < firstShoulderIdx, JSON.stringify(list.map((e) => e.id)));
-  ok("all 3 arms exercises appear as a contiguous block ahead of all 3 shoulder exercises", list.slice(0, 3).every((e) => armsIds.includes(e.id)), JSON.stringify(list.map((e) => e.id)));
+  // P1-5: the arms block also holds the arms bonus lift(s) and any pool
+  // spawns, tie-broken by exerciseId — so assert the block, not "first 3".
+  const isArms = (e) => ["biceps", "triceps"].includes(e.cat);
+  const isShoulder = (e) => ["vpress", "delts"].includes(e.cat);
+  const lastArms = list.reduce((m, e, i) => (isArms(e) ? i : m), -1);
+  const firstShoulder = list.findIndex(isShoulder);
+  ok("every arms row (template, bonus, spawned) precedes every shoulder row", lastArms < firstShoulder, JSON.stringify(list.map((e) => e.id)));
 
-  // Same-rank tie-break: within arms, ezcurl/skull/ohte should keep their
-  // ORIGINAL relative template order (stable sort) since they're all the
-  // same emphasis rank and none is compound.
+  // Same-rank tie-break: as of coach-apply-overhaul P1-5 (FIX_SPEC 5e) ties
+  // break on the stable exerciseId, never template/array position — so
+  // within arms (all specialize isolation, none regressing) it's
+  // alphabetical by id, not template order.
   const armsOnly = list.filter((e) => armsIds.includes(e.id)).map((e) => e.id);
-  check("same-rank exercises (all of arms) keep their original template order (stable sort)", armsOnly, ["ezcurl", "skull", "ohte"]);
+  check("same-rank exercises (all of arms) tie-break by exerciseId, not template position", armsOnly, ["ezcurl", "ohte", "skull"]);
 }
 
 /* ===== 2. Authored days still order by their own explicit `order` ===== */

@@ -198,9 +198,13 @@ const upperA = () => app.PROGRAMS.balanced.find((d) => d.id === "upperA");
 // Negative control: prove the subtraction is actually doing something —
 // an ADD-only version of the same net change (no replace to offset it)
 // SHOULD be rejected, since it pushes legs to 26 + 2 = 28 > cap 26.
+// 75-minute session (P1-5): at 60 minutes Lower A is already at 56 min,
+// so the add's time cost makes the time-fit trim leg extension 3 -> 1
+// and the FITTED week stays at 26 — that's time-fit, not netting. 75 min
+// gives the add room, which is what this control is about.
 {
   const data = baseData({});
-  const ctx = app.buildGateContext(data, { sessionRules: { weeklyGroupSetCaps: { legs: 26 } } });
+  const ctx = app.buildGateContext(data, { sessionMin: 75, sessionRules: { weeklyGroupSetCaps: { legs: 26 } } });
   const result = app.applyGatedPrescriptions([
     { exerciseId: "hacksquat", dayKey: "lowerA", sets: 2 }, // pure ADD, no offsetting replace
   ], ctx);
