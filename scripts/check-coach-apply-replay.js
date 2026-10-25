@@ -7,11 +7,11 @@
  *      arms=specialize, shoulders=emphasize, stored caps arms 28 /
  *      shoulders 20, and a plan whose own arm prescriptions total 26 and
  *      shoulder prescriptions 16.
- *      This commit is a CHARACTERIZATION test: it asserts the bug as it
- *      exists on main today (Gate 6 rejects arm work the plan's own totals
- *      fit under the cap; the apply is partial). P0-1/P0-2 flip these
- *      assertions to the spec's expected behavior — see the "FLIPS IN"
- *      labels below.
+ *      Commit 1 characterized the bug on main (Gate 6 rejected all 7 arm
+ *      prescriptions against an inflated baseline of 32; partial apply).
+ *      As of P0-1 it asserts the fix: Gate 6 nets against the projected
+ *      week (arms 26, shoulders 16, zero rejections), plus the netting
+ *      cases from FIX_SPEC.md item 1.
  *
  *   B. LOCAL REAL DATA (skips with a notice when absent — never committed).
  *      scripts/fixtures/local/ is gitignored. Reads the newest
@@ -30,6 +30,7 @@ const { loadApp } = require("./lib/load-app.js");
 const app = loadApp([
   "applyCoachGates", "coachMetrics", "weeklySetsByGroup", "extractPlanJson",
   "EX_BY_ID", "CAT_TO_GROUP", "PROGRAMS", "DEFAULT_INJURY_PROFILE",
+  "resolveDayExercises",
 ]);
 
 const FIXTURES = path.join(__dirname, "fixtures");
@@ -86,17 +87,90 @@ function runApply(data, rec) {
 
   console.log("synthetic baseline weekly sets (before apply):", JSON.stringify(before));
   console.log(`synthetic apply: ${(gated.prescriptions || []).length} accepted, ${rejections.length} rejected`);
+  console.log("synthetic projected weekly sets (after apply):", JSON.stringify(gated.weeklyGroupSetsAfter));
   rejections.forEach((r) => console.log(`  - [gate ${r.gate}] ${r.exerciseId}: ${r.reason}`));
 
-  // CHARACTERIZATION of the bug on main. FLIPS IN P0-1: expected afterwards
-  // is zero Gate 6 rejections, with arms ~26 and shoulders ~16 projected.
-  ok("BUG REPRO (flips in P0-1): baseline arms already exceed the plan's own 26",
+  // The baseline really is inflated (that's what fooled the old Gate 6)...
+  ok("baseline arms (with focus uplift + bonus lifts) exceed the plan's own 26",
     (before.arms || 0) > 26, `baseline arms ${before.arms}`);
-  ok("BUG REPRO (flips in P0-1): Gate 6 rejects at least one arm prescription",
-    gate6.some((r) => armIds.has(r.exerciseId)));
-  // FLIPS IN P0-2: expected afterwards is all-or-nothing — never a mix.
-  ok("BUG REPRO (flips in P0-2): apply is partial (some accepted AND some rejected)",
-    (gated.prescriptions || []).length > 0 && rejections.length > 0);
+  // ...and P0-1 nets against the projected week instead.
+  ok("P0-1: no Gate 6 rejections on the replayed plan", gate6.length === 0,
+    gate6.map((r) => r.reason).join(" | "));
+  ok("P0-1: no arm prescription rejected", !rejections.some((r) => armIds.has(r.exerciseId)));
+  ok("P0-1: projected arms = 26", gated.weeklyGroupSetsAfter.arms === 26, `got ${gated.weeklyGroupSetsAfter.arms}`);
+  ok("P0-1: projected shoulders = 16", gated.weeklyGroupSetsAfter.shoulders === 16, `got ${gated.weeklyGroupSetsAfter.shoulders}`);
+  ok("P0-1: before/after reported for the preview",
+    gated.weeklyGroupSetsBefore && gated.weeklyGroupSetsBefore.arms === before.arms);
+  ok("Gate 7 per day: all 18 prescriptions survive (no cross-day single-session trim)",
+    (gated.prescriptions || []).length === rec.prescriptions.length, `got ${(gated.prescriptions || []).length}`);
+  ok("baseline over cap is warned, not used to raise the cap",
+    (gated.prescriptionNotes || []).some((n) => n.gate === "6-baseline" && n.group === "arms"));
+  // P0-2 (atomic) will add: any rejection -> nothing applied.
+
+  // Netting cases, on top of the plan now being stored.
+  const stored = { ...data, focus: gated.focus,
+    plan: { ...data.plan, prescriptions: gated.prescriptions, sessionRules: gated.sessionRules } };
+  const storedWeek = app.weeklySetsByGroup(stored);
+  ok("stored plan renders the same week Gate 6 projected",
+    JSON.stringify(storedWeek) === JSON.stringify(gated.weeklyGroupSetsAfter),
+    `${JSON.stringify(storedWeek)} vs ${JSON.stringify(gated.weeklyGroupSetsAfter)}`);
+
+  const again = runApply(stored, rec);
+  ok("re-applying an identical plan: no rejections", !(again.prescriptionRejections || []).length);
+  ok("re-applying an identical plan nets to 0 (after === before)",
+    JSON.stringify(again.weeklyGroupSetsAfter) === JSON.stringify(again.weeklyGroupSetsBefore),
+    `${JSON.stringify(again.weeklyGroupSetsBefore)} -> ${JSON.stringify(again.weeklyGroupSetsAfter)}`);
+
+  const fewer = { ...rec, prescriptions: rec.prescriptions.map((p) =>
+    (p.exerciseId === "pressdn" && p.dayKey === "ufUpperA" ? { ...p, sets: 2 } : p)) };
+  const fewerRes = runApply(stored, fewer);
+  ok("replacement with fewer sets lowers the projected total by exactly that much",
+    fewerRes.weeklyGroupSetsAfter.arms === storedWeek.arms - 2,
+    `${storedWeek.arms} -> ${fewerRes.weeklyGroupSetsAfter.arms}`);
+
+  // Over-cap group: every prescription in it rejected with a reason; other groups unaffected.
+  const tight = { ...rec, sessionRules: { ...rec.sessionRules, weeklyGroupSetCaps: { arms: 20, shoulders: 20 } } };
+  const tightRes = runApply(data, tight);
+  const tightRej = tightRes.prescriptionRejections || [];
+  ok("cap below plan: every arm prescription rejected by Gate 6",
+    [...armIds].every((id) => tightRej.some((r) => r.gate === 6 && r.exerciseId === id)));
+  ok("cap below plan: reason names projected total and cap",
+    tightRej.some((r) => /would put Arms at \d+ weekly sets.*above the 20-set cap/.test(r.reason)));
+  ok("cap below plan: shoulder prescriptions still accepted",
+    (tightRes.prescriptions || []).some((p) => p.exerciseId === "machohp"));
+
+  // No explicit cap: falls back to MAV (arms 24), not max(mav, baseline).
+  const noCaps = { ...rec, sessionRules: { maxSetsPerMovement: 4 } };
+  const noCapsData = { ...data, plan: { ...data.plan, sessionRules: { maxSetsPerMovement: 4 } } };
+  const noCapsRes = runApply(noCapsData, noCaps);
+  ok("no explicit cap: arms 26 > MAV 24 is rejected (cap not raised to baseline 32)",
+    (noCapsRes.prescriptionRejections || []).some((r) => r.gate === 6 && /24-set cap/.test(r.reason)));
+
+  // Render side: a prescribed (day, group) gets no bonus and no focus uplift.
+  const partial = { ...data, plan: { ...data.plan,
+    prescriptions: [{ exerciseId: "ezcurl", dayKey: "ufArms", sets: 4, repMin: 10, repMax: 15 }] } };
+  const armsDay = app.PROGRAMS.upperFocus.find((d) => d.id === "ufArms");
+  const rendered = app.resolveDayExercises(armsDay, partial).map((e) => e.ex);
+  const byId = Object.fromEntries(rendered.map((e) => [e.id, e]));
+  ok("prescribed group's other rows drop to template sets (skull 3, ohte 2)",
+    byId.skull && byId.skull.sets === 3 && byId.ohte && byId.ohte.sets === 2,
+    rendered.map((e) => `${e.id}:${e.sets}`).join(" "));
+  ok("prescribed group gets no bonus lifts on that day",
+    !rendered.some((e) => e.isBonus && e.bonusGroup === "arms"));
+  ok("unprescribed group on the same day keeps its focus uplift (cablelat 3 -> 4 at emphasize)",
+    byId.cablelat && byId.cablelat.sets === 4, `cablelat ${byId.cablelat && byId.cablelat.sets}`);
+
+  // Maintain's 0.55x reduction is NOT an uplift — it survives a prescription
+  // on the same (day, group), so prescribing one leg row never raises legs.
+  const lowerDay = app.PROGRAMS.upperFocus.find((d) => d.id === "ufLower");
+  const legsRx = { ...data, plan: { ...data.plan,
+    prescriptions: [{ exerciseId: "goblet", dayKey: "ufLower", sets: 2 }] } };
+  const legsBefore = app.resolveDayExercises(lowerDay, data).map((e) => e.ex);
+  const legsAfter = app.resolveDayExercises(lowerDay, legsRx).map((e) => e.ex);
+  const setsOf = (list, id) => (list.find((e) => e.id === id) || {}).sets;
+  ok("maintain reduction kept on a prescribed group (legcurl stays at its maintain count)",
+    setsOf(legsAfter, "legcurl") === setsOf(legsBefore, "legcurl") && setsOf(legsAfter, "legcurl") < 3,
+    `legcurl ${setsOf(legsBefore, "legcurl")} -> ${setsOf(legsAfter, "legcurl")}`);
 }
 
 /* ---------------- B. local real data ---------------- */
@@ -124,6 +198,8 @@ function runApply(data, rec) {
       const gated = runApply(data, rec);
       console.log("local replay planned totals:", JSON.stringify(groupTotals(rec.prescriptions)));
       console.log(`local replay: ${(gated.prescriptions || []).length} accepted, ${(gated.prescriptionRejections || []).length} rejected`);
+      console.log("local replay weekly sets before -> after:",
+        JSON.stringify(gated.weeklyGroupSetsBefore), "->", JSON.stringify(gated.weeklyGroupSetsAfter));
       (gated.prescriptionRejections || []).forEach((r) => console.log(`  - [gate ${r.gate}] ${r.exerciseId}: ${r.reason}`));
     }
   }

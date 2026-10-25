@@ -2094,6 +2094,20 @@ function resolveAuthoredExercise(ae, data) {
   };
 }
 
+/* Muscle groups that have at least one stored coach prescription on this
+   dayKey. Keyed off the prescription's own exerciseId (stable tag), never
+   its position in the array. */
+function prescribedGroupsForDay(data, dayKey) {
+  const groups = new Set();
+  ((data.plan && data.plan.prescriptions) || []).forEach((p) => {
+    if (p.dayKey !== dayKey) return;
+    const ex = EX_BY_ID[p.exerciseId];
+    const g = ex && CAT_TO_GROUP[ex.cat];
+    if (g) groups.add(g);
+  });
+  return groups;
+}
+
 function resolveDayExercises(day, data) {
   const focus = data.focus || DEFAULT_FOCUS;
   const program = getProgram(data);
@@ -2117,9 +2131,29 @@ function resolveDayExercises(day, data) {
     splitList.maxSetsNotes = notes;
     return splitList;
   }
+  // coach-apply-overhaul P0-1: for a (day, group) the coach has prescribed,
+  // the prescriptions define that group's volume on that day — no bonus
+  // injection and no focus-multiplier uplift on the group's remaining
+  // generator rows. Gate 6 projects the week through this same function,
+  // so render and gate can't disagree about what a prescription nets to.
+  const prescribedGroups = prescribedGroupsForDay(data, day.id);
   const generatorList = [
-    ...day.exercises.map((s) => ({ slot: s, ex: resolveSlot(s, data.swaps, focus) })),
-    ...bonusForDay(day, focus, program).map((b) => ({ slot: b, ex: b })),
+    ...day.exercises.map((s) => {
+      const ex = resolveSlot(s, data.swaps, focus);
+      if (prescribedGroups.has(CAT_TO_GROUP[ex.cat])) {
+        // Uplift only (FIX_SPEC item 1: "adjustSets uplift"): a maintain
+        // group's 0.55x reduction stays — stripping it would RAISE a
+        // maintain group's volume just because one of its rows got a
+        // prescription (seen on real data: Lower legs 10 -> 14).
+        ex.sets = Math.min(ex.sets, ex.baseSets);
+        ex.focusBoost = false;
+        ex.focusSuppressed = true;
+      }
+      return { slot: s, ex };
+    }),
+    ...bonusForDay(day, focus, program)
+      .filter((b) => !prescribedGroups.has(b.bonusGroup))
+      .map((b) => ({ slot: b, ex: b })),
   ];
   // Task 6, Section 6 (pre-decision 6): default render order sorts by
   // emphasis rank DESCENDING — highest-focus group first — reusing
@@ -2945,7 +2979,9 @@ function gate7DurationTrim(prescriptions, sessionMin, focus, trimPriorityOrder) 
    hold RAW values; see scripts/check-prescription-reconciliation.js's
    assertion that a stored prescription's load is never deload-scaled. */
 
-/* Gate 6's default cap, absent a real sessionRules.weeklyGroupSetCaps
+/* NOTE (coach-apply-overhaul P0-1): Gate 6 no longer uses this — see
+   gate6Cap. Only Gate 11 (authored days) still does.
+   Gate 6's default cap, absent a real sessionRules.weeklyGroupSetCaps
    override (Task 2 hasn't wired that up yet). MUSCLE_GROUPS[group].mav can
    be lower than what the CURRENT default program already prescribes for
    that group with zero focus adjustment (legs: mav=20 vs. the balanced
@@ -3073,11 +3109,22 @@ function runPrescriptionGates(prescription, ctx) {
    survivor set), then 8 (deload, overrides everything that's left). This
    is the one place that knows about a LIST of prescriptions — the gates
    themselves stay single-item and caller-agnostic. */
+/* Gate 6's cap (coach-apply-overhaul P0-1, Sean's change 3): an explicit
+   sessionRules.weeklyGroupSetCaps value, else the group's MAV. Never
+   raised to fit the current baseline — the old max(mav, baseline) let an
+   already-inflated week set its own ceiling. A baseline that already sits
+   over this cap is reported as a warning, not a reason to raise it.
+   (Gate 11 still uses defaultGroupCap; deliberately untouched here.) */
+function gate6Cap(group, ctx) {
+  const explicit = ctx.weeklyGroupSetCaps && ctx.weeklyGroupSetCaps[group];
+  if (explicit != null) return explicit;
+  return (MUSCLE_GROUPS[group] && MUSCLE_GROUPS[group].mav) || null;
+}
+
 function applyGatedPrescriptions(prescriptions, ctx) {
   const rejections = [];
   const notes = [];
-  const runningGroupSets = { ...(ctx.weeklyGroupSets || {}) };
-  const survivors = [];
+  const candidates = [];
   // Within-batch collision guard (Task 2 commit 3): two prescriptions in
   // the SAME paste naming the same (dayKey, exerciseId) pair would each
   // independently subtract the same baseline slot's sets below — first
@@ -3102,44 +3149,94 @@ function applyGatedPrescriptions(prescriptions, ctx) {
       });
       return;
     }
-    const group = CAT_TO_GROUP[ex.cat];
-    const addedSets = result.value.sets || 3;
-    // Reconciliation-aware tally (Task 2 commit 3, closes the legs-cap
-    // headroom gap from DEFERRED-TESTS.md's handoff note): ctx.
-    // currentSlotFor is built from the exact same resolveDayExercises
-    // this prescription will be spliced into at render time — one
-    // predicate answers both "does this replace something" (render) and
-    // "how much do I subtract before adding" (here), so they can't drift
-    // apart. gate1dAmbiguousMatch already rejected the >1-match case
-    // upstream, so this is always 0 (ADD) or 1 (REPLACE) here.
-    const matches = ctx.currentSlotFor ? ctx.currentSlotFor(result.value.dayKey, result.value.exerciseId) : [];
-    const isReplace = matches.length === 1;
-    let current = (group && runningGroupSets[group]) || 0;
-    if (isReplace && group) {
-      current = Math.max(0, current - (matches[0].ex.sets || 0));
-    }
-    const cap = group ? ((ctx.weeklyGroupSetCaps && ctx.weeklyGroupSetCaps[group]) ?? defaultGroupCap(group, ctx.weeklyGroupSets)) : null;
-    if (group && cap != null && current + addedSets > cap) {
-      rejections.push({
-        exerciseId: result.value.exerciseId, gate: 6,
-        reason: `"${ex.name}" would push ${(MUSCLE_GROUPS[group] || {}).name || group} to ${current + addedSets} weekly sets, above the ${cap}-set cap.`,
-      });
-      return;
-    }
-    if (group) runningGroupSets[group] = current + addedSets;
     claimed.set(key, ex.name);
-    (result.notes || []).forEach((n) => notes.push({ exerciseId: result.value.exerciseId, ...n }));
-    notes.push({
-      exerciseId: result.value.exerciseId, gate: "reconcile",
-      note: isReplace ? `Replaces the existing "${ex.name}" on this day.` : `Adds "${ex.name}" as a new exercise on this day.`,
-    });
-    survivors.push(result.value);
+    candidates.push({ value: result.value, ex, group: CAT_TO_GROUP[ex.cat], notes: result.notes || [] });
   });
 
-  const trimmed = gate7DurationTrim(survivors, ctx.sessionMin, ctx.focus, ctx.trimPriorityOrder);
-  if (trimmed.trimmedCount > 0 || trimmed.dropped.length > 0) {
-    notes.push({ gate: 7, note: `Fitted to your ${ctx.sessionMin || 60}-minute session: trimmed ${trimmed.trimmedCount} set${trimmed.trimmedCount !== 1 ? "s" : ""}${trimmed.dropped.length ? `, dropped ${trimmed.dropped.join(", ")}` : ""}.` });
+  // Gate 6 (coach-apply-overhaul P0-1): net the WHOLE batch at once
+  // against the week it would actually produce. ctx.projectWeek renders
+  // every day through resolveDayExercises with these prescriptions stored
+  // — replaced rows replaced, and bonus lifts / focus uplift suppressed
+  // for every prescribed (day, group) — instead of the old per-item
+  // running tally, which added prescriptions on top of a baseline that
+  // still counted the uplift and bonus volume they supersede. Re-applying
+  // an identical plan therefore nets to zero.
+  // A group over its cap rejects every prescription in that group (with
+  // the projected total and the plan's own total in the reason) — there's
+  // no principled single "last one in" to blame. Removing a group's
+  // prescriptions changes the time-fit for the rest of its days, so the
+  // projection is re-run until no further group is over.
+  const before = ctx.weeklyGroupSets || {};
+  let kept = candidates;
+  const overGroups = new Set();
+  if (ctx.projectWeek) {
+    for (let guard = 0; guard < Object.keys(MUSCLE_GROUPS).length + 1; guard++) {
+      const projected = ctx.projectWeek(kept.map((c) => c.value));
+      const touched = new Set(kept.map((c) => c.group).filter(Boolean));
+      const newlyOver = [...touched].filter((g) => {
+        const cap = gate6Cap(g, ctx);
+        return cap != null && (projected[g] || 0) > cap;
+      });
+      if (!newlyOver.length) break;
+      newlyOver.forEach((g) => {
+        overGroups.add(g);
+        const cap = gate6Cap(g, ctx);
+        const gName = (MUSCLE_GROUPS[g] || {}).name || g;
+        const planTotal = kept.filter((c) => c.group === g).reduce((a, c) => a + (c.value.sets || 3), 0);
+        kept.filter((c) => c.group === g).forEach((c) => rejections.push({
+          exerciseId: c.value.exerciseId, gate: 6,
+          reason: `"${c.ex.name}": this plan's ${gName} prescriptions (${planTotal} sets) would put ${gName} at ${projected[g]} weekly sets (currently ${before[g] || 0}), above the ${cap}-set cap.`,
+        }));
+      });
+      kept = kept.filter((c) => !newlyOver.includes(c.group));
+    }
   }
+  // Baseline already over its cap: warn, never raise the cap.
+  Object.keys(MUSCLE_GROUPS).forEach((g) => {
+    const cap = gate6Cap(g, ctx);
+    if (cap != null && (before[g] || 0) > cap && !overGroups.has(g)) {
+      notes.push({ gate: "6-baseline", group: g,
+        note: `${MUSCLE_GROUPS[g].name} is already at ${before[g]} weekly sets, above its ${cap}-set cap, before this plan — the cap is not raised to fit.` });
+    }
+  });
+
+  const survivors = [];
+  kept.forEach((c) => {
+    // ctx.currentSlotFor reads the same resolveDayExercises this
+    // prescription is spliced into at render time — 0 matches = ADD,
+    // 1 = REPLACE (gate1dAmbiguousMatch already rejected >1 upstream).
+    const matches = ctx.currentSlotFor ? ctx.currentSlotFor(c.value.dayKey, c.value.exerciseId) : [];
+    const isReplace = matches.length === 1;
+    c.notes.forEach((n) => notes.push({ exerciseId: c.value.exerciseId, ...n }));
+    notes.push({
+      exerciseId: c.value.exerciseId, gate: "reconcile",
+      note: isReplace ? `Replaces the existing "${c.ex.name}" on this day.` : `Adds "${c.ex.name}" as a new exercise on this day.`,
+    });
+    survivors.push(c.value);
+  });
+
+  // Gate 7 per dayKey: each day is its own session. Trimming the whole
+  // batch against ONE session budget (the previous behavior) treated a
+  // three-day plan as a single workout and dropped whole prescriptions —
+  // masked until P0-1, because the old Gate 6 rejected most of the batch
+  // first. Day order follows first appearance in the paste; within a day,
+  // gate7DurationTrim is unchanged (the full trim rework is P1-6).
+  const dayOrder = [];
+  const byDay = {};
+  survivors.forEach((p) => {
+    if (!byDay[p.dayKey]) { byDay[p.dayKey] = []; dayOrder.push(p.dayKey); }
+    byDay[p.dayKey].push(p);
+  });
+  const trimmed = { list: [], trimmedCount: 0, dropped: [] };
+  dayOrder.forEach((dk) => {
+    const t = gate7DurationTrim(byDay[dk], ctx.sessionMin, ctx.focus, ctx.trimPriorityOrder);
+    trimmed.list.push(...t.list);
+    if (t.trimmedCount > 0 || t.dropped.length > 0) {
+      trimmed.trimmedCount += t.trimmedCount;
+      trimmed.dropped.push(...t.dropped);
+      notes.push({ gate: 7, dayKey: dk, note: `${dk}: fitted to your ${ctx.sessionMin || 60}-minute session — trimmed ${t.trimmedCount} set${t.trimmedCount !== 1 ? "s" : ""}${t.dropped.length ? `, dropped ${t.dropped.join(", ")}` : ""}.` });
+    }
+  });
 
   // Gate 8: deload no longer mutates what's stored here — see the amended
   // comment above where gate8DeloadOverride used to be. Still worth
@@ -3149,7 +3246,9 @@ function applyGatedPrescriptions(prescriptions, ctx) {
   const final = trimmed.list;
   if (ctx.deloadActive) notes.push({ gate: 8, note: "Deload week active — sets and loads will be scaled down wherever this plan renders, regardless of what's prescribed here." });
 
-  return { accepted: final, rejections, notes };
+  // Per-group before -> after, for the apply preview (P0-2).
+  const weeklyGroupSetsAfter = ctx.projectWeek ? ctx.projectWeek(final) : null;
+  return { accepted: final, rejections, notes, weeklyGroupSetsBefore: before, weeklyGroupSetsAfter };
 }
 
 /* Assembles the read-only ctx every gate above operates over. Not itself
@@ -3187,6 +3286,21 @@ function buildGateContext(data, plan) {
     }
     return dayCache[dayKey].filter((entry) => entry.ex.id === exerciseId);
   };
+  // Gate 6's projection: the week as it would render once this plan is
+  // stored. Mirrors what CoachCard's buildPlanUpdate persists (template,
+  // sessionMin, sessionRules, focus, and `prescriptions` as a full
+  // snapshot — wholesale replacement, not a merge).
+  const projectWeek = (prescriptions) => weeklySetsByGroup({
+    ...data,
+    focus: (plan && plan.focus) || data.focus,
+    plan: {
+      ...(data.plan || DEFAULT_PLAN),
+      template: (plan && plan.template) || (data.plan && data.plan.template),
+      sessionMin: (plan && plan.sessionMin) || (data.plan && data.plan.sessionMin),
+      sessionRules: (plan && plan.sessionRules) || (data.plan && data.plan.sessionRules),
+      prescriptions,
+    },
+  });
   return {
     injuryProfile,
     sessions: data.sessions || [],
@@ -3206,6 +3320,7 @@ function buildGateContext(data, plan) {
     checkinScopeIds: checkinScoped ? checkInExerciseIds(data) : null,
     programDayIds: new Set(program.map((d) => d.id)),
     currentSlotFor,
+    projectWeek,
     // Task 6, Gates 9-13: the day-gate orchestrator needs the raw program
     // array itself (to find a dayKey's base template day for Gate 12/13's
     // comparisons) and the pre-this-plan `data` (to compute a day's OLD
@@ -5671,6 +5786,8 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
     gated.prescriptions = result.accepted;
     gated.prescriptionRejections = result.rejections;
     gated.prescriptionNotes = result.notes;
+    gated.weeklyGroupSetsBefore = result.weeklyGroupSetsBefore;
+    gated.weeklyGroupSetsAfter = result.weeklyGroupSetsAfter;
   }
 
   // Task 6, Section 2: `days` through Gates 9-13. Backward compatible —
