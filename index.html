@@ -1292,21 +1292,42 @@ function deloadActive(data) {
 }
 
 /* Share of trained compound lifts whose weekly-best e1RM has not improved
-   over the last 3 recorded weeks. */
+   over the last 3 recorded weeks.
+   coach-apply-overhaul P2-11: the denominator only counts lifts that are
+   SUPPOSED to be progressing. Excluded, and reported with a reason:
+     - "too new": fewer than 3 logged weeks (no trend yet),
+     - "maintain": the lift's group is on maintain (holding is the goal),
+     - "rehab": REHAB_EXERCISE_IDS (load is clinician-paced, not chased).
+   A lift on maintain or rehab that "stalls" is doing its job; counting it
+   used to push the stall ratio toward a deload nobody needed. */
 function stallScore(data) {
+  const focus = data.focus || DEFAULT_FOCUS;
   const lifts = ALL_KNOWN.filter(
     (ex) => isCompound(ex) && data.sessions.some((s) => s.exerciseId === ex.id)
   );
   let eligible = 0, stalled = 0;
+  const excluded = [];
+  const stalledIds = [];
   lifts.forEach((ex) => {
+    if (REHAB_EXERCISE_IDS.has(ex.id)) { excluded.push({ id: ex.id, reason: "rehab" }); return; }
+    if (focus[CAT_TO_GROUP[ex.cat]] === "maintain") { excluded.push({ id: ex.id, reason: "maintain" }); return; }
     // P2-8: possible-data-error weeks excluded until confirmed.
     const { series } = trustedSeries(data.sessions, ex.id, data.dataQualityConfirmations, data.weights);
-    if (series.length < 3) return;
+    if (series.length < 3) { excluded.push({ id: ex.id, reason: "too new" }); return; }
     eligible++;
     const recent = series.slice(-3);
-    if (recent[2].e1 <= recent[0].e1 * 1.005) stalled++;
+    if (recent[2].e1 <= recent[0].e1 * 1.005) { stalled++; stalledIds.push(ex.id); }
   });
-  return { eligible, stalled, ratio: eligible ? stalled / eligible : 0 };
+  return { eligible, stalled, ratio: eligible ? stalled / eligible : 0, excluded, stalledIds };
+}
+
+/* "7 of 11 lifts stalled (4 excluded: 3 maintain, 1 rehab)" — the
+   denominator, said out loud wherever the stall ratio drives a decision. */
+function stallSummary(st) {
+  const byReason = {};
+  st.excluded.forEach((e) => { byReason[e.reason] = (byReason[e.reason] || 0) + 1; });
+  const ex = Object.entries(byReason).map(([r, n]) => `${n} ${r}`).join(", ");
+  return `${st.stalled} of ${st.eligible} progressing lift${st.eligible !== 1 ? "s" : ""} stalled${st.excluded.length ? ` (${st.excluded.length} not counted: ${ex})` : ""}`;
 }
 
 function templateWeeks(data) {
@@ -1330,7 +1351,7 @@ function phaseInfo(data) {
   if (wks >= 6 && st.eligible >= 3 && st.ratio >= 0.6) {
     suggestions.push({
       type: "deload",
-      text: `${st.stalled} of ${st.eligible} main lifts have stalled for ~3 weeks — the classic accumulated-fatigue signal. A 1-week deload is the evidence-based reset.`,
+      text: `${stallSummary(st)} for ~3 weeks — the classic accumulated-fatigue signal. A 1-week deload is the evidence-based reset.`,
     });
   }
   const tmpl = (data.plan && data.plan.template) || "balanced";
@@ -1352,6 +1373,8 @@ function phaseInfo(data) {
     name: "Building block", icon: "build",
     note: `Week ${wks} of training. Double progression is the driver: hit the top of a rep range on all sets, add weight next session.`,
     suggestions,
+    // P2-11: the stall denominator, always visible (not only when it trips a deload).
+    stallLine: st.eligible || st.excluded.length ? `Stall check: ${stallSummary(st)}.` : null,
   };
 }
 
@@ -2771,6 +2794,7 @@ function recommend(ex, sessions, deload) {
       weight: target,
       tag: "Reduce",
       backoff: target,
+      backoffTop: w, // the "keep w for set 1, then back off" alternative (P2-11 back-off plan)
       note: `Your reps fell from ${first} to ${worst} at ${w} lb — that's a ${Math.round(decay * 100)}% drop, and ${belowMin} set${belowMin > 1 ? "s" : ""} landed under ${ex.repMin}. The right load is one you can hold across all ${ex.sets || live.length} sets. Drop to ${target} lb. (Alternative: keep ${w} lb for set 1, then back off to ${target} for the rest.)`,
     };
   }
@@ -2779,6 +2803,7 @@ function recommend(ex, sessions, deload) {
       weight: w,
       tag: "Back-off sets",
       backoff: stepDown(w, inc),
+      backoffTop: w,
       note: `Only the last set slipped under ${ex.repMin}. Keep ${w} lb while reps are still in range, and drop to ${stepDown(w, inc)} lb on any set that would fall short — back-off loading keeps every set inside the range instead of grinding.`,
     };
   }
@@ -4487,6 +4512,7 @@ function PhaseCard({ data, persist }) {
         )}
       </div>
       <div style={{ fontSize: 13, color: "#3A3A3C", marginTop: 8, lineHeight: 1.5 }}>{info.note}</div>
+      {info.stallLine && <div style={{ fontSize: 12, color: C.sub, marginTop: 6, lineHeight: 1.4 }}>{info.stallLine}</div>}
 
       {info.suggestions.map((s, i) => (
         <div key={i} style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.line}` }}>
@@ -4796,6 +4822,68 @@ function LoadDropPrompt({ sets, drops, onChoose, compact }) {
   );
 }
 
+/* ===== Back-off suggestions while logging (Sean, 2026-10-25) =====
+   Two one-tap offers, never applied automatically:
+   1. Before you start: when recommend() already proposes back-off loading
+      (rec.backoffTop -> rec.backoff), pre-fill set 1 at the top load and
+      the rest as tagged back-off sets.
+   2. Mid-session: once a working (untagged) set comes in under repMin and
+      sets remain un-logged, offer to back the remaining sets off by
+      stepDown() (~10%, at least one increment) — the same rule recommend()
+      uses — tagged as back-off so progression reads them correctly.
+   Load math is on the EFFECTIVE load; for bodyweight-loaded lifts the
+   back-off is written back in the entry's terms (more assist). */
+function rowLoad(row, bw) {
+  return bw && row.mode !== undefined ? storedSetFromEntry(row, bw).w : Number(row.w) || 0;
+}
+function rowAtLoad(row, load, bw) {
+  if (bw && row.mode !== undefined) return entryRowFromEffective({ ...row, w: load }, load < bw ? "assist" : "added", bw);
+  return { ...row, w: String(load) };
+}
+function liveBackoffSuggestion(rows, ex, bw) {
+  if (!ex || !ex.repMin) return null;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const reps = Number(row.r) || 0;
+    if (!reps || row.segment === "backoff" || row.segment === "drop") continue;
+    if (reps >= ex.repMin) continue;
+    // Only sets still to do AND not already tagged back-off/drop (else the
+    // offer would reappear right after being accepted).
+    const remaining = rows.map((_, k) => k).filter((k) => k > i && !(Number(rows[k].r) > 0)
+      && rows[k].segment !== "backoff" && rows[k].segment !== "drop");
+    const fromLoad = rowLoad(row, bw);
+    if (!remaining.length || !(fromLoad > 0)) return null;
+    return { afterSet: i, remaining, reps, fromLoad, load: stepDown(fromLoad, ex.inc ?? 5) };
+  }
+  return null;
+}
+const applyLiveBackoff = (rows, s, bw) =>
+  rows.map((x, k) => (s.remaining.includes(k) ? { ...rowAtLoad(x, s.load, bw), segment: "backoff" } : x));
+function backoffPlanRows(rows, rec, bw) {
+  return rows.map((x, k) => (k === 0
+    ? { ...rowAtLoad(x, rec.backoffTop, bw), segment: "top" }
+    : { ...rowAtLoad(x, rec.backoff, bw), segment: "backoff" }));
+}
+
+function BackoffSuggestion({ rows, ex, bw, onApply }) {
+  const [dismissed, setDismissed] = useState(null);
+  const s = liveBackoffSuggestion(rows || [], ex, bw);
+  if (!s || dismissed === s.afterSet) return null;
+  const n = s.remaining.map((k) => k + 1);
+  return (
+    <div style={{ background: "#EAF3FF", borderRadius: 10, padding: 10, margin: "4px 0 8px" }}>
+      <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+        Set {s.afterSet + 1} came in at {s.reps} reps, under {ex.repMin}. Back off set{n.length !== 1 ? "s" : ""} {n.join(", ")} to <b>{s.load} lb</b>
+        {bw && rows[s.afterSet].mode !== undefined ? " effective" : ""} (from {s.fromLoad}) to keep {n.length !== 1 ? "them" : "it"} in range?
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+        <button style={S.smallPill()} onClick={() => onApply(applyLiveBackoff(rows, s, bw))}>Back off</button>
+        <button style={S.smallPill("#E9E9EB", C.text)} onClick={() => setDismissed(s.afterSet)}>Keep the load</button>
+      </div>
+    </div>
+  );
+}
+
 /* coach-apply-overhaul P2-9: one set's type picker for a bodyweight-loaded
    lift (BW − assist / Bodyweight / BW + weight). Switching type keeps the
    same effective load where it can (e.g. assist 23 at 158 -> BW + weight
@@ -5003,9 +5091,12 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                   </div>
                 ))}
               </div>
-              {rec.backoff && rec.backoff !== rec.weight && (
-                <div style={{ fontSize: 12, color: C.blue, marginTop: 8, lineHeight: 1.4 }}>
-                  Back-off option: {rec.weight} lb on set 1, then {rec.backoff} lb to keep every set in range.
+              {rec.backoff && rec.backoffTop && rec.backoff !== rec.backoffTop && (
+                <div style={{ fontSize: 12, color: C.blue, marginTop: 8, lineHeight: 1.4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span>Back-off option: {rec.backoffTop} lb on set 1, then {rec.backoff} lb to keep every set in range.</span>
+                  {sets && sets.length > 1 && (
+                    <button style={S.smallPill()} onClick={() => setSets(backoffPlanRows(sets, rec, bwLoaded ? bw : null))}>Use back-off plan</button>
+                  )}
                 </div>
               )}
             </div>
@@ -5038,13 +5129,21 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                   value={s.r} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, r: e.target.value } : x)))}
                 />
               </div>
-              {hasNonTrivialScheme && (
+              {hasNonTrivialScheme ? (
                 <div style={{ marginTop: 4, marginLeft: 54 }}>
                   <SegmentPicker value={s.segment || "top"} onChange={(seg) => setSets(sets.map((x, j) => (j === i ? { ...x, segment: seg } : x)))} />
+                </div>
+              ) : (s.segment === "backoff" || s.segment === "drop") && (
+                <div style={{ marginTop: 2, marginLeft: 54, fontSize: 11.5, color: C.blue }}>
+                  {s.segment === "backoff" ? "back-off set" : "drop set"} ·{" "}
+                  <button style={{ background: "none", border: "none", color: C.sub, padding: 0, cursor: "pointer", fontSize: 11.5, textDecoration: "underline" }}
+                    onClick={() => setSets(sets.map((x, j) => (j === i ? { ...x, segment: "top" } : x)))}>untag</button>
                 </div>
               )}
             </div>
           ))}
+
+          <BackoffSuggestion rows={sets} ex={ex} bw={bwLoaded ? bw : null} onApply={setSets} />
 
           {injuryProfile.recoveringMode && (
             <div style={{ ...S.row, marginTop: 4, marginBottom: 10 }}>
@@ -5994,13 +6093,21 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
                 value={s.r} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, r: e.target.value } : x)))}
               />
             </div>
-            {hasNonTrivialScheme && (
+            {hasNonTrivialScheme ? (
               <div style={{ marginTop: 4, marginLeft: 54 }}>
                 <SegmentPicker value={s.segment || "top"} onChange={(seg) => setSets(sets.map((x, j) => (j === i ? { ...x, segment: seg } : x)))} />
+              </div>
+            ) : (s.segment === "backoff" || s.segment === "drop") && (
+              <div style={{ marginTop: 2, marginLeft: 54, fontSize: 11.5, color: C.blue }}>
+                {s.segment === "backoff" ? "back-off set" : "drop set"} ·{" "}
+                <button style={{ background: "none", border: "none", color: C.sub, padding: 0, cursor: "pointer", fontSize: 11.5, textDecoration: "underline" }}
+                  onClick={() => setSets(sets.map((x, j) => (j === i ? { ...x, segment: "top" } : x)))}>untag</button>
               </div>
             )}
           </div>
         ))}
+
+        <BackoffSuggestion rows={sets} ex={selectedEx} bw={isBodyweightLoaded(exId) ? logBw : null} onApply={setSets} />
 
         {injuryProfile.recoveringMode && (
           <div style={{ ...S.row, marginBottom: 8 }}>
@@ -6317,6 +6424,8 @@ function coachMetrics(data) {
     latestBw: w.length ? w[w.length - 1].lbs : null,
     bwSlopePerWeek: bwSlope,
     stalledLifts: lifts.filter((l) => l.weeksLogged >= 3 && l.stalled).length,
+    // P2-11: what the deload decision actually uses, denominator included.
+    stallCheck: stallSummary(stallScore(data)),
     lifts: lifts.filter((l) => l.weeksLogged >= 1),
     currentPlan: data.plan || null,
     currentFocus: data.focus || null,

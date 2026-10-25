@@ -56,6 +56,7 @@ const SCRIPTS = [
   "check-data-quality-flags.js",
   "check-assisted-e1rm.js",
   "check-backoff-tagging.js",
+  "check-stall-and-backoff-suggest.js",
 ];
 
 const ASSERTION_RE = /(\d+)\s+assertions/;
