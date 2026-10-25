@@ -1485,11 +1485,13 @@ function researchForCheckIn(data) {
 const CHECKIN_ALTERNATES_PER_POOL = 0;
 function checkInExerciseIds(data) {
   const program = getProgram(data);
-  const focus = data.focus || DEFAULT_FOCUS;
   const currentIds = new Set();
+  // coach-apply-overhaul P0-3: read the live program through
+  // resolveDayExercises — the same function every day renders through —
+  // so stored prescription ADDs, pool spawns and authored days are in
+  // the library too, not just generator slots + bonus lifts.
   program.forEach((day) => {
-    day.exercises.forEach((slot) => currentIds.add(resolveSlot(slot, data.swaps, focus).id));
-    bonusForDay(day, focus, program).forEach((b) => currentIds.add(b.id));
+    resolveDayExercises(day, data).forEach(({ ex }) => currentIds.add(ex.id));
   });
   const scoped = new Set(currentIds);
   const poolsSeen = new Set();
@@ -1546,15 +1548,50 @@ const TAG_SOURCE_CODE = { descriptive: "D", from_app_caution: "C", conservative_
    information the model needs. Fixed column positions (empty fields stay
    blank between pipes, never omitted) so the legend below is enough to
    parse it without ambiguity. */
-/* includeTags=false (checkin tier): the model is working from an already
-   gate-compliant live program, not selecting/authoring new exercises, so a
-   bare id|name list is enough to reference a valid id — the full tag
+/* includeTags=false (checkin tier): a SHORT tag form — romProfile, the
+   gating attributes, contraindications and the computed ok column. (It
+   used to be bare id|name under the assumption that the live program is
+   gate-compliant; it isn't always — a swap can put a Gate-2-rejected
+   exercise like goblet into the live program, coach-apply-overhaul P0-3.)
+   The full tag
    payload is reserved for the "full" tier, where actual exercise-selection
    reasoning happens and tag-based self-constraint-checking earns its
    weight in characters. */
-function formatExerciseLibraryCompact(exercises, includeTags) {
+/* coach-apply-overhaul P0-3: "gate-compliant" is computed, never asserted.
+   An exercise is labeled compliant only if it passes the exercise-level
+   gates the apply step runs on every prescription — Gate 1 (known id)
+   and Gate 2 (injury) — called directly with the same frozen
+   injuryProfile buildGateContext uses. Gates 3-8 judge a prescription's
+   load/volume/time, not the exercise, so they have no per-exercise
+   verdict to report here. */
+function exerciseGateStatus(ex, injuryProfile) {
+  const g1 = gate1UnknownId({ exerciseId: ex.id });
+  if (g1.reject) return { compliant: false, gate: 1, reason: g1.reason };
+  const g2 = gate2Injury({ exerciseId: ex.id }, { injuryProfile });
+  if (g2.reject) return { compliant: false, gate: 2, reason: g2.reason };
+  return { compliant: true };
+}
+// Short column value: "Y", or "N:G2" (which gate rejects it).
+const gateStatusCode = (st) => (st.compliant ? "Y" : `N:G${st.gate}`);
+
+/* Attributes Gate 2 can act on — the forbidden list plus the hip-loading
+   family — shown in the check-in tier's short tag column so the model can
+   see WHY something is or isn't compliant without the full tag payload. */
+function gatingAttributes(ex, injuryProfile) {
+  const mc = (injuryProfile && injuryProfile.movementConstraints) || DEFAULT_INJURY_PROFILE.movementConstraints;
+  const relevant = new Set([...(mc.forbidden || []), ...HIP_LOADING_ATTRS]);
+  return (ex.attributes || []).filter((a) => relevant.has(a));
+}
+
+function formatExerciseLibraryCompact(exercises, includeTags, injuryProfile) {
+  const ip = injuryProfile || DEFAULT_INJURY_PROFILE;
   if (!includeTags) {
-    return exercises.map((ex) => `${ex.id}|${ex.name.replace(/\s*\([^)]*\)\s*$/, "")}`).join("\n");
+    return exercises.map((ex) => {
+      const rom = ex.romProfile ? Object.entries(ex.romProfile).map(([k, v]) => `${k}=${v}`).join(",") : "";
+      const attrs = gatingAttributes(ex, ip).join(",");
+      const ci = (ex.contraindications || []).join(",");
+      return `${ex.id}|${ex.name.replace(/\s*\([^)]*\)\s*$/, "")}|${rom}|${attrs}|${ci}|${gateStatusCode(exerciseGateStatus(ex, ip))}`;
+    }).join("\n");
   }
   return exerciseLibraryEntries(exercises).map((e) => {
     const attrs = (e.attributes || []).join(",");
@@ -1566,22 +1603,46 @@ function formatExerciseLibraryCompact(exercises, includeTags) {
     // already say structurally in this same row — dropped here only (not
     // from ex.name itself, which stays intact everywhere else in the app).
     const name = e.name.replace(/\s*\([^)]*\)\s*$/, "");
-    return `${e.id}|${name}|${e.group}|${code}|${attrs}|${rom}|${ci}`;
+    return `${e.id}|${name}|${e.group}|${code}|${attrs}|${rom}|${ci}|${gateStatusCode(exerciseGateStatus(EX_BY_ID[e.id] || e, ip))}`;
   }).join("\n");
 }
-const EXERCISE_LIBRARY_LEGEND = `Cols (pipe-delim, blank=none): id|name|group|tagSource|attributes|romProfile|contraindications
+const GATE_OK_LEGEND = "ok: Y = passes the same exercise-level gates (1 unknown id, 2 injury) the app runs on apply; N:G2 = Gate 2 WILL reject it — do not prescribe it. Load/volume/time gates (3-8) apply per prescription and aren't shown here.";
+const EXERCISE_LIBRARY_LEGEND = `Cols (pipe-delim, blank=none): id|name|group|tagSource|attributes|romProfile|contraindications|ok
 tagSource: D=descriptive fact, C=from_app_caution, G=conservative_default(UNVERIFIED GUESS - trust less), R=clinician_reviewed
-attributes/contraindications: comma-separated. romProfile: key=value, comma-separated.`;
-const EXERCISE_LIBRARY_LEGEND_CHECKIN = "Cols: id|name (pipe-delim).";
+attributes/contraindications: comma-separated. romProfile: key=value, comma-separated.
+${GATE_OK_LEGEND}`;
+const EXERCISE_LIBRARY_LEGEND_CHECKIN = `Cols (pipe-delim, blank=none): id|name|romProfile|gatingAttributes|contraindications|ok
+${GATE_OK_LEGEND}`;
 
 /* Same compact-encoding technique applied to training_metrics.lifts — the
    content is never truncated (every logged lift is still sent, in both
    tiers; that's the bug this task fixed), only the ENCODING is leaner:
    repeated JSON keys ("id":,"name":,"weeksLogged":...) per lift cost real
    characters for no benefit once a legend states the column order once. */
-const TRAINING_METRICS_LIFTS_LEGEND = "lifts cols (pipe-delim): id|name|group|weeksLogged|latestE1|trendPct|stalled";
-function formatLiftsCompact(lifts) {
-  return (lifts || []).map((l) => `${l.id}|${l.name}|${l.group}|${l.weeksLogged}|${l.latestE1 ?? ""}|${l.trendPct ?? ""}|${l.stalled}`).join("\n");
+const TRAINING_METRICS_LIFTS_LEGEND = "lifts cols (pipe-delim): id|name|group|weeksLogged|latestE1|trendPct|stalled|inLibrary (Y, or N = logged history only — not in this brief's <exercise_library>, so it can't be prescribed from this brief)";
+function formatLiftsCompact(lifts, libraryIds) {
+  return (lifts || []).map((l) => {
+    const inLib = !libraryIds || libraryIds.has(l.id) ? "Y" : "N";
+    return `${l.id}|${l.name}|${l.group}|${l.weeksLogged}|${l.latestE1 ?? ""}|${l.trendPct ?? ""}|${l.stalled}|${inLib}`;
+  }).join("\n");
+}
+
+/* coach-apply-overhaul P0-3: <program_days> lists each day as it actually
+   renders (swaps, bonus lifts, prescriptions, pool spawns — via
+   resolveDayExercises), not the raw template slot ids. Any exercise not
+   in this brief's library, or that Gate 2 would reject, is flagged inline
+   rather than silently listed as if it were fine. */
+function programDaysLines(data, libraryIds, injuryProfile) {
+  return getProgram(data).map((d) => {
+    const items = resolveDayExercises(d, data).map(({ ex }) => {
+      const flags = [];
+      if (!libraryIds.has(ex.id)) flags.push("not in live library");
+      const st = exerciseGateStatus(ex, injuryProfile);
+      if (!st.compliant) flags.push(`fails Gate ${st.gate}`);
+      return `${ex.name} [${ex.id}${flags.length ? `; ${flags.join("; ")}` : ""}]`;
+    });
+    return `- ${d.id} "${d.name}": ${items.join(", ")}`;
+  });
 }
 
 /* Every session carrying a resolved pain signal (an answered value, during
@@ -1624,17 +1685,18 @@ function buildCoachBrief(data, goalProfile, tier) {
   // either tier — the model had no way to know what a real one looked
   // like short of guessing from context. Listed once, used by both
   // <days_contract> (full tier) and plain prescriptions (both tiers).
-  const program = getProgram(data);
+  const libraryIds = new Set(libraryExercises.map((ex) => ex.id));
   const programDaysSection = `
 
 <program_days>
-Current template: ${(TEMPLATES.find((t) => t.key === (data.plan && data.plan.template)) || {}).name || "Balanced 2+2"}. Valid dayKey values (required on every prescription and every days[] entry):
-${program.map((d) => `- ${d.id} "${d.name}": ${d.exercises.map((s) => (EX_BY_ID[s.id] || {}).name || s.id).join(", ")}`).join("\n")}
+Current template: ${(TEMPLATES.find((t) => t.key === (data.plan && data.plan.template)) || {}).name || "Balanced 2+2"}. Valid dayKey values (required on every prescription and every days[] entry), each with the day as it currently renders (swaps applied) as name [id; flags]:
+${programDaysLines(data, libraryIds, injuryProfile).join("\n")}
 </program_days>`;
 
+  const nonCompliant = libraryExercises.filter((ex) => !exerciseGateStatus(ex, injuryProfile).compliant).length;
   const librarySectionIntro = isFullTier
-    ? `Full library: ${libraryExercises.length} exercises, tagged to match Gate 2. Constraint-check selections against the tags before proposing; if nothing fits, decline that slot and explain why — never substitute or invent an unverifiable exercise.`
-    : `Live-program exercises (${libraryExercises.length} of ${ALL_KNOWN.length}), id|name only — already gate-compliant. exerciseId must come from this list (enforced); ask for the full tagged library to propose something new.`;
+    ? `Full library: ${libraryExercises.length} exercises, tagged to match Gate 2 (${nonCompliant} marked ok=N). Constraint-check selections against the tags before proposing; if nothing fits, decline that slot and explain why — never substitute or invent an unverifiable exercise.`
+    : `Live-program exercises (${libraryExercises.length} of ${ALL_KNOWN.length}), with gating tags. ${nonCompliant ? `${nonCompliant} of them are ok=N — currently in your program but Gate 2 rejects them as a prescription.` : "All pass the exercise-level gates."} exerciseId must come from this list (enforced); ask for the full tagged library to propose something new.`;
 
   // Task 7, Section 7: full day authorship (`days`) is a full-tier-only
   // feature — applyAuthoredDays rejects it wholesale at checkin scope
@@ -1676,14 +1738,15 @@ ${JSON.stringify(injuryProfile)}
 <exercise_library>
 ${librarySectionIntro}
 ${isFullTier ? EXERCISE_LIBRARY_LEGEND : EXERCISE_LIBRARY_LEGEND_CHECKIN}
-${formatExerciseLibraryCompact(libraryExercises, isFullTier)}
+${formatExerciseLibraryCompact(libraryExercises, isFullTier, injuryProfile)}
 </exercise_library>
 ${programDaysSection}${daysContractSection}
 
 <training_metrics>
 ${JSON.stringify({ ...m, lifts: undefined }, (k, v) => (v === null ? undefined : v))}
+weeklySets = hard sets per muscle group per week as the app currently generates the week (after focus, bonus lifts, stored prescriptions and time-fit) — plan against this baseline.
 ${TRAINING_METRICS_LIFTS_LEGEND}
-${formatLiftsCompact(m.lifts)}
+${formatLiftsCompact(m.lifts, libraryIds)}
 </training_metrics>
 
 <set_quality>
@@ -5712,6 +5775,8 @@ function coachMetrics(data) {
     currentFocus: data.focus || null,
     nutritionTarget: computeNutrition(data.nutrition || DEFAULT_NUTRITION, w.length ? w[w.length - 1].lbs : null).target,
     deloadActive: deloadActive(data),
+    // P0-4: the real per-group weekly baseline the coach must plan against.
+    weeklySets: weeklySetsByGroup(data),
   };
 }
 

@@ -65,8 +65,9 @@ const baseData = (overrides) => ({
   const callSites = (html.match(/gate2Injury\(/g) || []).length;
   // definition + capAndSplitMovement + prescription pipeline (runPrescriptionGates)
   // + ExerciseCard's persistent-warning + swap-picker + contraindicatedInActiveProgram
-  // + gate9AuthoredExercise = 7.
-  ok("gate2Injury has exactly 7 occurrences in index.html (1 definition + 6 callers, no fork added for Gate 9)", callSites === 7, `found ${callSites}`);
+  // + gate9AuthoredExercise + exerciseGateStatus (coach-apply-overhaul P0-3:
+  // the brief's ok column calls the real gate rather than restating it) = 8.
+  ok("gate2Injury has exactly 8 occurrences in index.html (1 definition + 7 callers, no fork added for Gate 9 or the brief)", callSites === 8, `found ${callSites}`);
 }
 
 /* ===== 2. Gate 9 reuses gate2Injury verbatim, same reason text ===== */
