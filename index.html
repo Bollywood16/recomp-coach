@@ -1300,7 +1300,7 @@ function stallScore(data) {
   let eligible = 0, stalled = 0;
   lifts.forEach((ex) => {
     // P2-8: possible-data-error weeks excluded until confirmed.
-    const { series } = trustedSeries(data.sessions, ex.id, data.dataQualityConfirmations);
+    const { series } = trustedSeries(data.sessions, ex.id, data.dataQualityConfirmations, data.weights);
     if (series.length < 3) return;
     eligible++;
     const recent = series.slice(-3);
@@ -1879,10 +1879,6 @@ function weekStart(dateISO) {
 const shortDate = (iso) =>
   new Date(iso + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 const todayISO = () => new Date().toISOString().slice(0, 10);
-const currentBodyweight = (data) => {
-  const w = [...(data.weights || [])].sort((a, b) => (a.date < b.date ? -1 : 1)).slice(-1)[0];
-  return (w && w.lbs) || (data.nutrition && Number(data.nutrition ? 146 : 146)) || 146;
-};
 
 /* Point 1: drop segments excluded from e1RM — a drop's high-rep, reduced-
    load continuation can produce an inflated Epley estimate that isn't
@@ -1904,12 +1900,157 @@ function bestSet(sets) {
   return best;
 }
 
-function weeklySeries(sessions, exId) {
+/* ===== Bodyweight-loaded lifts (coach-apply-overhaul P2-9) =====
+   For these, the load is your bodyweight: minus machine assistance, plus
+   added weight, or just bodyweight. Every set is stored with w = the
+   EFFECTIVE load and its own entry mode, so e1RM compares like with like
+   (more assistance -> lower effective load -> lower e1RM). */
+const BODYWEIGHT_LOADED_IDS = new Set(["pullup", "chinup", "dips", "invrow"]);
+const isBodyweightLoaded = (exOrId) => {
+  const ex = typeof exOrId === "string" ? EX_BY_ID[exOrId] : exOrId;
+  return !!ex && (!!ex.assistable || BODYWEIGHT_LOADED_IDS.has(ex.id));
+};
+
+/* Bodyweight on a date from the weigh-in log: the nearest weigh-in by
+   date (Sean's change 6). null when there are none — never a silent 146. */
+function bodyweightOn(weights, date) {
+  const ws = (weights || []).filter((w) => w && w.lbs > 0);
+  if (!ws.length) return null;
+  const t = new Date(date).getTime();
+  return ws.reduce((best, w) => (Math.abs(new Date(w.date) - t) < Math.abs(new Date(best.date) - t) ? w : best)).lbs;
+}
+
+/* Effective load of one logged set. { load, resolvable }.
+   - Not bodyweight-loaded: w as logged.
+   - Set has a mode (P2-9 entry): w is already effective.
+   - Legacy assisted (assist field): bw - assist, bw from the row, else the
+     nearest weigh-in.
+   - Legacy bodyweight / +weight (no assist): the old entry stored only
+     the ADDED weight (0 for pure bodyweight), which e1rm() used to read as
+     "reps" — effective = bw + added.
+   No bodyweight available -> unresolvable: excluded from e1RM and flagged,
+   never guessed. */
+function effectiveLoad(set, exId, date, weights) {
+  const w = Number(set.w) || 0;
+  if (!isBodyweightLoaded(exId) || set.mode) return { load: w, resolvable: true };
+  if (set.assist != null) {
+    const bw = set.bw || bodyweightOn(weights, date);
+    return bw ? { load: Math.max(1, Math.round(bw - Number(set.assist))), resolvable: true } : { load: null, resolvable: false };
+  }
+  const bw = bodyweightOn(weights, date);
+  return bw ? { load: Math.round(bw + w), resolvable: true } : { load: null, resolvable: false };
+}
+
+/* Per-set entry for bodyweight-loaded lifts (Sean, 2026-10-25): each set
+   picks its own mode — "assist" (bodyweight minus machine assistance),
+   "bw" (bodyweight only), or "added" (bodyweight plus a belt/vest/DB).
+   What's typed depends on the mode; what's STORED is always the effective
+   load in w, plus the mode and its raw input, plus the bodyweight used. */
+const BW_ENTRY_MODES = [
+  { key: "assist", label: "BW − assist", placeholder: "assist lbs" },
+  { key: "bw", label: "Bodyweight", placeholder: "BW" },
+  { key: "added", label: "BW + weight", placeholder: "+ lbs" },
+];
+
+/* Mode a new entry starts in: the last logged set's mode for this lift
+   (legacy rows: assist field -> "assist", added weight -> "added", none ->
+   "bw"); first time: "assist" for an assistable lift, else "bw". */
+function defaultBodyweightMode(ex, sessions) {
+  const last = (sessions || []).filter((s) => s.exerciseId === ex.id).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id - b.id)).pop();
+  const set = last && last.sets[last.sets.length - 1];
+  if (set) {
+    if (set.mode) return set.mode;
+    if (set.assist != null) return "assist";
+    return Number(set.w) > 0 ? "added" : "bw";
+  }
+  return ex.assistable ? "assist" : "bw";
+}
+
+/* Convert a prefilled row whose w is an EFFECTIVE load (what recommend()
+   produces) into what the user types in `mode`. This is the fix for the
+   assisted input errors: the old form put the effective load (e.g. 106)
+   straight into the "assist lbs" field, which saved as assist 106 ->
+   effective 40. */
+function entryRowFromEffective(row, mode, bw) {
+  const eff = Number(row.w);
+  let w = "";
+  if (eff > 0 && bw) {
+    if (mode === "assist" && bw - eff > 0) w = String(Math.round(bw - eff));
+    if (mode === "added" && eff - bw > 0) w = String(Math.round(eff - bw));
+  }
+  return { ...row, mode, w };
+}
+
+/* What a set saves as. bw must be known (the form blocks saving without a
+   weigh-in rather than guessing). */
+function storedSetFromEntry(row, bw) {
+  const r = Number(row.r) || 0;
+  const segment = row.segment || "top";
+  const n = Number(row.w) || 0;
+  if (row.mode === "assist") return { w: Math.max(1, Math.round(bw - n)), r, mode: "assist", assist: n, bw, segment };
+  if (row.mode === "added") return { w: Math.round(bw + n), r, mode: "added", added: n, bw, segment };
+  return { w: Math.round(bw), r, mode: "bw", bw, segment };
+}
+
+/* Assisted-entry input errors (Sean, 2026-10-25): the effective load typed
+   into the assist field reads as huge assistance. Flag a session when any
+   set's assist is > 50% of bodyweight, or its assist is > 2x the previous
+   UNFLAGGED session's. Excluded from trends until confirmed (or corrected
+   in the Log tab). Never auto-fixed. */
+const ASSIST_MAX_BW_SHARE = 0.5;
+const ASSIST_MAX_JUMP = 2;
+function assistedInputErrors(sessions, exId, weights, confirmations) {
+  const rows = (sessions || []).filter((s) => s.exerciseId === exId && s.sets.some((x) => x.assist != null))
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id - b.id));
+  const flags = [];
+  let prevAssist = null;
+  rows.forEach((s) => {
+    const assists = s.sets.filter((x) => x.assist != null).map((x) => Number(x.assist));
+    const maxAssist = Math.max(...assists);
+    const bw = (s.sets.find((x) => x.bw) || {}).bw || bodyweightOn(weights, s.date);
+    const reasons = [];
+    if (bw && maxAssist > bw * ASSIST_MAX_BW_SHARE) reasons.push(`assist ${maxAssist} lb is more than half your ${Math.round(bw)} lb bodyweight`);
+    if (prevAssist != null && prevAssist > 0 && maxAssist > prevAssist * ASSIST_MAX_JUMP) reasons.push(`assist jumped from ${prevAssist} to ${maxAssist} lb (more than 2x) since the previous session`);
+    if (reasons.length) {
+      const id = `input|${s.id}`;
+      const confirmed = !!(confirmations && confirmations[id]);
+      flags.push({ kind: "input", id, exId, sessionId: s.id, date: s.date, assist: maxAssist, bw, reasons, confirmed });
+      if (confirmed) prevAssist = maxAssist;
+    } else {
+      prevAssist = maxAssist;
+    }
+  });
+  return flags;
+}
+
+/* Sessions to base LOAD decisions on (recommend(), the "last time" panel,
+   Gate 3 / load-sanity): every session except unconfirmed assisted input
+   errors — otherwise the next prefill just repeats the mistyped load.
+   Pain/escalation logic must keep using ALL sessions; this is load-only. */
+function loadSessions(data) {
+  const sessions = data.sessions || [];
+  const ids = [...new Set(sessions.map((s) => s.exerciseId))].filter(isBodyweightLoaded);
+  const bad = new Set(ids.flatMap((id) => assistedInputErrors(sessions, id, data.weights, data.dataQualityConfirmations))
+    .filter((f) => !f.confirmed).map((f) => f.sessionId));
+  return bad.size ? sessions.filter((s) => !bad.has(s.id)) : sessions;
+}
+
+/* opts (all optional): { weights, confirmations }. Without weights, legacy
+   bodyweight rows that carry no bw of their own are unresolvable and
+   skipped (never e1rm(0, reps)). Sessions flagged as assisted input errors
+   are skipped unless confirmed. */
+function weeklySeries(sessions, exId, opts) {
+  const weights = opts && opts.weights;
+  const confirmations = opts && opts.confirmations;
   const byWeek = {};
-  const mine = sessions.filter((s) => s.exerciseId === exId);
+  const badSessions = new Set(isBodyweightLoaded(exId)
+    ? assistedInputErrors(sessions, exId, weights, confirmations).filter((f) => !f.confirmed).map((f) => f.sessionId)
+    : []);
+  const mine = sessions.filter((s) => s.exerciseId === exId && !badSessions.has(s.id));
+  const loadOf = (s, x) => effectiveLoad(x, exId, s.date, weights).load;
   mine.forEach((s) => {
     const wk = weekStart(s.date);
-    const b = bestSet(s.sets);
+    const b = bestSet(s.sets.map((x) => ({ ...x, w: loadOf(s, x) })).filter((x) => x.w != null));
     if (!b) return;
     if (!byWeek[wk] || b.v > byWeek[wk].e1) {
       byWeek[wk] = { ...(byWeek[wk] || {}), week: wk, e1: b.v, topW: Number(b.w) || 0, topR: Number(b.r) || 0 };
@@ -1917,10 +2058,19 @@ function weeklySeries(sessions, exId) {
   });
   mine.forEach((s) => {
     const wk = weekStart(s.date);
-    const vol = s.sets.reduce((a, x) => a + (Number(x.w) || 0) * (Number(x.r) || 0), 0);
+    const vol = s.sets.reduce((a, x) => a + (loadOf(s, x) || 0) * (Number(x.r) || 0), 0);
     if (byWeek[wk]) byWeek[wk].vol = (byWeek[wk].vol || 0) + vol;
   });
   return Object.values(byWeek).sort((a, b) => (a.week < b.week ? -1 : 1));
+}
+
+/* Legacy bodyweight rows whose effective load can't be computed (no bw on
+   the row, no weigh-in logged at all) — flagged so they're visible rather
+   than silently mis-scored (Sean's change 6). */
+function unresolvableBodyweightRows(data) {
+  return (data.sessions || []).filter((s) => isBodyweightLoaded(s.exerciseId) &&
+    s.sets.some((x) => !effectiveLoad(x, s.exerciseId, s.date, data.weights).resolvable))
+    .map((s) => ({ kind: "no-bw", id: `nobw|${s.id}`, exId: s.exerciseId, sessionId: s.id, date: s.date }));
 }
 
 /* ===== Data-quality flags (coach-apply-overhaul P2-8) =====
@@ -1957,8 +2107,9 @@ function e1rmDataFlags(series, exId, confirmations) {
 
 /* weeklySeries minus unconfirmed possible-data-error points — the input
    every trend DECISION reads (stallScore, isRegressing, coachMetrics). */
-function trustedSeries(sessions, exId, confirmations) {
-  const series = weeklySeries(sessions || [], exId);
+function trustedSeries(sessions, exId, confirmations, weights) {
+  // P2-9: effective loads (weights) + assisted input-error sessions skipped.
+  const series = weeklySeries(sessions || [], exId, { weights, confirmations });
   const flags = e1rmDataFlags(series, exId, confirmations);
   const drop = new Set(flags.filter((f) => !f.confirmed).map((f) => f.week));
   return { series: series.filter((p) => !drop.has(p.week)), flags };
@@ -1968,9 +2119,13 @@ function trustedSeries(sessions, exId, confirmations) {
 function dataQualityFlags(data) {
   const sessions = data.sessions || [];
   const ids = [...new Set(sessions.map((s) => s.exerciseId))];
-  return ids.flatMap((id) => trustedSeries(sessions, id, data.dataQualityConfirmations).flags)
+  const conf = data.dataQualityConfirmations;
+  const e1Flags = ids.flatMap((id) => trustedSeries(sessions, id, conf, data.weights).flags).map((f) => ({ kind: "e1rm", ...f }));
+  // P2-9: assisted input errors and unresolvable bodyweight rows.
+  const inputFlags = ids.filter(isBodyweightLoaded).flatMap((id) => assistedInputErrors(sessions, id, data.weights, conf));
+  return [...e1Flags, ...inputFlags, ...unresolvableBodyweightRows(data)]
     .filter((f) => !f.confirmed)
-    .sort((a, b) => (a.week < b.week ? 1 : -1));
+    .sort((a, b) => ((a.week || a.date) < (b.week || b.date) ? 1 : -1));
 }
 
 /* Resolve a program slot through any active swap. The resolved exercise keeps
@@ -2289,8 +2444,8 @@ const ORDER_SPECIALIZE_SHARE = 0.4;
 const REGRESSING_TREND_PCT = -5;
 const REGRESSING_MIN_WEEKS = 3;
 
-function isRegressing(sessions, exId, confirmations) {
-  const t = trendPct(trustedSeries(sessions, exId, confirmations).series); // P2-8
+function isRegressing(sessions, exId, confirmations, weights) {
+  const t = trendPct(trustedSeries(sessions, exId, confirmations, weights).series); // P2-8/9
   return !!t && t.weeks >= REGRESSING_MIN_WEEKS && t.pct <= REGRESSING_TREND_PCT;
 }
 
@@ -2335,7 +2490,7 @@ function orderDay(entries, ctx) {
   const sessions = (ctx && ctx.sessions) || [];
   const exs = entries.map((e) => e.ex);
   const overrideGroup = specializationOverrideGroup(exs, focus);
-  const regressing = new Map(exs.map((ex) => [ex.id, isRegressing(sessions, ex.id, ctx && ctx.dataQualityConfirmations)]));
+  const regressing = new Map(exs.map((ex) => [ex.id, isRegressing(sessions, ex.id, ctx && ctx.dataQualityConfirmations, ctx && ctx.weights)]));
   const key = (ex) => [
     overrideGroup && CAT_TO_GROUP[ex.cat] === overrideGroup ? 0 : 1, // (a)
     isCompound(ex) ? 0 : 1,                                          // (b)
@@ -2416,7 +2571,7 @@ function resolveDayExercises(day, data) {
     const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
     // Authored days: the coach's `order` is the coach order (g); no rehab
     // template pins (no templateDay) — the coach authored the whole day.
-    return finishDayOrder(splitList, notes, { focus: data.focus || DEFAULT_FOCUS, sessions: data.sessions, dataQualityConfirmations: data.dataQualityConfirmations });
+    return finishDayOrder(splitList, notes, { focus: data.focus || DEFAULT_FOCUS, sessions: data.sessions, dataQualityConfirmations: data.dataQualityConfirmations, weights: data.weights });
   }
   // coach-apply-overhaul P0-1: for a (day, group) the coach has prescribed,
   // the prescriptions define that group's volume on that day — no bonus
@@ -2507,7 +2662,7 @@ function resolveDayExercises(day, data) {
   const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
-  return finishDayOrder(splitList, notes, { focus, sessions: data.sessions, templateDay: day, dataQualityConfirmations: data.dataQualityConfirmations });
+  return finishDayOrder(splitList, notes, { focus, sessions: data.sessions, templateDay: day, dataQualityConfirmations: data.dataQualityConfirmations, weights: data.weights });
 }
 
 /* Shared tail of both resolveDayExercises branches: order the complete
@@ -3027,7 +3182,8 @@ function exerciseForRecommend(ex, prescription) {
 function gate3LoadSanity(prescription, ctx) {
   const ex = EX_BY_ID[prescription.exerciseId];
   if (!ex) return { reject: false };
-  const lastW = lastWorkingWeight(ctx.sessions, prescription.exerciseId);
+  const loadHist = ctx.loadSessions || ctx.sessions; // P2-9
+  const lastW = lastWorkingWeight(loadHist, prescription.exerciseId);
   const escalating = ctx.escalatingPatterns && ctx.escalatingPatterns.has(ex.painPattern);
 
   if (prescription.load == null) {
@@ -3036,7 +3192,7 @@ function gate3LoadSanity(prescription, ctx) {
     // would otherwise flow through recommend() later, not just one
     // explicitly prescribed here, or the ratchet has a hole in it.
     if (escalating && lastW != null) {
-      const rec = recommend(exerciseForRecommend(ex, prescription), ctx.sessions, ctx.deloadActive);
+      const rec = recommend(exerciseForRecommend(ex, prescription), loadHist, ctx.deloadActive);
       if (rec.weight > lastW) {
         return {
           reject: false,
@@ -3051,7 +3207,7 @@ function gate3LoadSanity(prescription, ctx) {
   if (lastW == null) return { reject: false }; // no logged history to sanity-check against yet
   const ceiling = escalating ? lastW : lastW * 1.15;
   if (prescription.load > ceiling) {
-    const rec = recommend(exerciseForRecommend(ex, prescription), ctx.sessions, ctx.deloadActive);
+    const rec = recommend(exerciseForRecommend(ex, prescription), loadHist, ctx.deloadActive);
     const fallback = escalating ? Math.min(rec.weight, lastW) : rec.weight;
     return {
       reject: false,
@@ -3359,7 +3515,7 @@ function runPrescriptionGates(prescription, ctx) {
   // wrong (e.g. reverse pec-deck logged 10 vs prescribed 40), which the
   // clamp alone would quietly paper over. Warning only, never a reject.
   const rawLoad = prescription.load;
-  const lastLogged = rawLoad != null ? lastWorkingWeight(ctx.sessions || [], prescription.exerciseId) : null;
+  const lastLogged = rawLoad != null ? lastWorkingWeight(ctx.loadSessions || ctx.sessions || [], prescription.exerciseId) : null;
   const loadMismatch = rawLoad != null && lastLogged > 0 && (rawLoad > lastLogged * 2 || rawLoad < lastLogged * 0.5);
 
   const g3 = gate3LoadSanity(value, ctx);
@@ -3575,6 +3731,9 @@ function buildGateContext(data, plan) {
   return {
     injuryProfile,
     sessions: data.sessions || [],
+    // P2-9: load reads (Gate 3, load-sanity) skip unconfirmed assisted
+    // input errors; pain gates keep reading `sessions` (all of them).
+    loadSessions: loadSessions(data),
     weeklyGroupSets: weeklySetsByGroup(data),
     weeklyGroupSetCaps: (plan && plan.sessionRules && plan.sessionRules.weeklyGroupSetCaps) || {},
     // Task 6, Section 6 (pre-decision 4): Gate 7's own trim, wired the
@@ -4598,16 +4757,39 @@ function SegmentPicker({ value, onChange }) {
   );
 }
 
+/* coach-apply-overhaul P2-9: one set's type picker for a bodyweight-loaded
+   lift (BW − assist / Bodyweight / BW + weight). Switching type keeps the
+   same effective load where it can (e.g. assist 23 at 158 -> BW + weight
+   leaves it blank, since 135 < bodyweight). Shared by ExerciseCard and
+   the Log tab's "Log a lift" form so both store sets identically. */
+function BodyweightModeChips({ row, bw, onChange }) {
+  const current = row.mode || "bw";
+  return (
+    <div style={{ display: "flex", gap: 4, marginBottom: 4, marginLeft: 54 }}>
+      {BW_ENTRY_MODES.map((m) => (
+        <button key={m.key} style={{ ...S.chip(current === m.key), fontSize: 11.5, padding: "3px 8px" }}
+          onClick={() => {
+            const eff = bw && (row.w !== "" || current === "bw") ? storedSetFromEntry(row, bw).w : "";
+            onChange(entryRowFromEffective({ ...row, w: eff }, m.key, bw));
+          }}>{m.label}</button>
+      ))}
+    </div>
+  );
+}
+const bwPlaceholder = (row) => (BW_ENTRY_MODES.find((m) => m.key === (row.mode || "bw")) || {}).placeholder;
+
 function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
-  const rec = recommend(ex, data.sessions, deloadActive(data));
+  const rec = recommend(ex, loadSessions(data), deloadActive(data)); // P2-9: skip unconfirmed input errors
   const rest = restFor(ex);
   const [sets, setSets] = useState(null);
   const [swapMode, setSwapMode] = useState(false);
   const [timer, setTimer] = useState(null);
   const [flash, setFlash] = useState(false);
-  const [assist, setAssist] = useState(true); // for assistable lifts: enter machine assist
   const [pain, setPain] = useState("");
-  const bw = currentBodyweight(data);
+  // P2-9: bodyweight-loaded lifts pick a mode per set (see BW_ENTRY_MODES)
+  // and need a real weigh-in — no 146 fallback for effective load.
+  const bwLoaded = isBodyweightLoaded(ex);
+  const bw = bodyweightOn(data.weights, todayISO());
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   // Fix 3 — Gate 2, run in WARN mode against the exercise currently
   // rendered (post-swap). Same gate2Injury call the reject path uses; see
@@ -4626,7 +4808,13 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   // same number (point 1 of this round).
   useEffect(() => {
     if (open && sets === null) {
-      setSets(buildSegmentRows(ex, rec));
+      const rows = buildSegmentRows(ex, rec);
+      if (bwLoaded) {
+        const mode = defaultBodyweightMode(ex, data.sessions);
+        setSets(rows.map((row) => entryRowFromEffective(row, mode, bw)));
+      } else {
+        setSets(rows);
+      }
     }
     if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); }
   }, [open]); // eslint-disable-line
@@ -4634,7 +4822,7 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const hasNonTrivialScheme = ex.scheme && ex.scheme.type !== "straight";
 
   const saveSession = () => {
-    const assistMode = ex.assistable && assist;
+    if (bwLoaded && !bw) return; // the form says why (needs a weigh-in)
     // Point 2: each row's segment rides straight through to the stored
     // row. Point 4 (Addition B): the existing r>0 filter already drops
     // any row nobody filled in — a pre-filled drop/backoff segment the
@@ -4642,15 +4830,9 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
     // zero-rep row. That's unchanged; segment tagging doesn't touch it.
     const clean = (sets || [])
       .map((s) => {
-        const raw = Number(s.w) || 0;
-        const r = Number(s.r) || 0;
-        const segment = s.segment || "top";
-        if (assistMode) {
-          // Entered value is machine assistance; store what was actually lifted.
-          const eff = Math.max(1, Math.round(bw - raw));
-          return { w: eff, r, assist: raw, bw, segment };
-        }
-        return { w: raw, r, segment };
+        // P2-9: per-set mode; stores effective load + mode + raw input + bw.
+        if (bwLoaded) return storedSetFromEntry(s, bw);
+        return { w: Number(s.w) || 0, r: Number(s.r) || 0, segment: s.segment || "top" };
       })
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
@@ -4691,7 +4873,7 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   const setDelta = (ex.sets || 0) - (ex.baseSets || ex.sets || 0);
   const isBonus = !!slot.isBonus;
-  const lastSess = lastSessionFor(data.sessions || [], ex.id);
+  const lastSess = lastSessionFor(loadSessions(data), ex.id); // P2-9
 
   return (
     <div style={{ ...S.card, borderLeft: done ? `4px solid ${C.green}` : "none" }}>
@@ -4778,28 +4960,26 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
             </div>
           )}
 
-          {ex.assistable && (
-            <div style={{ marginBottom: 12 }}>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button style={{ ...S.chip(assist), flex: 1 }} onClick={() => setAssist(true)}>Machine assist</button>
-                <button style={{ ...S.chip(!assist), flex: 1 }} onClick={() => setAssist(false)}>Bodyweight / +weight</button>
-              </div>
-              {assist && (
-                <div style={{ fontSize: 12.5, color: C.sub, marginTop: 8, lineHeight: 1.45 }}>
-                  Enter the <b>assistance</b> the machine gives. It's logged as effective weight
-                  (your bodyweight {Math.round(bw)} lb − assist), so the number climbs as you get stronger.
-                </div>
-              )}
+          {bwLoaded && (
+            <div style={{ fontSize: 12.5, color: C.sub, marginBottom: 10, lineHeight: 1.45 }}>
+              {bw
+                ? <>Pick each set's type: <b>BW − assist</b> (type the machine's assistance), <b>Bodyweight</b>, or <b>BW + weight</b> (type the added load).
+                  It's logged as effective weight from your {Math.round(bw)} lb bodyweight, so the number climbs as you get stronger.</>
+                : <span style={{ color: C.red }}>Log a weigh-in first (Log tab) — this lift is scored from your bodyweight, and the app won't guess it.</span>}
             </div>
           )}
 
           {(sets || []).map((s, i) => (
             <div key={i} style={{ marginBottom: 8 }}>
+              {bwLoaded && (
+                <BodyweightModeChips row={s} bw={bw} onChange={(nr) => setSets(sets.map((x, j) => (j === i ? nr : x)))} />
+              )}
               <div style={S.row}>
                 <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
                 <input
                   style={S.input} type="number" inputMode="decimal"
-                  placeholder={ex.assistable && assist ? "assist lbs" : "lbs"}
+                  disabled={bwLoaded && (s.mode || "bw") === "bw"}
+                  placeholder={bwLoaded ? bwPlaceholder(s) : "lbs"}
                   value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
                 />
                 <input
@@ -4824,10 +5004,12 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
               />
             </div>
           )}
-          {ex.assistable && assist && (sets || []).some((s) => Number(s.w) > 0) && (
+          {bwLoaded && bw && (sets || []).some((s) => Number(s.r) > 0) && (
             <div style={{ fontSize: 12, color: C.blue, marginBottom: 4 }}>
-              Will log: {(sets || []).filter((s) => Number(s.w) > 0 || Number(s.r) > 0).map((s, i) =>
-                `${Math.max(1, Math.round(bw - (Number(s.w) || 0)))}×${Number(s.r) || 0}`).join("  ")} (effective lb)
+              Will log: {(sets || []).filter((s) => Number(s.r) > 0).map((s) => {
+                const st = storedSetFromEntry(s, bw);
+                return `${st.w}×${st.r}`;
+              }).join("  ")} (effective lb)
             </div>
           )}
 
@@ -4839,7 +5021,8 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                 scheme almost always means. */}
             <button style={S.smallPill()} onClick={() => {
               const prior = sets && sets.length ? sets[sets.length - 1] : null;
-              setSets([...(sets || []), { w: prior ? prior.w : (rec.weight === 0 ? "" : String(rec.weight)), r: "", segment: prior ? (prior.segment || "top") : "top" }]);
+              setSets([...(sets || []), { w: prior ? prior.w : (rec.weight === 0 ? "" : String(rec.weight)), r: "", segment: prior ? (prior.segment || "top") : "top",
+                ...(bwLoaded && prior ? { mode: prior.mode || "bw" } : {}) }]); // P2-9: same set type as the row above
             }}>
               <Plus size={13} /> Add set
             </button>
@@ -4918,10 +5101,11 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
           )}
 
           <button
-            style={{ ...S.pillBtn(flash ? C.green : C.blue), width: "100%", marginTop: 12 }}
+            style={{ ...S.pillBtn(flash ? C.green : (bwLoaded && !bw) ? "#C7C7CC" : C.blue), width: "100%", marginTop: 12 }}
+            disabled={bwLoaded && !bw}
             onClick={saveSession}
           >
-            {flash ? "Saved ✓" : "Save session"}
+            {flash ? "Saved ✓" : (bwLoaded && !bw) ? "Log a weigh-in first" : "Save session"}
           </button>
         </div>
       )}
@@ -5602,7 +5786,15 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
   // which blanks every segment's weight) — this form has never
   // auto-filled a recommended weight the way ExerciseCard does, only the
   // SEGMENT sequence and row count are worth seeding here.
-  const blankRowsFor = (id) => buildSegmentRows(exerciseById(id), { weight: 0 });
+  // P2-9: bodyweight-loaded lifts get per-set types here too, so a pull-up
+  // logged from this form stores exactly what ExerciseCard would.
+  const logBw = bodyweightOn(data.weights, todayISO());
+  const blankRowsFor = (id) => {
+    const rows = buildSegmentRows(exerciseById(id), { weight: 0 });
+    if (!isBodyweightLoaded(id)) return rows;
+    const mode = defaultBodyweightMode(exerciseById(id), data.sessions);
+    return rows.map((r) => ({ ...r, mode, w: "" }));
+  };
 
   const [exId, setExId] = useState(resolvedProgram[0].exercises[0].id);
   const [sets, setSets] = useState(() => blankRowsFor(resolvedProgram[0].exercises[0].id));
@@ -5616,9 +5808,11 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
   const flash = (msg) => { setSavedFlash(msg); setTimeout(() => setSavedFlash(""), 2000); };
 
   const saveSession = () => {
+    const bwLift = isBodyweightLoaded(exId);
+    if (bwLift && !logBw) return; // needs a weigh-in; the form says so
     // Point 2: segment rides through to the stored row here too.
     const clean = sets
-      .map((s) => ({ w: Number(s.w) || 0, r: Number(s.r) || 0, segment: s.segment || "top" }))
+      .map((s) => (bwLift ? storedSetFromEntry(s, logBw) : { w: Number(s.w) || 0, r: Number(s.r) || 0, segment: s.segment || "top" }))
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
     // Delayed-onset pain (painRetro) is asked for separately, across all lifts —
@@ -5702,12 +5896,22 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
           )}
         </select>
 
+        {isBodyweightLoaded(exId) && !logBw && (
+          <div style={{ fontSize: 12.5, color: C.red, marginBottom: 8 }}>
+            Log a weigh-in above first — this lift is scored from your bodyweight, and the app won't guess it.
+          </div>
+        )}
         {sets.map((s, i) => (
           <div key={i} style={{ marginBottom: 8 }}>
+            {isBodyweightLoaded(exId) && (
+              <BodyweightModeChips row={s} bw={logBw} onChange={(nr) => setSets(sets.map((x, j) => (j === i ? nr : x)))} />
+            )}
             <div style={S.row}>
               <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
               <input
-                style={S.input} type="number" inputMode="decimal" placeholder="lbs"
+                style={S.input} type="number" inputMode="decimal"
+                disabled={isBodyweightLoaded(exId) && (s.mode || "bw") === "bw"}
+                placeholder={isBodyweightLoaded(exId) ? bwPlaceholder(s) : "lbs"}
                 value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
               />
               <input
@@ -5803,10 +6007,12 @@ function DataQualityCard({ data, persist }) {
       {flags.map((f) => (
         <div key={f.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
           <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
-            <b>{(EX_BY_ID[f.exId] || {}).name || f.exId}</b> · week of {shortDate(f.week)}<br />
-            e1RM {Math.round(f.e1)} vs {Math.round(f.refE1)} on {shortDate(f.refWeek)} (−{f.dropPct}%)
+            <b>{(EX_BY_ID[f.exId] || {}).name || f.exId}</b> · {f.kind === "e1rm" ? `week of ${shortDate(f.week)}` : shortDate(f.date)}<br />
+            {f.kind === "e1rm" && <>e1RM {Math.round(f.e1)} vs {Math.round(f.refE1)} on {shortDate(f.refWeek)} (−{f.dropPct}%)</>}
+            {f.kind === "input" && <>Possible input error: {f.reasons.join("; ")}. Was the effective load typed into the assist field?</>}
+            {f.kind === "no-bw" && <>Bodyweight lift with no bodyweight on record — log a weigh-in so its effective load can be computed.</>}
           </div>
-          <button style={S.smallPill()} onClick={() => confirm(f.id)}>It's real</button>
+          {f.kind !== "no-bw" && <button style={S.smallPill()} onClick={() => confirm(f.id)}>It's real</button>}
         </div>
       ))}
     </div>
@@ -5820,13 +6026,14 @@ function Progress({ data, persist }) {
   const [exId, setExId] = useState(null);
 
   const rows = useMemo(() => trained.map((ex) => {
-    const series = weeklySeries(data.sessions, ex.id);
+    // P2-9: effective loads for bodyweight lifts; input-error sessions left out.
+    const series = weeklySeries(data.sessions, ex.id, { weights: data.weights, confirmations: data.dataQualityConfirmations });
     const last = series[series.length - 1];
     const best = series.reduce((a, s) => Math.max(a, s.e1), 0);
     const t = trendPct(series);
     const lastDate = data.sessions.filter((s) => s.exerciseId === ex.id).map((s) => s.date).sort().slice(-1)[0];
     return { ex, series, last, best, trend: t, lastDate };
-  }).sort((a, b) => (a.lastDate < b.lastDate ? 1 : -1)), [data.sessions, trained.length]);
+  }).sort((a, b) => (a.lastDate < b.lastDate ? 1 : -1)), [data.sessions, data.weights, data.dataQualityConfirmations, trained.length]);
 
   const matches = query.trim()
     ? rows.filter((r) => r.ex.name.toLowerCase().includes(query.trim().toLowerCase()))
@@ -5999,7 +6206,7 @@ function coachMetrics(data) {
   const lifts = trained.map((ex) => {
     // P2-8: trend/stall from the trusted series (possible-data-error weeks
     // excluded until confirmed); the flags themselves go in dataFlags below.
-    const { series } = trustedSeries(sessions, ex.id, data.dataQualityConfirmations);
+    const { series } = trustedSeries(sessions, ex.id, data.dataQualityConfirmations, data.weights);
     const t = trendPct(series);
     const stalled = series.length >= 3 &&
       series[series.length - 1].e1 <= series[series.length - 3].e1 * 1.005;
@@ -6033,7 +6240,11 @@ function coachMetrics(data) {
     // P0-4: the real per-group weekly baseline the coach must plan against.
     weeklySets: weeklySetsByGroup(data),
     // P2-8: unconfirmed possible data errors, excluded from trends above.
-    dataFlags: dataQualityFlags(data).map((f) => `${f.exId} wk ${f.week}: e1RM ${Math.round(f.e1)} vs ${Math.round(f.refE1)} (-${f.dropPct}%) — possible data error, excluded until confirmed`),
+    dataFlags: dataQualityFlags(data).map((f) => (f.kind === "e1rm"
+      ? `${f.exId} wk ${f.week}: e1RM ${Math.round(f.e1)} vs ${Math.round(f.refE1)} (-${f.dropPct}%) — possible data error, excluded until confirmed`
+      : f.kind === "input"
+        ? `${f.exId} ${f.date}: ${f.reasons.join("; ")} — possible input error (effective load typed as assist?), excluded until confirmed`
+        : `${f.exId} ${f.date}: bodyweight lift with no bodyweight on record — effective load unknown, excluded`)),
   };
 }
 
@@ -6798,10 +7009,10 @@ function Insights({ data, persist }) {
       )}
 
       {trained.map((ex) => {
-        const series = weeklySeries(data.sessions, ex.id);
+        const series = weeklySeries(data.sessions, ex.id, { weights: data.weights, confirmations: data.dataQualityConfirmations });
         const t = trendPct(series);
         const scheme = { repMin: ex.repMin || 8, repMax: ex.repMax || 12 };
-        const rec = recommend({ ...ex, ...scheme }, data.sessions);
+        const rec = recommend({ ...ex, ...scheme }, loadSessions(data));
         return (
           <div key={ex.id} style={S.card}>
             <div style={{ ...S.row, justifyContent: "space-between" }}>

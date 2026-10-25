@@ -54,6 +54,7 @@ const SCRIPTS = [
   "check-time-fit.js",
   "check-max-sets-apply.js",
   "check-data-quality-flags.js",
+  "check-assisted-e1rm.js",
 ];
 
 const ASSERTION_RE = /(\d+)\s+assertions/;
