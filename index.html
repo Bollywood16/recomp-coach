@@ -1844,6 +1844,7 @@ ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 3. Push back on goal-vs-constraint/research conflicts; cite sources.
 4. Recommend: template ("balanced"|"upperFocus"|"superhero"); focus/group (shoulders/arms/chest/back/legs/core: maintain|normal|emphasize|specialize, max 2 emphasize+); sessionMin (45|60|75); calorieDelta (-300..300); next to watch. Optional \`prescriptions\`(exerciseId,dayKey,order,sets,repMin,repMax,load,restSec) + \`sessionRules\`(maxSetsPerMovement,orderByFocus,trimPriority,weeklyGroupSetCaps).${isFullTier ? ` Optional \`days\` (see <days_contract>) + \`splitPattern\` (a short label for the split you authored, e.g. "UULU" — descriptive only, not enforced).` : ""}
    Exercise order: the app orders each day itself (a specialize group holding >=40% of a day's sets goes first; then compounds before isolation; then focus rank; regressing lifts earlier). A prescription/day \`order\` is honored only if it keeps those two hard rules (specialize-first block; specialize isolation before normal/maintain isolation) — otherwise that day, and so the whole plan, is rejected. Omit \`order\` unless you need it.
+   Per-movement cap: no exercise gets more than sessionRules.maxSetsPerMovement sets (default ${DEFAULT_MAX_SETS_PER_MOVEMENT}). Sets above it are split onto the best-ranked same-pool alternate that passes the injury gate (or capped, with a note, if none does) — prescribe across two movements yourself if you care which one.
 5. Prose under 300 words; the \`\`\`json block (and every exercise's \`rationale\` in it) is separate and not counted against that.
 6. One \`\`\`json block: plan object, optionally + prescriptions/sessionRules${isFullTier ? "/days/splitPattern" : ""}. Gated on apply; injury constraints aren't overridable.${isFullTier ? " Every days[].exercises[] entry needs its own rationale — an entry without one is rejected (Gate 9). Decline a slot rather than guess: see <days_contract>." : ""}
 </instructions>`;
@@ -1925,8 +1926,15 @@ function weeklySeries(sessions, exId) {
    the slot's set/rep scheme so the day's structure is preserved. */
 function resolveSlot(slot, swaps, focus) {
   const swapId = swaps && swaps[slot.id];
+  // coach-apply-overhaul P1-7: spread the canonical EX_BY_ID entry first.
+  // EXERCISE_ATTRS is merged onto EX_BY_ID — i.e. only onto the FIRST
+  // template's slot object for each id — so a slot from any other
+  // template (e.g. upperFocus's curl, calf) used to resolve with no
+  // pool/attributes/tagSource, and capAndSplitMovement dropped its
+  // overflow as "untagged pool" instead of splitting it. The slot's own
+  // sets/repMin/repMax still win (spread after).
   const base = (!swapId || !EX_BY_ID[swapId])
-    ? { ...slot, slotId: slot.id, swapped: false }
+    ? { ...(EX_BY_ID[slot.id] || {}), ...slot, slotId: slot.id, swapped: false }
     : { ...EX_BY_ID[swapId], repMin: slot.repMin, repMax: slot.repMax,
         slotId: slot.id, swapped: true, originalName: slot.name };
   // Emphasis scales the number of working sets for this exercise's muscle.
@@ -6258,6 +6266,9 @@ function PlanPreview({ pendingPlan, onConfirm, onDiscard }) {
               </div>
             ))}
             {d.dropped.length > 0 && <div style={{ color: C.orange }}>Dropped to fit time: {d.dropped.join(", ")}</div>}
+            {d.maxSetsNotes.map((n, i) => (
+              <div key={`ms${i}`} style={{ color: C.orange, marginTop: 2 }}>Per-movement cap: {n.note}</div>
+            ))}
           </div>
         </div>
       ))}
