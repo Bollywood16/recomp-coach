@@ -27,6 +27,9 @@ Personal fitness PWA for one user (Sean). Goal: "superhero" physique (capped sho
 - `computeNutrition` (Mifflin-St Jeor; target = TDEE − 350 + calorieDelta).
 - Coach gates (Gate 2 injury tags, Gate 4 pain, Gate 6 weekly set caps, etc.).
 
+## Known limitations
+- **Sync is last-writer-wins for everything except sessions and weights** (`mergeData`). Sessions (by id) and weights (by date) are unioned. `swaps`, `focus`, `plan`, `phase`, `nutrition`, `injuryProfile` take whichever device's copy has the newer `_updatedAt`; any other top-level key (e.g. `dataQualityConfirmations`, `planVersions`) is local-wins on every sync. Accepted for now because Sean logs on one device (phone). To be fixed in the separate sync project — not in feature branches.
+
 ## Known iOS/PWA gotchas
 - Home-screen PWA storage ≠ Safari-tab storage for the same URL.
 - iOS evicts web storage after ~7 days unused — Supabase sync is the real persistence; export/import is the fallback.
@@ -35,6 +38,7 @@ Personal fitness PWA for one user (Sean). Goal: "superhero" physique (capped sho
 - Always work on a branch; never commit directly to main.
 - **Start non-trivial work in plan mode and STOP at architectural decision points** for Sean's review before implementing.
 - Test locally before pushing: `npx serve .` (or `python3 -m http.server`) and open on localhost.
+- **Never sign in to Supabase or sync when testing on localhost.** Use local test data only (synthetic fixtures / a fresh browser profile with no saved Supabase config). Because `plan` is last-writer-wins, a localhost test paste that syncs would overwrite Sean's real plan in the cloud.
 - Testing conventions: esbuild bundle check on every change; headless Node tests with stubbed React/Recharts/localStorage; unit tests on pure functions (merge semantics, fit budgets, gate timing, assist conversion, gate netting, ordering).
 - Never commit secrets. The Supabase anon key is public by design; never add a service-role key or an Anthropic API key to the repo.
 
