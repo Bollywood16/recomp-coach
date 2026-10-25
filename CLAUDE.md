@@ -51,7 +51,11 @@ Personal fitness PWA for one user (Sean). Goal: "superhero" physique (capped sho
 ## Open items
 - **FIX_SPEC.md (coach-apply-overhaul): all 13 items implemented** on branch `coach-apply-overhaul`, not yet merged/deployed. Sean's decisions recorded there: uplift-only suppression (maintain's reduction kept), emphasize 65% hard floor, whole-paste atomic apply, rehab = hipthrust/rdl/legcurl.
 - RDL / pin squat / chest-supported row "missing from the library": resolved by truthful flagging — the brief lists each day as it renders (swaps applied) and marks logged-history lifts `inLibrary=N`.
-- Pending from Sean: the rejected Claude reply (`scripts/fixtures/local/rejected-reply.{json,txt,md}`) for the real-data replay; verification of `docs/proposed-research-notes.md` (exercise order, energy balance) before any corpus ingest.
+- Real-data replay done (`scripts/fixtures/local/rejected-coach-reply.md`, goblet removed; checked in `check-coach-apply-replay.js`, local-only): all 25 prescriptions pass every prescription gate; weekly sets arms 37 → 26, shoulders 15 → 17 (the plan's 16 + 1 unprescribed lateral raise left on Delts & Arms by the reardelt → latraise swap), chest 4 → 6, back 8 → 12, legs 10 → 12, core 3 → 2. The only blocker is the plan's calorieDelta +300 (P3-13: 3 weigh-ins, no trend); at +150 or less it applies.
+- From the replay — decide: Gate 3's fallback can RAISE a load above the coach's prescription (rear delt prescribed 7.5, last logged 5 → falls back to recommend()'s 10). Pre-existing; a `min(prescribed, recommended)` fallback would be the conservative fix.
+- From the replay — decide: `sessionRules.trimPriority` sent as muscle-group names (`"core","chest",…`) is silently ignored (it expects focus levels); per principle 3 it should be noted or rejected.
+- From the replay: goblet stays on the Lower day through the legpress → goblet swap even with no goblet prescription (flagged "fails Gate 2" in the brief) — undo that swap in the app.
+- Pending from Sean: verification of `docs/proposed-research-notes.md` (exercise order, energy balance) before any corpus ingest.
 - Real-data follow-ups (Sean's log): confirm/correct the flagged weeks on the Progress card (2 pull-up input errors, 1 rear-delt e1RM drop); 4th weigh-in to unlock calorie increases > +150; Delts & Arms is ~1 min over at 60 min (banner).
 - Decide: Gate 11 (authored days) still caps at `max(mav, baseline)` via `defaultGroupCap`; Gate 6 now uses `?? mav`.
 - Decide: stall check still counts lifts swapped out of the current program (e.g. csrow's old history).

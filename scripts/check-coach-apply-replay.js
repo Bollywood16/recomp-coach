@@ -187,10 +187,10 @@ function runApply(data, rec) {
     console.log(`local backup ${file}: ${data.sessions.length} session rows, template ${(data.plan || {}).template}`);
     console.log("local current weekly sets:", JSON.stringify(app.weeklySetsByGroup(data)));
 
-    const replyFile = ["rejected-reply.json", "rejected-reply.txt", "rejected-reply.md"]
+    const replyFile = ["rejected-coach-reply.md", "rejected-reply.json", "rejected-reply.txt", "rejected-reply.md"]
       .map((f) => path.join(LOCAL, f)).find((p) => fs.existsSync(p));
     if (!replyFile) {
-      console.log("SKIP (local): no scripts/fixtures/local/rejected-reply.{json,txt,md} — rejected-plan replay not run.");
+      console.log("SKIP (local): no scripts/fixtures/local/rejected-coach-reply.md (or rejected-reply.*) — rejected-plan replay not run.");
     } else {
       const text = fs.readFileSync(replyFile, "utf8");
       const rec = app.extractPlanJson(text);
@@ -201,6 +201,14 @@ function runApply(data, rec) {
       console.log("local replay weekly sets before -> after:",
         JSON.stringify(gated.weeklyGroupSetsBefore), "->", JSON.stringify(gated.weeklyGroupSetsAfter));
       (gated.prescriptionRejections || []).forEach((r) => console.log(`  - [gate ${r.gate}] ${r.exerciseId}: ${r.reason}`));
+      // FIX_SPEC Testing: "Replay the rejected plan (goblet removed): it
+      // must pass Gate 6 with arms ≈ 26 and shoulders ≈ 16 weekly sets."
+      const after = gated.weeklyGroupSetsAfter || {};
+      ok("local replay: every prescription accepted (no Gate 6 or other prescription rejection)",
+        !(gated.prescriptionRejections || []).length && (gated.prescriptions || []).length === rec.prescriptions.length,
+        JSON.stringify(gated.prescriptionRejections));
+      ok("local replay: arms ≈ 26 weekly sets", Math.abs((after.arms || 0) - 26) <= 1, `arms ${after.arms}`);
+      ok("local replay: shoulders ≈ 16 weekly sets", Math.abs((after.shoulders || 0) - 16) <= 1, `shoulders ${after.shoulders}`);
     }
   }
 }
