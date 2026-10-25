@@ -6,7 +6,9 @@ Personal fitness PWA for one user (Sean). Goal: "superhero" physique (capped sho
 - Single `index.html`: React 18 + Recharts + supabase-js loaded from unpkg CDN, in-browser Babel transpilation. No build step in production.
 - `sw.js` service worker for offline use. **Bump the cache name on every deploy** — updates land on the *second* open with network.
 - Hosted on GitHub Pages. Pages serves `index.html` at the repo root only; files in subfolders 404.
-- Supabase backend, event-sourced: one row per session. Sync = pull → merge (union) → push. Never push a near-empty dataset if the pull failed.
+- Supabase backend (auth + data). Sync on `main` is a **single `app_data` blob per user** with merge-on-push: `safeCloudSync` pulls the cloud copy, unions it with local via `mergeData`, then upserts the whole blob. Never push a near-empty dataset if the pull failed.
+- An event-sourced rework (separate `sessions` / `weights` / `settings` tables, additive-only push, dual-write to `app_data`) exists **only** on `origin/event-sourced-sync-wip` and is **NOT deployed**. It is held back pending schema verification: an earlier migration ran against the wrong Supabase project (the forecasting app, not the fitness project), so the tables' existence in the fitness project is unconfirmed. See `docs/bucket-b-plan.md` on that branch.
+- Do not touch sync code, Supabase tables, or that branch unless explicitly asked.
 - AI Coach card (Insights tab): builds an XML coach brief → user gets a reply from Claude → pastes it into "Apply pasted plan" → app parses one ```json block and runs the gates.
 
 ## Governing principles (do not violate)
