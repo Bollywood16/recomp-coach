@@ -141,13 +141,19 @@ function check(label, actual, expected) {
     { ...app.EX_BY_ID.inclinecurl, sets: 2 },
     { ...app.EX_BY_ID.ohte, id: "ohdbext2", sets: 2 }, // stand-in for the spawned triceps alternate
   ];
+  // SUPERSEDED by coach-apply-overhaul P1-6 (FIX_SPEC item 6 + Sean's
+  // 2026-10-25 decision). Fix 1 balanced this day by cutting arms to <=15
+  // so shoulders could keep >=8. Now both are HARD floors: specialize
+  // (arms) keeps 100%, emphasize (shoulders) keeps 65%. When both can't
+  // fit, neither is gutted — the day is reported over budget instead
+  // (banner on the day; any plan producing it is rejected at apply).
   const fit = app.fitDayToTime(preFit, 60, focus);
   const byGroup = {};
   fit.list.forEach((ex) => { const g = app.CAT_TO_GROUP[ex.cat]; byGroup[g] = (byGroup[g] || 0) + ex.sets; });
-  ok("shoulders keeps a real floor, not gutted to its bare per-exercise minimum (>=8, not 4)", byGroup.shoulders >= 8, byGroup.shoulders);
-  ok("shoulders isn't left untouched either — it absorbs cuts before arms does (<=9, not the original 12)", byGroup.shoulders <= 9, byGroup.shoulders);
-  ok("arms keeps most of its specialize-level volume (>=13, not cut down to 11 as before this fix)", byGroup.arms >= 13, byGroup.arms);
-  ok("arms doesn't end up with literally everything either (<=15, not 19 — the overcorrection this fix rejected)", byGroup.arms <= 15, byGroup.arms);
+  ok("shoulders keeps its 65% hard floor (8 of 12), not gutted to its bare minimum (4)", byGroup.shoulders === 8, byGroup.shoulders);
+  ok("shoulders still absorbs cuts first (<12)", byGroup.shoulders < 12, byGroup.shoulders);
+  ok("arms (specialize) keeps every set (19)", byGroup.arms === 19, byGroup.arms);
+  ok("the day is reported over budget rather than breaking either floor", fit.overBudgetMin > 0, fit.overBudgetMin);
   ok("no exercise fell below its own absolute floor", fit.list.every((ex) => ex.sets >= (app.isCompound(ex) ? 2 : 1)));
 }
 

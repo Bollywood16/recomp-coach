@@ -44,7 +44,10 @@ const gate = (d, r) => app.applyCoachGates(r, app.coachMetrics(d), d.injuryProfi
   ok("clean plan: no rejections", preview.rejections.length === 0);
   const arms = preview.groups.find((g) => g.group === "arms");
   const sh = preview.groups.find((g) => g.group === "shoulders");
-  ok("preview arms before -> after = 32 -> 26", arms.before === 32 && arms.after === 26, JSON.stringify(arms));
+  // "before" is the live week as rendered (P1-6: specialize arms are never
+  // trimmed, so this is the fixture's full untrimmed arms volume).
+  const liveArms = app.weeklySetsByGroup(data).arms;
+  ok(`preview arms before -> after = ${liveArms} -> 26`, arms.before === liveArms && arms.after === 26, JSON.stringify(arms));
   ok("preview shoulders after = 16", sh.after === 16, JSON.stringify(sh));
   ok("preview after matches Gate 6's projection",
     preview.groups.every((g) => g.after === ((gated.weeklyGroupSetsAfter || {})[g.group] || 0)));
@@ -68,7 +71,7 @@ const gate = (d, r) => app.applyCoachGates(r, app.coachMetrics(d), d.injuryProfi
   ok("coach-prescribed rows are marked in the preview",
     preview.days.find((d) => d.dayKey === "ufArms").exercises.filter((e) => e.prescribed).length === 6);
   ok("notes carry the over-cap baseline warning",
-    preview.notes.some((n) => /already at 32 weekly sets/.test(n.note)));
+    preview.notes.some((n) => /^Arms is already at \d+ weekly sets, above its 28-set cap/.test(n.note)));
   ok("reconcile bookkeeping notes are not shown as notes", !preview.notes.some((n) => n.gate === "reconcile"));
 }
 

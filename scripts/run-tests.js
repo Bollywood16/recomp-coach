@@ -51,6 +51,7 @@ const SCRIPTS = [
   "check-atomic-apply.js",
   "check-brief-truthfulness.js",
   "check-order-engine.js",
+  "check-time-fit.js",
 ];
 
 const ASSERTION_RE = /(\d+)\s+assertions/;

@@ -1059,6 +1059,10 @@ const isCompound = (ex) => COMPOUND_CATS.includes(ex.cat);
    this way — see its own comment for why that stays a fixed safety
    invariant, order param or not. */
 const LEVEL_TRIM_FLOOR_PCT_BY_RANK = { 3: 0.75, 2: 0.65, 1: 0, 0: 0 };
+// coach-apply-overhaul P1-6: emphasize's 65% is also a HARD floor (Sean's
+// decision) — when a specialize group (100%) and an emphasize group (65%)
+// can't both fit, the day is over budget rather than gutting either one.
+const EMPHASIZE_HARD_FLOOR_PCT = 0.65;
 
 function emphasisRank(ex, focus, order) {
   const g = CAT_TO_GROUP[ex.cat];
@@ -1152,6 +1156,21 @@ function groupTrimFloors(items, focus, order) {
   return floors;
 }
 
+/* coach-apply-overhaul P1-6 (FIX_SPEC item 6 + Sean's change 5). On top
+   of the tiered trim above:
+   - HARD floors: a specialize group is never cut below the sets it came
+     in with (its prescribed sets, or its generator sets when nothing is
+     prescribed); an emphasize group never below 65% of them
+     (EMPHASIZE_HARD_FLOOR_PCT). Keyed on the literal level, like Gate
+     13's maintain protection, so no custom trimPriority order can weaken
+     them. A specialize group's isolation lifts are never dropped, and no
+     lift is dropped if that would take its group under its hard floor.
+   - Compounds never below 2 sets (unchanged: minSets).
+   - Within a tier, cut from the END of the list — the list arrives in
+     orderDay's order, so "last-listed first" is "last in the session".
+   - If the day still doesn't fit once every allowed cut is made, it's
+     reported as overBudgetMin (minutes over) instead of breaking a floor.
+     The apply rejects such a day (Gate 7); the day view says so. */
 function fitDayToTime(list, sessionMin, focus, trimPriorityOrder) {
   const budget = Math.max(20, (sessionMin || 60) - 8) * 60; // minus ~8 min warm-up
   const items = list.map((e) => ({ ...e }));
@@ -1165,23 +1184,44 @@ function fitDayToTime(list, sessionMin, focus, trimPriorityOrder) {
   const floors = groupTrimFloors(items, focus, trimPriorityOrder);
   const groupOf = (ex) => CAT_TO_GROUP[ex.cat];
   const groupTotal = (g) => items.reduce((a, e) => a + (groupOf(e) === g ? e.sets : 0), 0);
+  const levelOf = (ex) => (focus && groupOf(ex) && focus[groupOf(ex)]) || "normal";
+  const isSpecialize = (ex) => levelOf(ex) === "specialize";
+  // P1-6 hard floors (Sean, 2026-10-25): specialize keeps 100% of the sets
+  // it came in with; emphasize keeps EMPHASIZE_HARD_FLOOR_PCT of them
+  // (never below its per-exercise minimums). Keyed on the literal level,
+  // so a custom trimPriority order can't weaken either.
+  const preFit = {};
+  const absMin = {};
+  items.forEach((e) => {
+    const g = groupOf(e);
+    if (!g) return;
+    preFit[g] = (preFit[g] || 0) + e.sets;
+    absMin[g] = (absMin[g] || 0) + minSets(e);
+  });
+  const hardFloors = {};
+  items.forEach((e) => {
+    const g = groupOf(e);
+    if (isSpecialize(e)) hardFloors[g] = preFit[g];
+    else if (levelOf(e) === "emphasize") hardFloors[g] = Math.max(absMin[g], Math.round(preFit[g] * EMPHASIZE_HARD_FLOOR_PCT));
+  });
+  const aboveHard = (e) => { const g = groupOf(e); return !g || hardFloors[g] == null || groupTotal(g) > hardFloors[g]; };
+  // Dropping a whole lift is allowed only if its group stays at/above its hard floor.
+  const droppable = (e) => { const g = groupOf(e); return !g || hardFloors[g] == null || groupTotal(g) - e.sets >= hardFloors[g]; };
   let trimmed = 0;
   const dropped = [];
   let guard = 200;
   while (total() > budget && guard-- > 0) {
-    // Pass 1: respect each group's floor — a group at or below it is off
-    // the table as long as ANY candidate elsewhere still has room.
+    // Pass 1: respect each group's soft floor (groupTrimFloors) — a group
+    // at or below it is off the table as long as ANY candidate elsewhere
+    // still has room.
     let cands = items.filter((e) => {
-      if (e.sets <= minSets(e)) return false;
+      if (e.sets <= minSets(e) || !aboveHard(e)) return false;
       const g = groupOf(e);
       return !g || groupTotal(g) > (floors[g] ?? 0);
     });
-    // Pass 2 fallback: every group is at its floor and the day still
-    // doesn't fit — Gate 13 territory (no group-floor guarantee exists
-    // yet for this case). Falls back to the bare per-exercise floor
-    // rather than looping without progress or leaving the day over
-    // budget; trimPriority below still orders which group absorbs it.
-    if (!cands.length) cands = items.filter((e) => e.sets > minSets(e));
+    // Pass 2: soft floors relaxed, hard floors (specialize total,
+    // per-exercise minimum) never.
+    if (!cands.length) cands = items.filter((e) => e.sets > minSets(e) && aboveHard(e));
     if (cands.length) {
       cands.sort((a, b) => trimPriority(a, focus, trimPriorityOrder) - trimPriority(b, focus, trimPriorityOrder) || items.indexOf(b) - items.indexOf(a));
       const idx = items.indexOf(cands[0]);
@@ -1192,14 +1232,19 @@ function fitDayToTime(list, sessionMin, focus, trimPriorityOrder) {
     // everything at its absolute per-exercise floor: drop a non-compound
     // lift — dropTierRank order (Gate 13: maintain protected LAST, not
     // first — see its own comment), ties broken last-listed first.
-    const dropCands = items.filter((e) => !isCompound(e));
+    const dropCands = items.filter((e) => !isCompound(e) && !isSpecialize(e) && droppable(e));
     if (!dropCands.length) break;
     dropCands.sort((a, b) => dropTierRank(a, focus) - dropTierRank(b, focus) || items.indexOf(b) - items.indexOf(a));
     const idx = items.indexOf(dropCands[0]);
     dropped.push(items[idx].name);
     items.splice(idx, 1);
   }
-  return { list: items, trimmed, dropped, minutes: Math.round(total() / 60) + 8 };
+  const overSec = total() - budget;
+  return {
+    list: items, trimmed, dropped, minutes: Math.round(total() / 60) + 8,
+    // Minutes still over the session after every allowed cut (P1-6); 0 = fits.
+    overBudgetMin: overSec > 0 ? Math.ceil(overSec / 60) : 0,
+  };
 }
 
 /* Task 6, Section 6: single lookup for sessionRules.trimPriority, reused
@@ -3108,48 +3153,19 @@ function isPainEscalating(sessions, painPattern, threshold) {
    so `exOf(p)` stands in for `ex` at every call. sessionRules.trimPriority
    is still not read here, same as fitDayToTime — see that function's
    comment. */
+/* coach-apply-overhaul P1-6: no longer a second copy of the trim loop —
+   adapts a prescription list to fitDayToTime's shape and back, so the two
+   can't drift (one implementation, one set of floors). The apply path no
+   longer calls this (Gate 7 now fits each projected FULL day — see
+   applyCoachGates); kept as the prescription-shaped entry point. */
 function gate7DurationTrim(prescriptions, sessionMin, focus, trimPriorityOrder) {
-  const budget = Math.max(20, (sessionMin || 60) - 8) * 60;
-  const items = prescriptions.map((p) => ({ ...p, sets: p.sets || 3 }));
-  const exOf = (p) => EX_BY_ID[p.exerciseId];
-  const shapeOf = (p) => ({ cat: (exOf(p) || {}).cat, sets: p.sets });
-  // Point 4: same drop-time addition as fitDayToTime — a prescription
-  // carries its own scheme/sets directly, so dropExtraSec/trimOneHardSet
-  // work on it unchanged.
-  const dur = (p) => p.sets * (40 + restFor(exOf(p)).sec) + dropExtraSec(p);
-  const total = () => items.reduce((a, p) => a + dur(p), 0);
-  const minSets = (p) => (isCompound(exOf(p)) ? 2 : 1);
-  const floors = groupTrimFloors(items.map(shapeOf), focus, trimPriorityOrder);
-  const groupOf = (p) => CAT_TO_GROUP[(exOf(p) || {}).cat];
-  const groupTotal = (g) => items.reduce((a, p) => a + (groupOf(p) === g ? p.sets : 0), 0);
-  let trimmedCount = 0;
-  const dropped = [];
-  let guard = 200;
-  while (total() > budget && guard-- > 0) {
-    let cands = items.filter((p) => {
-      if (p.sets <= minSets(p)) return false;
-      const g = groupOf(p);
-      return !g || groupTotal(g) > (floors[g] ?? 0);
-    });
-    if (!cands.length) cands = items.filter((p) => p.sets > minSets(p));
-    if (cands.length) {
-      cands.sort((a, b) => trimPriority(shapeOf(a), focus, trimPriorityOrder) - trimPriority(shapeOf(b), focus, trimPriorityOrder) || items.indexOf(b) - items.indexOf(a));
-      const idx = items.indexOf(cands[0]);
-      items[idx] = trimOneHardSet(items[idx]);
-      trimmedCount++;
-      continue;
-    }
-    // Gate 13: maintain protected LAST for a full drop, not first — see
-    // dropTierRank's comment. Must stay identical to fitDayToTime's own
-    // drop-entirely sort (check-trim-priority.js asserts the two agree).
-    const dropCands = items.filter((p) => !isCompound(exOf(p)));
-    if (!dropCands.length) break;
-    dropCands.sort((a, b) => dropTierRank(shapeOf(a), focus) - dropTierRank(shapeOf(b), focus) || items.indexOf(b) - items.indexOf(a));
-    const idx = items.indexOf(dropCands[0]);
-    dropped.push((exOf(items[idx]) || {}).name || items[idx].exerciseId);
-    items.splice(idx, 1);
-  }
-  return { list: items, trimmedCount, dropped };
+  const shaped = prescriptions.map((p, i) => ({ ...(EX_BY_ID[p.exerciseId] || {}), ...p, id: p.exerciseId, sets: p.sets || 3, __rxIdx: i }));
+  const fit = fitDayToTime(shaped, sessionMin, focus, trimPriorityOrder);
+  const list = fit.list.map((ex) => {
+    const p = prescriptions[ex.__rxIdx];
+    return ex.scheme !== undefined ? { ...p, sets: ex.sets, scheme: ex.scheme } : { ...p, sets: ex.sets };
+  });
+  return { list, trimmedCount: fit.trimmed, dropped: fit.dropped, overBudgetMin: fit.overBudgetMin };
 }
 
 /* Gate 8 — deload overrides all prescriptions, unconditionally: ~60% sets
@@ -3409,35 +3425,20 @@ function applyGatedPrescriptions(prescriptions, ctx) {
     survivors.push(c.value);
   });
 
-  // Gate 7 per dayKey: each day is its own session. Trimming the whole
-  // batch against ONE session budget (the previous behavior) treated a
-  // three-day plan as a single workout and dropped whole prescriptions —
-  // masked until P0-1, because the old Gate 6 rejected most of the batch
-  // first. Day order follows first appearance in the paste; within a day,
-  // gate7DurationTrim is unchanged (the full trim rework is P1-6).
-  const dayOrder = [];
-  const byDay = {};
-  survivors.forEach((p) => {
-    if (!byDay[p.dayKey]) { byDay[p.dayKey] = []; dayOrder.push(p.dayKey); }
-    byDay[p.dayKey].push(p);
-  });
-  const trimmed = { list: [], trimmedCount: 0, dropped: [] };
-  dayOrder.forEach((dk) => {
-    const t = gate7DurationTrim(byDay[dk], ctx.sessionMin, ctx.focus, ctx.trimPriorityOrder);
-    trimmed.list.push(...t.list);
-    if (t.trimmedCount > 0 || t.dropped.length > 0) {
-      trimmed.trimmedCount += t.trimmedCount;
-      trimmed.dropped.push(...t.dropped);
-      notes.push({ gate: 7, dayKey: dk, note: `${dk}: fitted to your ${ctx.sessionMin || 60}-minute session — trimmed ${t.trimmedCount} set${t.trimmedCount !== 1 ? "s" : ""}${t.dropped.length ? `, dropped ${t.dropped.join(", ")}` : ""}.` });
-    }
-  });
+  // Gate 7 (coach-apply-overhaul P1-6) no longer trims prescriptions here.
+  // Stored prescriptions keep their RAW sets; every rendered day — the
+  // prescriptions together with the rest of that day — is fitted by
+  // fitDayToTime, and applyCoachGates rejects any projected day that
+  // can't fit without breaking a hard floor (Sean's change 5). Trimming
+  // the prescriptions alone, out of context of their day, was the
+  // second, divergent trim this replaces.
 
   // Gate 8: deload no longer mutates what's stored here — see the amended
   // comment above where gate8DeloadOverride used to be. Still worth
   // telling the user it's in effect; the actual scaling happens at render
   // time now (recommend()'s ex.prescribedLoad branch for load, DayPage's
   // isDeload block for sets), uniformly across every rendered entry.
-  const final = trimmed.list;
+  const final = survivors;
   if (ctx.deloadActive) notes.push({ gate: 8, note: "Deload week active — sets and loads will be scaled down wherever this plan renders, regardless of what's prescribed here." });
 
   // Per-group before -> after, for the apply preview (P0-2).
@@ -3875,6 +3876,7 @@ function buildPlanPreview(data, gated, today) {
     ...(gated.prescriptionRejections || []).map((r) => ({ ...r, kind: "prescription" })),
     ...(gated.dayRejections || []).map((r) => ({ ...r, kind: "day" })),
     ...(gated.orderRejections || []).map((r) => ({ ...r, kind: "day" })),
+    ...(gated.fitRejections || []).map((r) => ({ ...r, kind: "day" })),
   ];
   const projected = { ...data, focus: gated.focus || data.focus, plan: planUpdateFrom(data, gated, today || todayISO()) };
   const before = weeklySetsByGroup(data);
@@ -3889,7 +3891,7 @@ function buildPlanPreview(data, gated, today) {
     const entries = resolveDayExercises(day, projected);
     const fit = fitDayToTime(entries.map((e) => e.ex), sessionMin, projected.focus, trimPriorityOf(projected));
     return {
-      dayKey: day.id, name: day.name, minutes: fit.minutes, dropped: fit.dropped,
+      dayKey: day.id, name: day.name, minutes: fit.minutes, dropped: fit.dropped, overBudgetMin: fit.overBudgetMin,
       exercises: fit.list.map((ex) => ({ id: ex.id, name: ex.name, sets: ex.sets, prescribed: !!ex.prescribed, isBonus: !!ex.isBonus })),
       maxSetsNotes: entries.maxSetsNotes || [],
     };
@@ -3898,6 +3900,7 @@ function buildPlanPreview(data, gated, today) {
     ...(gated.gates || []).map((g) => ({ gate: "plan", note: g })),
     ...(gated.prescriptionNotes || []).filter((n) => n.gate !== "reconcile"),
     ...(gated.dayNotes || []),
+    ...(gated.fitNotes || []),
   ];
   return { ok: rejections.length === 0, rejections, groups, days, notes, deloadActive: deloadActive(data) };
 }
@@ -4425,6 +4428,16 @@ function DayPage({ day, data, persist, onBack }) {
                 </div>
               </div>
             )}
+            {fit.overBudgetMin > 0 && (
+              <div style={{ ...S.card, background: "#FDECEC", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <Flame size={18} color={C.red} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.45 }}>
+                  <b style={{ color: C.red }}>~{fit.overBudgetMin} min over</b> your {(data.plan && data.plan.sessionMin) || 60}-minute session
+                  even after every allowed cut — your specialized muscle's sets and 2-set compound minimums are never cut to make time.
+                  Lengthen the session or lower a focus level in Focus.
+                </div>
+              </div>
+            )}
             {(fit.trimmed > 0 || fit.dropped.length > 0) && (
               <div style={{ ...S.card, background: "#F7F7FA", display: "flex", gap: 10, alignItems: "flex-start" }}>
                 <Flame size={18} color={C.orange} style={{ marginTop: 1, flexShrink: 0 }} />
@@ -4432,7 +4445,7 @@ function DayPage({ day, data, persist, onBack }) {
                   <b>Fitted to ~{fit.minutes} min</b> for your {(data.plan && data.plan.sessionMin) || 60}-minute session:
                   trimmed {fit.trimmed} set{fit.trimmed !== 1 ? "s" : ""}
                   {fit.dropped.length > 0 ? `, skipped ${fit.dropped.join(", ")}` : ""}.
-                  Compounds and focused muscles were protected first. More time = more volume — change it in Focus.
+                  Lowest-priority sets were cut first, from the end of the session; specialized muscles keep every set. More time = more volume — change it in Focus.
                 </div>
               </div>
             )}
@@ -6073,14 +6086,29 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
   // day it produces still satisfies the order engine's hard rules. Checked
   // against the plan exactly as it would be stored (planUpdateFrom), so a
   // rejection here blocks the whole apply (P0-2) — never a silent re-sort.
+  // P1-6 Gate 7 (Sean's change 5), same projected pass: every day must fit
+  // sessionMin with the hard floors intact (specialize groups' sets,
+  // compounds >= 2). A day that can't is a rejection with the overage in
+  // minutes — the apply fails atomically. Trims that DO fit are notes.
   if (data) {
     const projected = { ...data, focus: gated.focus, plan: planUpdateFrom(data, gated, todayISO()) };
+    const sessionMin = (projected.plan && projected.plan.sessionMin) || 60;
     gated.orderRejections = [];
+    gated.fitRejections = [];
+    gated.fitNotes = [];
     getProgram(projected).forEach((day) => {
       const list = resolveDayExercises(day, projected);
       if (list.orderViolation) {
         gated.orderRejections.push({ gate: "order", dayKey: day.id,
           reason: `${day.name}: the coach's exercise order can't be used — ${list.orderViolation}` });
+      }
+      const fit = fitDayToTime(list.map((e) => e.ex), sessionMin, projected.focus, trimPriorityOf(projected));
+      if (fit.overBudgetMin > 0) {
+        gated.fitRejections.push({ gate: 7, dayKey: day.id,
+          reason: `${day.name} runs ${fit.overBudgetMin} min over your ${sessionMin}-minute session even after every allowed cut (specialized muscle sets and 2-set compound minimums are protected). Fewer sets, fewer exercises, or a longer session.` });
+      } else if (fit.trimmed > 0 || fit.dropped.length > 0) {
+        gated.fitNotes.push({ gate: 7, dayKey: day.id,
+          note: `${day.name}: fitted to ${sessionMin} min — trimmed ${fit.trimmed} set${fit.trimmed !== 1 ? "s" : ""}${fit.dropped.length ? `, skipped ${fit.dropped.join(", ")}` : ""} (lowest-priority, last-listed first).` });
       }
     });
   }
@@ -6216,7 +6244,10 @@ function PlanPreview({ pendingPlan, onConfirm, onDiscard }) {
       {preview.days.map((d) => (
         <div key={d.dayKey} style={{ marginTop: 8, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 10 }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700 }}>
-            <span>{d.name}</span><span style={{ color: C.sub, fontWeight: 400 }}>~{d.minutes} min</span>
+            <span>{d.name}</span>
+            <span style={{ color: d.overBudgetMin ? C.red : C.sub, fontWeight: d.overBudgetMin ? 700 : 400 }}>
+              ~{d.minutes} min{d.overBudgetMin ? ` · ${d.overBudgetMin} min over` : ""}
+            </span>
           </div>
           <div style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.5 }}>
             {d.exercises.map((ex, i) => (

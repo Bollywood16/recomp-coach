@@ -121,8 +121,23 @@ const baseData = (overrides) => ({
   const customEzcurl = customFit.list.find((e) => e.id === "ezcurl");
   const customMachohp = customFit.list.find((e) => e.id === "machohp");
 
-  ok("with a custom trimPriority naming specialize FIRST, the specialize-tier exercise (ezcurl) is cut MORE than under the default order", customEzcurl.sets < defaultEzcurl.sets, JSON.stringify({ default: defaultEzcurl.sets, custom: customEzcurl.sets }));
+  // coach-apply-overhaul P1-6: specialize keeps 100% of its sets as a
+  // HARD floor keyed on the literal level — a custom order naming
+  // specialize first can no longer cut it (same non-customizable design
+  // as Gate 13's maintain protection). The custom order still decides
+  // cuts among the non-floored tiers (see the normal/maintain case below).
+  ok("custom trimPriority naming specialize FIRST still can't cut the specialize lift (hard floor)", customEzcurl.sets === 6 && defaultEzcurl.sets === 6, JSON.stringify({ default: defaultEzcurl.sets, custom: customEzcurl.sets }));
   ok("machohp (compound, protected at floor 2 regardless of tier) is unaffected either way", defaultMachohp.sets >= 2 && customMachohp.sets >= 2);
+  {
+    const f2 = { legs: "maintain", core: "normal" };
+    const items = [{ ...app.EX_BY_ID.legcurl, sets: 8 }, { ...app.EX_BY_ID.cablecrunch, sets: 8 }];
+    const def = app.fitDayToTime(items.map((e) => ({ ...e })), 20, f2);
+    const cus = app.fitDayToTime(items.map((e) => ({ ...e })), 20, f2, ["normal", "maintain", "emphasize", "specialize"]);
+    const s = (fit, id) => fit.list.find((e) => e.id === id).sets;
+    ok("custom order still applies among non-floored tiers: default cuts maintain (legcurl) first, custom naming normal first cuts core first",
+      s(def, "legcurl") < s(def, "cablecrunch") && s(cus, "cablecrunch") < s(cus, "legcurl"),
+      JSON.stringify({ def: def.list.map((e) => `${e.id}:${e.sets}`), cus: cus.list.map((e) => `${e.id}:${e.sets}`) }));
+  }
 
   // Floor coherence: groupTrimFloors under the custom order should give
   // "maintain" (now RANKED LAST in customOrder = position 3, the
