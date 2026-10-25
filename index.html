@@ -1414,13 +1414,13 @@ const RESEARCH_CORPUS = [
     param:"starting_loads", source:"Schwartz et al. 2021; Bruusgaard et al. 2010" },
 
   // ── Volume & MEV/MAV ──
-  { id:"r05", topic:"volume_hypertrophy", phase:["building","all"],
+  { id:"r05", tags:["volume"], topic:"volume_hypertrophy", phase:["building","all"],
     finding:"Dose-response relationship between weekly hard sets and hypertrophy is well-established up to ~20 sets/muscle/week; beyond that, additional sets show diminishing returns for most individuals.",
     param:"weekly_sets", source:"Schoenfeld et al. 2017 meta-analysis; Krieger 2010" },
-  { id:"r06", topic:"mev_practical", phase:["building","maintain"],
+  { id:"r06", tags:["volume"], topic:"mev_practical", phase:["building","maintain"],
     finding:"Minimum effective volume to prevent detraining is approximately 4-6 hard sets/muscle/week; maintenance phases can use 30-50% of peak volume to retain adaptations.",
     param:"weekly_sets", source:"Israetel et al. RP Strength MEV/MRV framework" },
-  { id:"r07", topic:"specialization_reallocation", phase:["building","upperFocus","superhero"],
+  { id:"r07", tags:["volume"], topic:"specialization_reallocation", phase:["building","upperFocus","superhero"],
     finding:"Specialization works through reallocation, not addition: emphasizing 1-2 muscles requires reducing others to maintenance to keep total weekly volume recoverable. Attempting to raise all simultaneously stalls progress.",
     param:"focus_distribution", source:"Israetel et al. periodization research" },
 
@@ -1447,7 +1447,7 @@ const RESEARCH_CORPUS = [
   { id:"r22", topic:"load_selection", phase:["building","all"],
     finding:"Correct load is the one permitting the target rep range on ALL prescribed sets at 1-3 reps in reserve. Loads that only allow the range on set 1 reduce total stimulating reps and raise joint stress for less growth.",
     param:"load_selection", source:"Zourdos et al. 2016 RIR framework; Helms et al. 2016" },
-  { id:"r23", topic:"inter_set_decay", phase:["building","stalled","all"],
+  { id:"r23", tags:["rest"], topic:"inter_set_decay", phase:["building","stalled","all"],
     finding:"Inter-set rep decay beyond ~30-40% at fixed load indicates load exceeds what recovers within the rest interval; the corrective is reducing load or extending rest, not repeating the same weight.",
     param:"load_selection", source:"Senna et al. 2011 rest-interval research; Grgic et al. 2018" },
   { id:"r24", topic:"backoff_sets", phase:["building","all"],
@@ -1477,7 +1477,7 @@ const RESEARCH_CORPUS = [
   { id:"r18", topic:"lateral_delt_isolation", phase:["superhero","upperFocus"],
     finding:"Lateral (side) deltoid is primarily developed through isolation (lateral raises 12-20 reps) rather than compound pressing; it receives minimal stimulus from overhead press.",
     param:"exercise_selection", source:"Boehler 2011 EMG; Coratella et al. 2020" },
-  { id:"r19", topic:"arm_direct_work", phase:["superhero","upperFocus"],
+  { id:"r19", tags:["volume"], topic:"arm_direct_work", phase:["superhero","upperFocus"],
     finding:"Direct bicep/tricep work produces meaningful additional hypertrophy beyond compound movements; 6-15 additional sets/week on top of compound stimulus is the evidence-supported range.",
     param:"weekly_sets", source:"Gentil et al. 2013; Barbalho et al. 2020" },
   { id:"r20", topic:"superhero_block_structure", phase:["superhero"],
@@ -1533,6 +1533,23 @@ function researchForCheckIn(data) {
   const tags = researchPhaseTags(data);
   return researchRankedFull(data).filter((r) => r.phase.some((p) => tags.has(p))).slice(0, 1);
 }
+
+/* coach-apply-overhaul P3-12: a brief that invites prescriptions must carry
+   the evidence prescriptions are built on — every corpus entry tagged
+   order / volume / rest — not just the single most phase-relevant entry.
+   Phase entry first, then the tagged entries in corpus order, deduped. */
+const PRESCRIPTION_RESEARCH_TAGS = ["order", "volume", "rest"];
+function researchForPrescriptions(data) {
+  const out = [...researchForCheckIn(data)];
+  RESEARCH_CORPUS.forEach((r) => {
+    if ((r.tags || []).some((t) => PRESCRIPTION_RESEARCH_TAGS.includes(t)) && !out.includes(r)) out.push(r);
+  });
+  return out;
+}
+/* Which prescription tags have NO corpus entry — said out loud in the
+   brief so the model doesn't assert what the corpus doesn't cover. */
+const uncoveredPrescriptionTags = () =>
+  PRESCRIPTION_RESEARCH_TAGS.filter((t) => !RESEARCH_CORPUS.some((r) => (r.tags || []).includes(t)));
 
 /* Check-in tier's exercise scope: whatever the user's CURRENT program
    actually contains (every day, resolved through active swaps and any
@@ -1734,7 +1751,9 @@ function painHistoryEntries(sessions) {
 function buildCoachBrief(data, goalProfile, tier) {
   const isFullTier = tier === "full";
   const m = coachMetrics(data); // m.lifts is sent in full in BOTH tiers — no truncation (see failure #5 in the build spec: slice(-14) silently dropped foundational lifts declared early in ALL_KNOWN, regardless of training recency)
-  const research = isFullTier ? researchRankedFull(data) : researchForCheckIn(data);
+  // P3-12: both tiers invite prescriptions, so check-in carries every
+  // order/volume/rest entry too (full tier already sends the whole corpus).
+  const research = isFullTier ? researchRankedFull(data) : researchForPrescriptions(data);
   const libraryExercises = isFullTier ? ALL_KNOWN : checkInExerciseLibrary(data);
   const injuryProfile = deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE);
   const specUnlocked = isSpecializationUnlocked(injuryProfile, m);
@@ -1857,8 +1876,8 @@ ${painHistoryEntries(data.sessions).map((s) => {
 <research_context>
 ${isFullTier
     ? `All ${RESEARCH_CORPUS.length} corpus entries, ranked by phase relevance (most relevant first) — not a subset.`
-    : `${research.length} of ${RESEARCH_CORPUS.length} corpus entries, most phase-relevant. Ask for the full corpus if this doesn't cover it.`}
-Where uncovered, say so rather than assert.
+    : `${research.length} of ${RESEARCH_CORPUS.length} corpus entries: the most phase-relevant one, plus every entry tagged ${PRESCRIPTION_RESEARCH_TAGS.join("/")} (the evidence prescriptions rest on). Ask for the full corpus if this doesn't cover it.`}
+${uncoveredPrescriptionTags().length ? `The corpus has NO entry on: ${uncoveredPrescriptionTags().join(", ")} — the app orders exercises itself (see the order rule in <instructions>); don't cite research for ${uncoveredPrescriptionTags().join("/")} decisions.\n` : ""}Where uncovered, say so rather than assert.
 ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 </research_context>
 

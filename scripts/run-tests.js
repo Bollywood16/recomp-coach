@@ -57,6 +57,7 @@ const SCRIPTS = [
   "check-assisted-e1rm.js",
   "check-backoff-tagging.js",
   "check-stall-and-backoff-suggest.js",
+  "check-corpus-retrieval.js",
 ];
 
 const ASSERTION_RE = /(\d+)\s+assertions/;
