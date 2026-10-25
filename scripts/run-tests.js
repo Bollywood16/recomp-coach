@@ -55,6 +55,7 @@ const SCRIPTS = [
   "check-max-sets-apply.js",
   "check-data-quality-flags.js",
   "check-assisted-e1rm.js",
+  "check-backoff-tagging.js",
 ];
 
 const ASSERTION_RE = /(\d+)\s+assertions/;

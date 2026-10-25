@@ -4757,6 +4757,45 @@ function SegmentPicker({ value, onChange }) {
   );
 }
 
+/* ===== Back-off tagging (coach-apply-overhaul P2-10) =====
+   A load drop mid-exercise (30, 30, 25, 25) is either a deliberate
+   back-off/drop or fatigue — and progression reads them very differently
+   (a tagged back-off set is never "under range = too heavy"). Untagged
+   sets lighter than an earlier untagged set are offered for tagging; the
+   user decides, and "just fatigue" leaves them untagged, still readable
+   as fatigue. Never tagged automatically. */
+function untaggedLoadDrops(sets) {
+  const idx = [];
+  let peak = 0;
+  (sets || []).forEach((s, i) => {
+    const w = Number(s.w) || 0;
+    const tagged = s.segment === "backoff" || s.segment === "drop";
+    if (!tagged && peak > 0 && w > 0 && w < peak) idx.push(i);
+    if (!tagged) peak = Math.max(peak, w);
+  });
+  return idx;
+}
+const tagSetsAs = (sets, idxs, segment) => sets.map((s, i) => (idxs.includes(i) ? { ...s, segment } : s));
+
+/* The question itself — shared by the save prompt and the history list. */
+function LoadDropPrompt({ sets, drops, onChoose, compact }) {
+  const heavy = Math.max(...sets.filter((_, i) => !drops.includes(i)).map((s) => Number(s.w) || 0));
+  const lighter = [...new Set(drops.map((i) => Number(sets[i].w)))].join("/");
+  return (
+    <div style={{ background: "#FFF7EC", borderRadius: 10, padding: compact ? 8 : 10, marginTop: 8 }}>
+      <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+        Set{drops.length !== 1 ? "s" : ""} {drops.map((i) => i + 1).join(", ")} {drops.length !== 1 ? "are" : "is"} lighter ({lighter} vs {heavy} lb).
+        Planned back-off / drop, or fatigue?
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+        <button style={S.smallPill()} onClick={() => onChoose("backoff")}>Back-off</button>
+        <button style={S.smallPill()} onClick={() => onChoose("drop")}>Drop set</button>
+        <button style={S.smallPill("#E9E9EB", C.text)} onClick={() => onChoose(null)}>Just fatigue</button>
+      </div>
+    </div>
+  );
+}
+
 /* coach-apply-overhaul P2-9: one set's type picker for a bodyweight-loaded
    lift (BW − assist / Bodyweight / BW + weight). Switching type keeps the
    same effective load where it can (e.g. assist 23 at 158 -> BW + weight
@@ -4786,6 +4825,7 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const [timer, setTimer] = useState(null);
   const [flash, setFlash] = useState(false);
   const [pain, setPain] = useState("");
+  const [dropPrompt, setDropPrompt] = useState(null); // P2-10: { clean, drops } awaiting an answer
   // P2-9: bodyweight-loaded lifts pick a mode per set (see BW_ENTRY_MODES)
   // and need a real weigh-in — no 146 fallback for effective load.
   const bwLoaded = isBodyweightLoaded(ex);
@@ -4816,7 +4856,7 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
         setSets(rows);
       }
     }
-    if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); }
+    if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); setDropPrompt(null); }
   }, [open]); // eslint-disable-line
 
   const hasNonTrivialScheme = ex.scheme && ex.scheme.type !== "straight";
@@ -4836,6 +4876,15 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
       })
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
+    // P2-10: an untagged load drop gets asked about before saving.
+    const drops = untaggedLoadDrops(clean);
+    if (drops.length) { setDropPrompt({ clean, drops }); return; }
+    commitSession(clean, false);
+  };
+
+  // dropTagAnswered: the user already said what a drop in this session
+  // was, so the history list doesn't ask again.
+  const commitSession = (clean, dropTagAnswered) => {
     // Delayed-onset pain (painRetro) is asked for separately, across all lifts,
     // by PendingPainRetroPrompts — not gated on reopening this specific
     // exercise, which on a ~7-day split would close the window long before
@@ -4844,8 +4893,10 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
       id: Date.now(), date: todayISO(), exerciseId: ex.id, sets: clean,
       pain: pain === "" ? null : Math.max(0, Math.min(10, Number(pain) || 0)),
       painRetro: null, painRetroAt: null, painRetroDismissed: false,
+      ...(dropTagAnswered ? { dropTagAnswered: true } : {}),
     };
     persist({ ...data, sessions: [...data.sessions, session] });
+    setDropPrompt(null);
     setFlash(true);
     setTimeout(() => { setFlash(false); onToggle(); }, 900);
   };
@@ -5100,13 +5151,18 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
             </div>
           )}
 
-          <button
-            style={{ ...S.pillBtn(flash ? C.green : (bwLoaded && !bw) ? "#C7C7CC" : C.blue), width: "100%", marginTop: 12 }}
-            disabled={bwLoaded && !bw}
-            onClick={saveSession}
-          >
-            {flash ? "Saved ✓" : (bwLoaded && !bw) ? "Log a weigh-in first" : "Save session"}
-          </button>
+          {dropPrompt ? (
+            <LoadDropPrompt sets={dropPrompt.clean} drops={dropPrompt.drops}
+              onChoose={(seg) => commitSession(seg ? tagSetsAs(dropPrompt.clean, dropPrompt.drops, seg) : dropPrompt.clean, true)} />
+          ) : (
+            <button
+              style={{ ...S.pillBtn(flash ? C.green : (bwLoaded && !bw) ? "#C7C7CC" : C.blue), width: "100%", marginTop: 12 }}
+              disabled={bwLoaded && !bw}
+              onClick={saveSession}
+            >
+              {flash ? "Saved ✓" : (bwLoaded && !bw) ? "Log a weigh-in first" : "Save session"}
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -5801,6 +5857,7 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
   const [bw, setBw] = useState("");
   const [savedFlash, setSavedFlash] = useState("");
   const [pain, setPain] = useState("");
+  const [dropPrompt, setDropPrompt] = useState(null); // P2-10
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   const selectedEx = exerciseById(exId);
   const hasNonTrivialScheme = selectedEx.scheme && selectedEx.scheme.type !== "straight";
@@ -5815,6 +5872,13 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
       .map((s) => (bwLift ? storedSetFromEntry(s, logBw) : { w: Number(s.w) || 0, r: Number(s.r) || 0, segment: s.segment || "top" }))
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
+    // P2-10: ask about an untagged load drop before saving.
+    const drops = untaggedLoadDrops(clean);
+    if (drops.length) { setDropPrompt({ clean, drops }); return; }
+    commitSession(clean, false);
+  };
+
+  const commitSession = (clean, dropTagAnswered) => {
     // Delayed-onset pain (painRetro) is asked for separately, across all lifts —
     // see findAllPendingPainRetros / PendingPainRetroPrompts, rendered on the
     // Workout tab.
@@ -5822,11 +5886,22 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
       id: Date.now(), date: todayISO(), exerciseId: exId, sets: clean,
       pain: pain === "" ? null : Math.max(0, Math.min(10, Number(pain) || 0)),
       painRetro: null, painRetroAt: null, painRetroDismissed: false,
+      ...(dropTagAnswered ? { dropTagAnswered: true } : {}),
     };
     persist({ ...data, sessions: [...data.sessions, session] });
+    setDropPrompt(null);
     setSets(blankRowsFor(exId));
     setPain("");
     flash("Session saved");
+  };
+
+  // P2-10: answer the back-off question for an already-saved session.
+  // Tags only the sets the user confirms; "just fatigue" records the answer
+  // and changes no set.
+  const answerDropTag = (s, seg) => {
+    const drops = untaggedLoadDrops(s.sets);
+    const updated = { ...s, sets: seg ? tagSetsAs(s.sets, drops, seg) : s.sets, dropTagAnswered: true };
+    persist({ ...data, sessions: data.sessions.map((x) => (x.id === s.id ? updated : x)) });
   };
 
   const saveWeight = () => {
@@ -5942,15 +6017,22 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
             style={S.pillBtn("#E9E9EB", C.text)}
             onClick={() => {
               const prior = sets.length ? sets[sets.length - 1] : null;
-              setSets([...sets, { w: prior ? prior.w : "", r: "", segment: prior ? (prior.segment || "top") : "top" }]);
+              setSets([...sets, { w: prior ? prior.w : "", r: "", segment: prior ? (prior.segment || "top") : "top",
+                ...(isBodyweightLoaded(exId) && prior ? { mode: prior.mode || "bw" } : {}) }]);
             }}
           >
             <Plus size={14} style={{ verticalAlign: -2 }} /> Add set
           </button>
-          <button style={{ ...S.pillBtn(), flex: 1 }} onClick={saveSession}>
-            Save session
-          </button>
+          {!dropPrompt && (
+            <button style={{ ...S.pillBtn(), flex: 1 }} onClick={saveSession}>
+              Save session
+            </button>
+          )}
         </div>
+        {dropPrompt && (
+          <LoadDropPrompt sets={dropPrompt.clean} drops={dropPrompt.drops}
+            onChoose={(seg) => commitSession(seg ? tagSetsAs(dropPrompt.clean, dropPrompt.drops, seg) : dropPrompt.clean, true)} />
+        )}
       </div>
 
       <div style={{ padding: "8px 20px 0", fontWeight: 700, fontSize: 15 }}>Recent sessions</div>
@@ -5961,11 +6043,14 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
       )}
       {recent.map((s) => (
         <div key={s.id} style={{ ...S.card, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div>
+          <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 700, fontSize: 14 }}>{EX_BY_ID[s.exerciseId]?.name || s.exerciseId}</div>
             <div style={{ color: C.sub, fontSize: 13, marginTop: 2 }}>
               {shortDate(s.date)} · {formatSchemeSets(s.sets)}
             </div>
+            {!s.dropTagAnswered && untaggedLoadDrops(s.sets).length > 0 && (
+              <LoadDropPrompt compact sets={s.sets} drops={untaggedLoadDrops(s.sets)} onChoose={(seg) => answerDropTag(s, seg)} />
+            )}
           </div>
           <button
             style={{ background: "transparent", border: "none", cursor: "pointer", color: C.red }}
