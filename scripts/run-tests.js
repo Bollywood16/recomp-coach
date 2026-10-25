@@ -47,6 +47,18 @@ const SCRIPTS = [
   "check-pain-pattern-migration.js",
   "check-day-ordering.js",
   "check-coach-brief-contract.js",
+  "check-coach-apply-replay.js",
+  "check-atomic-apply.js",
+  "check-brief-truthfulness.js",
+  "check-order-engine.js",
+  "check-time-fit.js",
+  "check-max-sets-apply.js",
+  "check-data-quality-flags.js",
+  "check-assisted-e1rm.js",
+  "check-backoff-tagging.js",
+  "check-stall-and-backoff-suggest.js",
+  "check-corpus-retrieval.js",
+  "check-nutrition-context.js",
 ];
 
 const ASSERTION_RE = /(\d+)\s+assertions/;

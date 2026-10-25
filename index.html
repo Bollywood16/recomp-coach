@@ -1059,6 +1059,10 @@ const isCompound = (ex) => COMPOUND_CATS.includes(ex.cat);
    this way — see its own comment for why that stays a fixed safety
    invariant, order param or not. */
 const LEVEL_TRIM_FLOOR_PCT_BY_RANK = { 3: 0.75, 2: 0.65, 1: 0, 0: 0 };
+// coach-apply-overhaul P1-6: emphasize's 65% is also a HARD floor (Sean's
+// decision) — when a specialize group (100%) and an emphasize group (65%)
+// can't both fit, the day is over budget rather than gutting either one.
+const EMPHASIZE_HARD_FLOOR_PCT = 0.65;
 
 function emphasisRank(ex, focus, order) {
   const g = CAT_TO_GROUP[ex.cat];
@@ -1152,6 +1156,21 @@ function groupTrimFloors(items, focus, order) {
   return floors;
 }
 
+/* coach-apply-overhaul P1-6 (FIX_SPEC item 6 + Sean's change 5). On top
+   of the tiered trim above:
+   - HARD floors: a specialize group is never cut below the sets it came
+     in with (its prescribed sets, or its generator sets when nothing is
+     prescribed); an emphasize group never below 65% of them
+     (EMPHASIZE_HARD_FLOOR_PCT). Keyed on the literal level, like Gate
+     13's maintain protection, so no custom trimPriority order can weaken
+     them. A specialize group's isolation lifts are never dropped, and no
+     lift is dropped if that would take its group under its hard floor.
+   - Compounds never below 2 sets (unchanged: minSets).
+   - Within a tier, cut from the END of the list — the list arrives in
+     orderDay's order, so "last-listed first" is "last in the session".
+   - If the day still doesn't fit once every allowed cut is made, it's
+     reported as overBudgetMin (minutes over) instead of breaking a floor.
+     The apply rejects such a day (Gate 7); the day view says so. */
 function fitDayToTime(list, sessionMin, focus, trimPriorityOrder) {
   const budget = Math.max(20, (sessionMin || 60) - 8) * 60; // minus ~8 min warm-up
   const items = list.map((e) => ({ ...e }));
@@ -1165,23 +1184,44 @@ function fitDayToTime(list, sessionMin, focus, trimPriorityOrder) {
   const floors = groupTrimFloors(items, focus, trimPriorityOrder);
   const groupOf = (ex) => CAT_TO_GROUP[ex.cat];
   const groupTotal = (g) => items.reduce((a, e) => a + (groupOf(e) === g ? e.sets : 0), 0);
+  const levelOf = (ex) => (focus && groupOf(ex) && focus[groupOf(ex)]) || "normal";
+  const isSpecialize = (ex) => levelOf(ex) === "specialize";
+  // P1-6 hard floors (Sean, 2026-10-25): specialize keeps 100% of the sets
+  // it came in with; emphasize keeps EMPHASIZE_HARD_FLOOR_PCT of them
+  // (never below its per-exercise minimums). Keyed on the literal level,
+  // so a custom trimPriority order can't weaken either.
+  const preFit = {};
+  const absMin = {};
+  items.forEach((e) => {
+    const g = groupOf(e);
+    if (!g) return;
+    preFit[g] = (preFit[g] || 0) + e.sets;
+    absMin[g] = (absMin[g] || 0) + minSets(e);
+  });
+  const hardFloors = {};
+  items.forEach((e) => {
+    const g = groupOf(e);
+    if (isSpecialize(e)) hardFloors[g] = preFit[g];
+    else if (levelOf(e) === "emphasize") hardFloors[g] = Math.max(absMin[g], Math.round(preFit[g] * EMPHASIZE_HARD_FLOOR_PCT));
+  });
+  const aboveHard = (e) => { const g = groupOf(e); return !g || hardFloors[g] == null || groupTotal(g) > hardFloors[g]; };
+  // Dropping a whole lift is allowed only if its group stays at/above its hard floor.
+  const droppable = (e) => { const g = groupOf(e); return !g || hardFloors[g] == null || groupTotal(g) - e.sets >= hardFloors[g]; };
   let trimmed = 0;
   const dropped = [];
   let guard = 200;
   while (total() > budget && guard-- > 0) {
-    // Pass 1: respect each group's floor — a group at or below it is off
-    // the table as long as ANY candidate elsewhere still has room.
+    // Pass 1: respect each group's soft floor (groupTrimFloors) — a group
+    // at or below it is off the table as long as ANY candidate elsewhere
+    // still has room.
     let cands = items.filter((e) => {
-      if (e.sets <= minSets(e)) return false;
+      if (e.sets <= minSets(e) || !aboveHard(e)) return false;
       const g = groupOf(e);
       return !g || groupTotal(g) > (floors[g] ?? 0);
     });
-    // Pass 2 fallback: every group is at its floor and the day still
-    // doesn't fit — Gate 13 territory (no group-floor guarantee exists
-    // yet for this case). Falls back to the bare per-exercise floor
-    // rather than looping without progress or leaving the day over
-    // budget; trimPriority below still orders which group absorbs it.
-    if (!cands.length) cands = items.filter((e) => e.sets > minSets(e));
+    // Pass 2: soft floors relaxed, hard floors (specialize total,
+    // per-exercise minimum) never.
+    if (!cands.length) cands = items.filter((e) => e.sets > minSets(e) && aboveHard(e));
     if (cands.length) {
       cands.sort((a, b) => trimPriority(a, focus, trimPriorityOrder) - trimPriority(b, focus, trimPriorityOrder) || items.indexOf(b) - items.indexOf(a));
       const idx = items.indexOf(cands[0]);
@@ -1192,14 +1232,19 @@ function fitDayToTime(list, sessionMin, focus, trimPriorityOrder) {
     // everything at its absolute per-exercise floor: drop a non-compound
     // lift — dropTierRank order (Gate 13: maintain protected LAST, not
     // first — see its own comment), ties broken last-listed first.
-    const dropCands = items.filter((e) => !isCompound(e));
+    const dropCands = items.filter((e) => !isCompound(e) && !isSpecialize(e) && droppable(e));
     if (!dropCands.length) break;
     dropCands.sort((a, b) => dropTierRank(a, focus) - dropTierRank(b, focus) || items.indexOf(b) - items.indexOf(a));
     const idx = items.indexOf(dropCands[0]);
     dropped.push(items[idx].name);
     items.splice(idx, 1);
   }
-  return { list: items, trimmed, dropped, minutes: Math.round(total() / 60) + 8 };
+  const overSec = total() - budget;
+  return {
+    list: items, trimmed, dropped, minutes: Math.round(total() / 60) + 8,
+    // Minutes still over the session after every allowed cut (P1-6); 0 = fits.
+    overBudgetMin: overSec > 0 ? Math.ceil(overSec / 60) : 0,
+  };
 }
 
 /* Task 6, Section 6: single lookup for sessionRules.trimPriority, reused
@@ -1247,20 +1292,42 @@ function deloadActive(data) {
 }
 
 /* Share of trained compound lifts whose weekly-best e1RM has not improved
-   over the last 3 recorded weeks. */
+   over the last 3 recorded weeks.
+   coach-apply-overhaul P2-11: the denominator only counts lifts that are
+   SUPPOSED to be progressing. Excluded, and reported with a reason:
+     - "too new": fewer than 3 logged weeks (no trend yet),
+     - "maintain": the lift's group is on maintain (holding is the goal),
+     - "rehab": REHAB_EXERCISE_IDS (load is clinician-paced, not chased).
+   A lift on maintain or rehab that "stalls" is doing its job; counting it
+   used to push the stall ratio toward a deload nobody needed. */
 function stallScore(data) {
+  const focus = data.focus || DEFAULT_FOCUS;
   const lifts = ALL_KNOWN.filter(
     (ex) => isCompound(ex) && data.sessions.some((s) => s.exerciseId === ex.id)
   );
   let eligible = 0, stalled = 0;
+  const excluded = [];
+  const stalledIds = [];
   lifts.forEach((ex) => {
-    const series = weeklySeries(data.sessions, ex.id);
-    if (series.length < 3) return;
+    if (REHAB_EXERCISE_IDS.has(ex.id)) { excluded.push({ id: ex.id, reason: "rehab" }); return; }
+    if (focus[CAT_TO_GROUP[ex.cat]] === "maintain") { excluded.push({ id: ex.id, reason: "maintain" }); return; }
+    // P2-8: possible-data-error weeks excluded until confirmed.
+    const { series } = trustedSeries(data.sessions, ex.id, data.dataQualityConfirmations, data.weights);
+    if (series.length < 3) { excluded.push({ id: ex.id, reason: "too new" }); return; }
     eligible++;
     const recent = series.slice(-3);
-    if (recent[2].e1 <= recent[0].e1 * 1.005) stalled++;
+    if (recent[2].e1 <= recent[0].e1 * 1.005) { stalled++; stalledIds.push(ex.id); }
   });
-  return { eligible, stalled, ratio: eligible ? stalled / eligible : 0 };
+  return { eligible, stalled, ratio: eligible ? stalled / eligible : 0, excluded, stalledIds };
+}
+
+/* "7 of 11 lifts stalled (4 excluded: 3 maintain, 1 rehab)" — the
+   denominator, said out loud wherever the stall ratio drives a decision. */
+function stallSummary(st) {
+  const byReason = {};
+  st.excluded.forEach((e) => { byReason[e.reason] = (byReason[e.reason] || 0) + 1; });
+  const ex = Object.entries(byReason).map(([r, n]) => `${n} ${r}`).join(", ");
+  return `${st.stalled} of ${st.eligible} progressing lift${st.eligible !== 1 ? "s" : ""} stalled${st.excluded.length ? ` (${st.excluded.length} not counted: ${ex})` : ""}`;
 }
 
 function templateWeeks(data) {
@@ -1284,7 +1351,7 @@ function phaseInfo(data) {
   if (wks >= 6 && st.eligible >= 3 && st.ratio >= 0.6) {
     suggestions.push({
       type: "deload",
-      text: `${st.stalled} of ${st.eligible} main lifts have stalled for ~3 weeks — the classic accumulated-fatigue signal. A 1-week deload is the evidence-based reset.`,
+      text: `${stallSummary(st)} for ~3 weeks — the classic accumulated-fatigue signal. A 1-week deload is the evidence-based reset.`,
     });
   }
   const tmpl = (data.plan && data.plan.template) || "balanced";
@@ -1306,6 +1373,8 @@ function phaseInfo(data) {
     name: "Building block", icon: "build",
     note: `Week ${wks} of training. Double progression is the driver: hit the top of a rep range on all sets, add weight next session.`,
     suggestions,
+    // P2-11: the stall denominator, always visible (not only when it trips a deload).
+    stallLine: st.eligible || st.excluded.length ? `Stall check: ${stallSummary(st)}.` : null,
   };
 }
 
@@ -1345,13 +1414,13 @@ const RESEARCH_CORPUS = [
     param:"starting_loads", source:"Schwartz et al. 2021; Bruusgaard et al. 2010" },
 
   // ── Volume & MEV/MAV ──
-  { id:"r05", topic:"volume_hypertrophy", phase:["building","all"],
+  { id:"r05", tags:["volume"], topic:"volume_hypertrophy", phase:["building","all"],
     finding:"Dose-response relationship between weekly hard sets and hypertrophy is well-established up to ~20 sets/muscle/week; beyond that, additional sets show diminishing returns for most individuals.",
     param:"weekly_sets", source:"Schoenfeld et al. 2017 meta-analysis; Krieger 2010" },
-  { id:"r06", topic:"mev_practical", phase:["building","maintain"],
+  { id:"r06", tags:["volume"], topic:"mev_practical", phase:["building","maintain"],
     finding:"Minimum effective volume to prevent detraining is approximately 4-6 hard sets/muscle/week; maintenance phases can use 30-50% of peak volume to retain adaptations.",
     param:"weekly_sets", source:"Israetel et al. RP Strength MEV/MRV framework" },
-  { id:"r07", topic:"specialization_reallocation", phase:["building","upperFocus","superhero"],
+  { id:"r07", tags:["volume"], topic:"specialization_reallocation", phase:["building","upperFocus","superhero"],
     finding:"Specialization works through reallocation, not addition: emphasizing 1-2 muscles requires reducing others to maintenance to keep total weekly volume recoverable. Attempting to raise all simultaneously stalls progress.",
     param:"focus_distribution", source:"Israetel et al. periodization research" },
 
@@ -1378,7 +1447,7 @@ const RESEARCH_CORPUS = [
   { id:"r22", topic:"load_selection", phase:["building","all"],
     finding:"Correct load is the one permitting the target rep range on ALL prescribed sets at 1-3 reps in reserve. Loads that only allow the range on set 1 reduce total stimulating reps and raise joint stress for less growth.",
     param:"load_selection", source:"Zourdos et al. 2016 RIR framework; Helms et al. 2016" },
-  { id:"r23", topic:"inter_set_decay", phase:["building","stalled","all"],
+  { id:"r23", tags:["rest"], topic:"inter_set_decay", phase:["building","stalled","all"],
     finding:"Inter-set rep decay beyond ~30-40% at fixed load indicates load exceeds what recovers within the rest interval; the corrective is reducing load or extending rest, not repeating the same weight.",
     param:"load_selection", source:"Senna et al. 2011 rest-interval research; Grgic et al. 2018" },
   { id:"r24", topic:"backoff_sets", phase:["building","all"],
@@ -1408,7 +1477,7 @@ const RESEARCH_CORPUS = [
   { id:"r18", topic:"lateral_delt_isolation", phase:["superhero","upperFocus"],
     finding:"Lateral (side) deltoid is primarily developed through isolation (lateral raises 12-20 reps) rather than compound pressing; it receives minimal stimulus from overhead press.",
     param:"exercise_selection", source:"Boehler 2011 EMG; Coratella et al. 2020" },
-  { id:"r19", topic:"arm_direct_work", phase:["superhero","upperFocus"],
+  { id:"r19", tags:["volume"], topic:"arm_direct_work", phase:["superhero","upperFocus"],
     finding:"Direct bicep/tricep work produces meaningful additional hypertrophy beyond compound movements; 6-15 additional sets/week on top of compound stimulus is the evidence-supported range.",
     param:"weekly_sets", source:"Gentil et al. 2013; Barbalho et al. 2020" },
   { id:"r20", topic:"superhero_block_structure", phase:["superhero"],
@@ -1465,6 +1534,23 @@ function researchForCheckIn(data) {
   return researchRankedFull(data).filter((r) => r.phase.some((p) => tags.has(p))).slice(0, 1);
 }
 
+/* coach-apply-overhaul P3-12: a brief that invites prescriptions must carry
+   the evidence prescriptions are built on — every corpus entry tagged
+   order / volume / rest — not just the single most phase-relevant entry.
+   Phase entry first, then the tagged entries in corpus order, deduped. */
+const PRESCRIPTION_RESEARCH_TAGS = ["order", "volume", "rest"];
+function researchForPrescriptions(data) {
+  const out = [...researchForCheckIn(data)];
+  RESEARCH_CORPUS.forEach((r) => {
+    if ((r.tags || []).some((t) => PRESCRIPTION_RESEARCH_TAGS.includes(t)) && !out.includes(r)) out.push(r);
+  });
+  return out;
+}
+/* Which prescription tags have NO corpus entry — said out loud in the
+   brief so the model doesn't assert what the corpus doesn't cover. */
+const uncoveredPrescriptionTags = () =>
+  PRESCRIPTION_RESEARCH_TAGS.filter((t) => !RESEARCH_CORPUS.some((r) => (r.tags || []).includes(t)));
+
 /* Check-in tier's exercise scope: whatever the user's CURRENT program
    actually contains (every day, resolved through active swaps and any
    focus-driven bonus lifts), plus up to CHECKIN_ALTERNATES_PER_POOL
@@ -1485,11 +1571,13 @@ function researchForCheckIn(data) {
 const CHECKIN_ALTERNATES_PER_POOL = 0;
 function checkInExerciseIds(data) {
   const program = getProgram(data);
-  const focus = data.focus || DEFAULT_FOCUS;
   const currentIds = new Set();
+  // coach-apply-overhaul P0-3: read the live program through
+  // resolveDayExercises — the same function every day renders through —
+  // so stored prescription ADDs, pool spawns and authored days are in
+  // the library too, not just generator slots + bonus lifts.
   program.forEach((day) => {
-    day.exercises.forEach((slot) => currentIds.add(resolveSlot(slot, data.swaps, focus).id));
-    bonusForDay(day, focus, program).forEach((b) => currentIds.add(b.id));
+    resolveDayExercises(day, data).forEach(({ ex }) => currentIds.add(ex.id));
   });
   const scoped = new Set(currentIds);
   const poolsSeen = new Set();
@@ -1546,15 +1634,50 @@ const TAG_SOURCE_CODE = { descriptive: "D", from_app_caution: "C", conservative_
    information the model needs. Fixed column positions (empty fields stay
    blank between pipes, never omitted) so the legend below is enough to
    parse it without ambiguity. */
-/* includeTags=false (checkin tier): the model is working from an already
-   gate-compliant live program, not selecting/authoring new exercises, so a
-   bare id|name list is enough to reference a valid id — the full tag
+/* includeTags=false (checkin tier): a SHORT tag form — romProfile, the
+   gating attributes, contraindications and the computed ok column. (It
+   used to be bare id|name under the assumption that the live program is
+   gate-compliant; it isn't always — a swap can put a Gate-2-rejected
+   exercise like goblet into the live program, coach-apply-overhaul P0-3.)
+   The full tag
    payload is reserved for the "full" tier, where actual exercise-selection
    reasoning happens and tag-based self-constraint-checking earns its
    weight in characters. */
-function formatExerciseLibraryCompact(exercises, includeTags) {
+/* coach-apply-overhaul P0-3: "gate-compliant" is computed, never asserted.
+   An exercise is labeled compliant only if it passes the exercise-level
+   gates the apply step runs on every prescription — Gate 1 (known id)
+   and Gate 2 (injury) — called directly with the same frozen
+   injuryProfile buildGateContext uses. Gates 3-8 judge a prescription's
+   load/volume/time, not the exercise, so they have no per-exercise
+   verdict to report here. */
+function exerciseGateStatus(ex, injuryProfile) {
+  const g1 = gate1UnknownId({ exerciseId: ex.id });
+  if (g1.reject) return { compliant: false, gate: 1, reason: g1.reason };
+  const g2 = gate2Injury({ exerciseId: ex.id }, { injuryProfile });
+  if (g2.reject) return { compliant: false, gate: 2, reason: g2.reason };
+  return { compliant: true };
+}
+// Short column value: "Y", or "N:G2" (which gate rejects it).
+const gateStatusCode = (st) => (st.compliant ? "Y" : `N:G${st.gate}`);
+
+/* Attributes Gate 2 can act on — the forbidden list plus the hip-loading
+   family — shown in the check-in tier's short tag column so the model can
+   see WHY something is or isn't compliant without the full tag payload. */
+function gatingAttributes(ex, injuryProfile) {
+  const mc = (injuryProfile && injuryProfile.movementConstraints) || DEFAULT_INJURY_PROFILE.movementConstraints;
+  const relevant = new Set([...(mc.forbidden || []), ...HIP_LOADING_ATTRS]);
+  return (ex.attributes || []).filter((a) => relevant.has(a));
+}
+
+function formatExerciseLibraryCompact(exercises, includeTags, injuryProfile) {
+  const ip = injuryProfile || DEFAULT_INJURY_PROFILE;
   if (!includeTags) {
-    return exercises.map((ex) => `${ex.id}|${ex.name.replace(/\s*\([^)]*\)\s*$/, "")}`).join("\n");
+    return exercises.map((ex) => {
+      const rom = ex.romProfile ? Object.entries(ex.romProfile).map(([k, v]) => `${k}=${v}`).join(",") : "";
+      const attrs = gatingAttributes(ex, ip).join(",");
+      const ci = (ex.contraindications || []).join(",");
+      return `${ex.id}|${ex.name.replace(/\s*\([^)]*\)\s*$/, "")}|${rom}|${attrs}|${ci}|${gateStatusCode(exerciseGateStatus(ex, ip))}`;
+    }).join("\n");
   }
   return exerciseLibraryEntries(exercises).map((e) => {
     const attrs = (e.attributes || []).join(",");
@@ -1566,22 +1689,46 @@ function formatExerciseLibraryCompact(exercises, includeTags) {
     // already say structurally in this same row — dropped here only (not
     // from ex.name itself, which stays intact everywhere else in the app).
     const name = e.name.replace(/\s*\([^)]*\)\s*$/, "");
-    return `${e.id}|${name}|${e.group}|${code}|${attrs}|${rom}|${ci}`;
+    return `${e.id}|${name}|${e.group}|${code}|${attrs}|${rom}|${ci}|${gateStatusCode(exerciseGateStatus(EX_BY_ID[e.id] || e, ip))}`;
   }).join("\n");
 }
-const EXERCISE_LIBRARY_LEGEND = `Cols (pipe-delim, blank=none): id|name|group|tagSource|attributes|romProfile|contraindications
+const GATE_OK_LEGEND = "ok: Y = passes the same exercise-level gates (1 unknown id, 2 injury) the app runs on apply; N:G2 = Gate 2 WILL reject it — do not prescribe it. Load/volume/time gates (3-8) apply per prescription and aren't shown here.";
+const EXERCISE_LIBRARY_LEGEND = `Cols (pipe-delim, blank=none): id|name|group|tagSource|attributes|romProfile|contraindications|ok
 tagSource: D=descriptive fact, C=from_app_caution, G=conservative_default(UNVERIFIED GUESS - trust less), R=clinician_reviewed
-attributes/contraindications: comma-separated. romProfile: key=value, comma-separated.`;
-const EXERCISE_LIBRARY_LEGEND_CHECKIN = "Cols: id|name (pipe-delim).";
+attributes/contraindications: comma-separated. romProfile: key=value, comma-separated.
+${GATE_OK_LEGEND}`;
+const EXERCISE_LIBRARY_LEGEND_CHECKIN = `Cols (pipe-delim, blank=none): id|name|romProfile|gatingAttributes|contraindications|ok
+${GATE_OK_LEGEND}`;
 
 /* Same compact-encoding technique applied to training_metrics.lifts — the
    content is never truncated (every logged lift is still sent, in both
    tiers; that's the bug this task fixed), only the ENCODING is leaner:
    repeated JSON keys ("id":,"name":,"weeksLogged":...) per lift cost real
    characters for no benefit once a legend states the column order once. */
-const TRAINING_METRICS_LIFTS_LEGEND = "lifts cols (pipe-delim): id|name|group|weeksLogged|latestE1|trendPct|stalled";
-function formatLiftsCompact(lifts) {
-  return (lifts || []).map((l) => `${l.id}|${l.name}|${l.group}|${l.weeksLogged}|${l.latestE1 ?? ""}|${l.trendPct ?? ""}|${l.stalled}`).join("\n");
+const TRAINING_METRICS_LIFTS_LEGEND = "lifts cols (pipe-delim): id|name|group|weeksLogged|latestE1|trendPct|stalled|inLibrary (Y, or N = logged history only — not in this brief's <exercise_library>, so it can't be prescribed from this brief)";
+function formatLiftsCompact(lifts, libraryIds) {
+  return (lifts || []).map((l) => {
+    const inLib = !libraryIds || libraryIds.has(l.id) ? "Y" : "N";
+    return `${l.id}|${l.name}|${l.group}|${l.weeksLogged}|${l.latestE1 ?? ""}|${l.trendPct ?? ""}|${l.stalled}|${inLib}`;
+  }).join("\n");
+}
+
+/* coach-apply-overhaul P0-3: <program_days> lists each day as it actually
+   renders (swaps, bonus lifts, prescriptions, pool spawns — via
+   resolveDayExercises), not the raw template slot ids. Any exercise not
+   in this brief's library, or that Gate 2 would reject, is flagged inline
+   rather than silently listed as if it were fine. */
+function programDaysLines(data, libraryIds, injuryProfile) {
+  return getProgram(data).map((d) => {
+    const items = resolveDayExercises(d, data).map(({ ex }) => {
+      const flags = [];
+      if (!libraryIds.has(ex.id)) flags.push("not in live library");
+      const st = exerciseGateStatus(ex, injuryProfile);
+      if (!st.compliant) flags.push(`fails Gate ${st.gate}`);
+      return `${ex.name} [${ex.id}${flags.length ? `; ${flags.join("; ")}` : ""}]`;
+    });
+    return `- ${d.id} "${d.name}": ${items.join(", ")}`;
+  });
 }
 
 /* Every session carrying a resolved pain signal (an answered value, during
@@ -1604,7 +1751,9 @@ function painHistoryEntries(sessions) {
 function buildCoachBrief(data, goalProfile, tier) {
   const isFullTier = tier === "full";
   const m = coachMetrics(data); // m.lifts is sent in full in BOTH tiers — no truncation (see failure #5 in the build spec: slice(-14) silently dropped foundational lifts declared early in ALL_KNOWN, regardless of training recency)
-  const research = isFullTier ? researchRankedFull(data) : researchForCheckIn(data);
+  // P3-12: both tiers invite prescriptions, so check-in carries every
+  // order/volume/rest entry too (full tier already sends the whole corpus).
+  const research = isFullTier ? researchRankedFull(data) : researchForPrescriptions(data);
   const libraryExercises = isFullTier ? ALL_KNOWN : checkInExerciseLibrary(data);
   const injuryProfile = deepFreeze(data.injuryProfile || DEFAULT_INJURY_PROFILE);
   const specUnlocked = isSpecializationUnlocked(injuryProfile, m);
@@ -1624,17 +1773,18 @@ function buildCoachBrief(data, goalProfile, tier) {
   // either tier — the model had no way to know what a real one looked
   // like short of guessing from context. Listed once, used by both
   // <days_contract> (full tier) and plain prescriptions (both tiers).
-  const program = getProgram(data);
+  const libraryIds = new Set(libraryExercises.map((ex) => ex.id));
   const programDaysSection = `
 
 <program_days>
-Current template: ${(TEMPLATES.find((t) => t.key === (data.plan && data.plan.template)) || {}).name || "Balanced 2+2"}. Valid dayKey values (required on every prescription and every days[] entry):
-${program.map((d) => `- ${d.id} "${d.name}": ${d.exercises.map((s) => (EX_BY_ID[s.id] || {}).name || s.id).join(", ")}`).join("\n")}
+Current template: ${(TEMPLATES.find((t) => t.key === (data.plan && data.plan.template)) || {}).name || "Balanced 2+2"}. Valid dayKey values (required on every prescription and every days[] entry), each with the day as it currently renders (swaps applied) as name [id; flags]:
+${programDaysLines(data, libraryIds, injuryProfile).join("\n")}
 </program_days>`;
 
+  const nonCompliant = libraryExercises.filter((ex) => !exerciseGateStatus(ex, injuryProfile).compliant).length;
   const librarySectionIntro = isFullTier
-    ? `Full library: ${libraryExercises.length} exercises, tagged to match Gate 2. Constraint-check selections against the tags before proposing; if nothing fits, decline that slot and explain why — never substitute or invent an unverifiable exercise.`
-    : `Live-program exercises (${libraryExercises.length} of ${ALL_KNOWN.length}), id|name only — already gate-compliant. exerciseId must come from this list (enforced); ask for the full tagged library to propose something new.`;
+    ? `Full library: ${libraryExercises.length} exercises, tagged to match Gate 2 (${nonCompliant} marked ok=N). Constraint-check selections against the tags before proposing; if nothing fits, decline that slot and explain why — never substitute or invent an unverifiable exercise.`
+    : `Live-program exercises (${libraryExercises.length} of ${ALL_KNOWN.length}), with gating tags. ${nonCompliant ? `${nonCompliant} of them are ok=N — currently in your program but Gate 2 rejects them as a prescription.` : "All pass the exercise-level gates."} exerciseId must come from this list (enforced); ask for the full tagged library to propose something new.`;
 
   // Task 7, Section 7: full day authorship (`days`) is a full-tier-only
   // feature — applyAuthoredDays rejects it wholesale at checkin scope
@@ -1676,14 +1826,18 @@ ${JSON.stringify(injuryProfile)}
 <exercise_library>
 ${librarySectionIntro}
 ${isFullTier ? EXERCISE_LIBRARY_LEGEND : EXERCISE_LIBRARY_LEGEND_CHECKIN}
-${formatExerciseLibraryCompact(libraryExercises, isFullTier)}
+${formatExerciseLibraryCompact(libraryExercises, isFullTier, injuryProfile)}
 </exercise_library>
 ${programDaysSection}${daysContractSection}
 
 <training_metrics>
 ${JSON.stringify({ ...m, lifts: undefined }, (k, v) => (v === null ? undefined : v))}
+${m.bwSlopePerWeek == null
+    ? `Bodyweight trend: NONE — only ${m.weighIns} weigh-in${m.weighIns !== 1 ? "s" : ""} logged (a trend needs at least ${BW_TREND_MIN_WEIGHINS}). Don't reason from a bodyweight trend you don't have; a calorieDelta above +${CALORIE_INCREASE_NEEDS_TREND} will be rejected until there is one — recommend daily weigh-ins instead.`
+    : `bwSlopePerWeek = ${m.bwSlopePerWeek} lb/week from ${m.weighIns} weigh-ins.`}
+weeklySets = hard sets per muscle group per week as the app currently generates the week (after focus, bonus lifts, stored prescriptions and time-fit) — plan against this baseline.
 ${TRAINING_METRICS_LIFTS_LEGEND}
-${formatLiftsCompact(m.lifts)}
+${formatLiftsCompact(m.lifts, libraryIds)}
 </training_metrics>
 
 <set_quality>
@@ -1725,8 +1879,8 @@ ${painHistoryEntries(data.sessions).map((s) => {
 <research_context>
 ${isFullTier
     ? `All ${RESEARCH_CORPUS.length} corpus entries, ranked by phase relevance (most relevant first) — not a subset.`
-    : `${research.length} of ${RESEARCH_CORPUS.length} corpus entries, most phase-relevant. Ask for the full corpus if this doesn't cover it.`}
-Where uncovered, say so rather than assert.
+    : `${research.length} of ${RESEARCH_CORPUS.length} corpus entries: the most phase-relevant one, plus every entry tagged ${PRESCRIPTION_RESEARCH_TAGS.join("/")} (the evidence prescriptions rest on). Ask for the full corpus if this doesn't cover it.`}
+${uncoveredPrescriptionTags().length ? `The corpus has NO entry on: ${uncoveredPrescriptionTags().join(", ")} — the app orders exercises itself (see the order rule in <instructions>); don't cite research for ${uncoveredPrescriptionTags().join("/")} decisions.\n` : ""}Where uncovered, say so rather than assert.
 ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 </research_context>
 
@@ -1735,6 +1889,8 @@ ${research.map((r) => `- [${r.source}] ${r.finding}`).join("\n")}
 2. Check <set_quality>/<pain_history>: flag rep collapse, under-range reps, or forced pain reduction; fix is lower load or a back-off, never a repeat.
 3. Push back on goal-vs-constraint/research conflicts; cite sources.
 4. Recommend: template ("balanced"|"upperFocus"|"superhero"); focus/group (shoulders/arms/chest/back/legs/core: maintain|normal|emphasize|specialize, max 2 emphasize+); sessionMin (45|60|75); calorieDelta (-300..300); next to watch. Optional \`prescriptions\`(exerciseId,dayKey,order,sets,repMin,repMax,load,restSec) + \`sessionRules\`(maxSetsPerMovement,orderByFocus,trimPriority,weeklyGroupSetCaps).${isFullTier ? ` Optional \`days\` (see <days_contract>) + \`splitPattern\` (a short label for the split you authored, e.g. "UULU" — descriptive only, not enforced).` : ""}
+   Exercise order: the app orders each day itself (a specialize group holding >=40% of a day's sets goes first; then compounds before isolation; then focus rank; regressing lifts earlier). A prescription/day \`order\` is honored only if it keeps those two hard rules (specialize-first block; specialize isolation before normal/maintain isolation) — otherwise that day, and so the whole plan, is rejected. Omit \`order\` unless you need it.
+   Per-movement cap: no exercise gets more than sessionRules.maxSetsPerMovement sets (default ${DEFAULT_MAX_SETS_PER_MOVEMENT}). Sets above it are split onto the best-ranked same-pool alternate that passes the injury gate (or capped, with a note, if none does) — prescribe across two movements yourself if you care which one.
 5. Prose under 300 words; the \`\`\`json block (and every exercise's \`rationale\` in it) is separate and not counted against that.
 6. One \`\`\`json block: plan object, optionally + prescriptions/sessionRules${isFullTier ? "/days/splitPattern" : ""}. Gated on apply; injury constraints aren't overridable.${isFullTier ? " Every days[].exercises[] entry needs its own rationale — an entry without one is rejected (Gate 9). Decline a slot rather than guess: see <days_contract>." : ""}
 </instructions>`;
@@ -1768,10 +1924,6 @@ function weekStart(dateISO) {
 const shortDate = (iso) =>
   new Date(iso + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 const todayISO = () => new Date().toISOString().slice(0, 10);
-const currentBodyweight = (data) => {
-  const w = [...(data.weights || [])].sort((a, b) => (a.date < b.date ? -1 : 1)).slice(-1)[0];
-  return (w && w.lbs) || (data.nutrition && Number(data.nutrition ? 146 : 146)) || 146;
-};
 
 /* Point 1: drop segments excluded from e1RM — a drop's high-rep, reduced-
    load continuation can produce an inflated Epley estimate that isn't
@@ -1793,12 +1945,157 @@ function bestSet(sets) {
   return best;
 }
 
-function weeklySeries(sessions, exId) {
+/* ===== Bodyweight-loaded lifts (coach-apply-overhaul P2-9) =====
+   For these, the load is your bodyweight: minus machine assistance, plus
+   added weight, or just bodyweight. Every set is stored with w = the
+   EFFECTIVE load and its own entry mode, so e1RM compares like with like
+   (more assistance -> lower effective load -> lower e1RM). */
+const BODYWEIGHT_LOADED_IDS = new Set(["pullup", "chinup", "dips", "invrow"]);
+const isBodyweightLoaded = (exOrId) => {
+  const ex = typeof exOrId === "string" ? EX_BY_ID[exOrId] : exOrId;
+  return !!ex && (!!ex.assistable || BODYWEIGHT_LOADED_IDS.has(ex.id));
+};
+
+/* Bodyweight on a date from the weigh-in log: the nearest weigh-in by
+   date (Sean's change 6). null when there are none — never a silent 146. */
+function bodyweightOn(weights, date) {
+  const ws = (weights || []).filter((w) => w && w.lbs > 0);
+  if (!ws.length) return null;
+  const t = new Date(date).getTime();
+  return ws.reduce((best, w) => (Math.abs(new Date(w.date) - t) < Math.abs(new Date(best.date) - t) ? w : best)).lbs;
+}
+
+/* Effective load of one logged set. { load, resolvable }.
+   - Not bodyweight-loaded: w as logged.
+   - Set has a mode (P2-9 entry): w is already effective.
+   - Legacy assisted (assist field): bw - assist, bw from the row, else the
+     nearest weigh-in.
+   - Legacy bodyweight / +weight (no assist): the old entry stored only
+     the ADDED weight (0 for pure bodyweight), which e1rm() used to read as
+     "reps" — effective = bw + added.
+   No bodyweight available -> unresolvable: excluded from e1RM and flagged,
+   never guessed. */
+function effectiveLoad(set, exId, date, weights) {
+  const w = Number(set.w) || 0;
+  if (!isBodyweightLoaded(exId) || set.mode) return { load: w, resolvable: true };
+  if (set.assist != null) {
+    const bw = set.bw || bodyweightOn(weights, date);
+    return bw ? { load: Math.max(1, Math.round(bw - Number(set.assist))), resolvable: true } : { load: null, resolvable: false };
+  }
+  const bw = bodyweightOn(weights, date);
+  return bw ? { load: Math.round(bw + w), resolvable: true } : { load: null, resolvable: false };
+}
+
+/* Per-set entry for bodyweight-loaded lifts (Sean, 2026-10-25): each set
+   picks its own mode — "assist" (bodyweight minus machine assistance),
+   "bw" (bodyweight only), or "added" (bodyweight plus a belt/vest/DB).
+   What's typed depends on the mode; what's STORED is always the effective
+   load in w, plus the mode and its raw input, plus the bodyweight used. */
+const BW_ENTRY_MODES = [
+  { key: "assist", label: "BW − assist", placeholder: "assist lbs" },
+  { key: "bw", label: "Bodyweight", placeholder: "BW" },
+  { key: "added", label: "BW + weight", placeholder: "+ lbs" },
+];
+
+/* Mode a new entry starts in: the last logged set's mode for this lift
+   (legacy rows: assist field -> "assist", added weight -> "added", none ->
+   "bw"); first time: "assist" for an assistable lift, else "bw". */
+function defaultBodyweightMode(ex, sessions) {
+  const last = (sessions || []).filter((s) => s.exerciseId === ex.id).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id - b.id)).pop();
+  const set = last && last.sets[last.sets.length - 1];
+  if (set) {
+    if (set.mode) return set.mode;
+    if (set.assist != null) return "assist";
+    return Number(set.w) > 0 ? "added" : "bw";
+  }
+  return ex.assistable ? "assist" : "bw";
+}
+
+/* Convert a prefilled row whose w is an EFFECTIVE load (what recommend()
+   produces) into what the user types in `mode`. This is the fix for the
+   assisted input errors: the old form put the effective load (e.g. 106)
+   straight into the "assist lbs" field, which saved as assist 106 ->
+   effective 40. */
+function entryRowFromEffective(row, mode, bw) {
+  const eff = Number(row.w);
+  let w = "";
+  if (eff > 0 && bw) {
+    if (mode === "assist" && bw - eff > 0) w = String(Math.round(bw - eff));
+    if (mode === "added" && eff - bw > 0) w = String(Math.round(eff - bw));
+  }
+  return { ...row, mode, w };
+}
+
+/* What a set saves as. bw must be known (the form blocks saving without a
+   weigh-in rather than guessing). */
+function storedSetFromEntry(row, bw) {
+  const r = Number(row.r) || 0;
+  const segment = row.segment || "top";
+  const n = Number(row.w) || 0;
+  if (row.mode === "assist") return { w: Math.max(1, Math.round(bw - n)), r, mode: "assist", assist: n, bw, segment };
+  if (row.mode === "added") return { w: Math.round(bw + n), r, mode: "added", added: n, bw, segment };
+  return { w: Math.round(bw), r, mode: "bw", bw, segment };
+}
+
+/* Assisted-entry input errors (Sean, 2026-10-25): the effective load typed
+   into the assist field reads as huge assistance. Flag a session when any
+   set's assist is > 50% of bodyweight, or its assist is > 2x the previous
+   UNFLAGGED session's. Excluded from trends until confirmed (or corrected
+   in the Log tab). Never auto-fixed. */
+const ASSIST_MAX_BW_SHARE = 0.5;
+const ASSIST_MAX_JUMP = 2;
+function assistedInputErrors(sessions, exId, weights, confirmations) {
+  const rows = (sessions || []).filter((s) => s.exerciseId === exId && s.sets.some((x) => x.assist != null))
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id - b.id));
+  const flags = [];
+  let prevAssist = null;
+  rows.forEach((s) => {
+    const assists = s.sets.filter((x) => x.assist != null).map((x) => Number(x.assist));
+    const maxAssist = Math.max(...assists);
+    const bw = (s.sets.find((x) => x.bw) || {}).bw || bodyweightOn(weights, s.date);
+    const reasons = [];
+    if (bw && maxAssist > bw * ASSIST_MAX_BW_SHARE) reasons.push(`assist ${maxAssist} lb is more than half your ${Math.round(bw)} lb bodyweight`);
+    if (prevAssist != null && prevAssist > 0 && maxAssist > prevAssist * ASSIST_MAX_JUMP) reasons.push(`assist jumped from ${prevAssist} to ${maxAssist} lb (more than 2x) since the previous session`);
+    if (reasons.length) {
+      const id = `input|${s.id}`;
+      const confirmed = !!(confirmations && confirmations[id]);
+      flags.push({ kind: "input", id, exId, sessionId: s.id, date: s.date, assist: maxAssist, bw, reasons, confirmed });
+      if (confirmed) prevAssist = maxAssist;
+    } else {
+      prevAssist = maxAssist;
+    }
+  });
+  return flags;
+}
+
+/* Sessions to base LOAD decisions on (recommend(), the "last time" panel,
+   Gate 3 / load-sanity): every session except unconfirmed assisted input
+   errors — otherwise the next prefill just repeats the mistyped load.
+   Pain/escalation logic must keep using ALL sessions; this is load-only. */
+function loadSessions(data) {
+  const sessions = data.sessions || [];
+  const ids = [...new Set(sessions.map((s) => s.exerciseId))].filter(isBodyweightLoaded);
+  const bad = new Set(ids.flatMap((id) => assistedInputErrors(sessions, id, data.weights, data.dataQualityConfirmations))
+    .filter((f) => !f.confirmed).map((f) => f.sessionId));
+  return bad.size ? sessions.filter((s) => !bad.has(s.id)) : sessions;
+}
+
+/* opts (all optional): { weights, confirmations }. Without weights, legacy
+   bodyweight rows that carry no bw of their own are unresolvable and
+   skipped (never e1rm(0, reps)). Sessions flagged as assisted input errors
+   are skipped unless confirmed. */
+function weeklySeries(sessions, exId, opts) {
+  const weights = opts && opts.weights;
+  const confirmations = opts && opts.confirmations;
   const byWeek = {};
-  const mine = sessions.filter((s) => s.exerciseId === exId);
+  const badSessions = new Set(isBodyweightLoaded(exId)
+    ? assistedInputErrors(sessions, exId, weights, confirmations).filter((f) => !f.confirmed).map((f) => f.sessionId)
+    : []);
+  const mine = sessions.filter((s) => s.exerciseId === exId && !badSessions.has(s.id));
+  const loadOf = (s, x) => effectiveLoad(x, exId, s.date, weights).load;
   mine.forEach((s) => {
     const wk = weekStart(s.date);
-    const b = bestSet(s.sets);
+    const b = bestSet(s.sets.map((x) => ({ ...x, w: loadOf(s, x) })).filter((x) => x.w != null));
     if (!b) return;
     if (!byWeek[wk] || b.v > byWeek[wk].e1) {
       byWeek[wk] = { ...(byWeek[wk] || {}), week: wk, e1: b.v, topW: Number(b.w) || 0, topR: Number(b.r) || 0 };
@@ -1806,18 +2103,89 @@ function weeklySeries(sessions, exId) {
   });
   mine.forEach((s) => {
     const wk = weekStart(s.date);
-    const vol = s.sets.reduce((a, x) => a + (Number(x.w) || 0) * (Number(x.r) || 0), 0);
+    const vol = s.sets.reduce((a, x) => a + (loadOf(s, x) || 0) * (Number(x.r) || 0), 0);
     if (byWeek[wk]) byWeek[wk].vol = (byWeek[wk].vol || 0) + vol;
   });
   return Object.values(byWeek).sort((a, b) => (a.week < b.week ? -1 : 1));
+}
+
+/* Legacy bodyweight rows whose effective load can't be computed (no bw on
+   the row, no weigh-in logged at all) — flagged so they're visible rather
+   than silently mis-scored (Sean's change 6). */
+function unresolvableBodyweightRows(data) {
+  return (data.sessions || []).filter((s) => isBodyweightLoaded(s.exerciseId) &&
+    s.sets.some((x) => !effectiveLoad(x, s.exerciseId, s.date, data.weights).resolvable))
+    .map((s) => ({ kind: "no-bw", id: `nobw|${s.id}`, exId: s.exerciseId, sessionId: s.id, date: s.date }));
+}
+
+/* ===== Data-quality flags (coach-apply-overhaul P2-8) =====
+   Warnings, never silent fixes. A weekly e1RM that drops more than 30%
+   below the best of the previous < 3 weeks is far more likely a logging
+   error (wrong field, wrong unit, per-hand vs total) than real strength
+   loss, so it's flagged "possible data error" and EXCLUDED from trend-
+   based decisions (stall count, regressing) until the user confirms it's
+   real (data.dataQualityConfirmations[id]) or corrects the log. The raw
+   series is never altered — charts still show every point. A flagged,
+   unconfirmed point never serves as the reference for a later one. */
+const DATA_ERROR_DROP_PCT = 0.30;
+const DATA_ERROR_WINDOW_DAYS = 21;
+const dataPointId = (exId, week) => `${exId}|${week}`;
+const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+
+function e1rmDataFlags(series, exId, confirmations) {
+  const flags = [];
+  const excluded = new Set();
+  series.forEach((p, i) => {
+    const refs = series.slice(0, i).filter((q) => !excluded.has(q.week) && daysBetween(q.week, p.week) < DATA_ERROR_WINDOW_DAYS);
+    if (!refs.length) return;
+    const ref = refs.reduce((m, q) => (q.e1 > m.e1 ? q : m));
+    if (p.e1 < ref.e1 * (1 - DATA_ERROR_DROP_PCT)) {
+      const id = dataPointId(exId, p.week);
+      const confirmed = !!(confirmations && confirmations[id]);
+      flags.push({ id, exId, week: p.week, e1: p.e1, refWeek: ref.week, refE1: ref.e1,
+        dropPct: Math.round((1 - p.e1 / ref.e1) * 100), confirmed });
+      if (!confirmed) excluded.add(p.week);
+    }
+  });
+  return flags;
+}
+
+/* weeklySeries minus unconfirmed possible-data-error points — the input
+   every trend DECISION reads (stallScore, isRegressing, coachMetrics). */
+function trustedSeries(sessions, exId, confirmations, weights) {
+  // P2-9: effective loads (weights) + assisted input-error sessions skipped.
+  const series = weeklySeries(sessions || [], exId, { weights, confirmations });
+  const flags = e1rmDataFlags(series, exId, confirmations);
+  const drop = new Set(flags.filter((f) => !f.confirmed).map((f) => f.week));
+  return { series: series.filter((p) => !drop.has(p.week)), flags };
+}
+
+/* Every unconfirmed flag across trained lifts, newest first (Progress card, brief). */
+function dataQualityFlags(data) {
+  const sessions = data.sessions || [];
+  const ids = [...new Set(sessions.map((s) => s.exerciseId))];
+  const conf = data.dataQualityConfirmations;
+  const e1Flags = ids.flatMap((id) => trustedSeries(sessions, id, conf, data.weights).flags).map((f) => ({ kind: "e1rm", ...f }));
+  // P2-9: assisted input errors and unresolvable bodyweight rows.
+  const inputFlags = ids.filter(isBodyweightLoaded).flatMap((id) => assistedInputErrors(sessions, id, data.weights, conf));
+  return [...e1Flags, ...inputFlags, ...unresolvableBodyweightRows(data)]
+    .filter((f) => !f.confirmed)
+    .sort((a, b) => ((a.week || a.date) < (b.week || b.date) ? 1 : -1));
 }
 
 /* Resolve a program slot through any active swap. The resolved exercise keeps
    the slot's set/rep scheme so the day's structure is preserved. */
 function resolveSlot(slot, swaps, focus) {
   const swapId = swaps && swaps[slot.id];
+  // coach-apply-overhaul P1-7: spread the canonical EX_BY_ID entry first.
+  // EXERCISE_ATTRS is merged onto EX_BY_ID — i.e. only onto the FIRST
+  // template's slot object for each id — so a slot from any other
+  // template (e.g. upperFocus's curl, calf) used to resolve with no
+  // pool/attributes/tagSource, and capAndSplitMovement dropped its
+  // overflow as "untagged pool" instead of splitting it. The slot's own
+  // sets/repMin/repMax still win (spread after).
   const base = (!swapId || !EX_BY_ID[swapId])
-    ? { ...slot, slotId: slot.id, swapped: false }
+    ? { ...(EX_BY_ID[slot.id] || {}), ...slot, slotId: slot.id, swapped: false }
     : { ...EX_BY_ID[swapId], repMin: slot.repMin, repMax: slot.repMax,
         slotId: slot.id, swapped: true, originalName: slot.name };
   // Emphasis scales the number of working sets for this exercise's muscle.
@@ -2090,8 +2458,140 @@ function resolveAuthoredExercise(ae, data) {
     ...resolved,
     restSec: ae.restSec, prescribedLoad: ae.load, scheme: ae.scheme,
     order: ae.order ?? 0, rationale: ae.rationale, substitutedFor: ae.substitutedFor,
+    coachOrder: typeof ae.order === "number" ? ae.order : undefined, // P1-5 (g)
     authored: true,
   };
+}
+
+/* ===== Exercise order engine (coach-apply-overhaul P1-5) =====
+   Deterministic; replaces the old index-stable emphasis sort. Per day:
+     (a) Specialization override — if one "specialize" group holds >= 40%
+         of the day's sets, that group's exercises go first (compound,
+         then isolation), then the rest of the day by (b)-(e).
+     (b) Compounds before isolation.
+     (c) Within each class, focus rank: specialize > emphasize > normal >
+         maintain.
+     (d) Tie-break 1: a regressing lift (trendPct <= -5% over >= 3 weeks)
+         goes earlier.
+     (e) Tie-break 2: the stable exercise tag (exerciseId). Never array
+         index — no tie depends on insertion order.
+     (f) Rehab lifts (REHAB_EXERCISE_IDS, a code constant no coach output
+         can change) keep their TEMPLATE position on generator days; focus
+         rules never move them, everything else fills around them.
+     (g) A coach `order` (prescription or authored day) permutes the rows
+         that carry one among the positions those rows occupy. Honored
+         only if the result still satisfies (a) and "specialize isolation
+         before non-focus isolation"; otherwise `violation` is set, the
+         render falls back to the engine order, and the apply rejects the
+         day with that reason (never a silent re-sort). */
+const REHAB_EXERCISE_IDS = new Set(["hipthrust", "rdl", "legcurl"]);
+const ORDER_SPECIALIZE_SHARE = 0.4;
+const REGRESSING_TREND_PCT = -5;
+const REGRESSING_MIN_WEEKS = 3;
+
+function isRegressing(sessions, exId, confirmations, weights) {
+  const t = trendPct(trustedSeries(sessions, exId, confirmations, weights).series); // P2-8/9
+  return !!t && t.weeks >= REGRESSING_MIN_WEEKS && t.pct <= REGRESSING_TREND_PCT;
+}
+
+const focusLevelOf = (ex, focus) => (focus && focus[CAT_TO_GROUP[ex.cat]]) || "normal";
+
+/* The (a) group, or null: the specialize group with the largest share of
+   the day's sets, if that share is >= 40%. Ties broken by group name. */
+function specializationOverrideGroup(exs, focus) {
+  const total = exs.reduce((a, ex) => a + (ex.sets || 0), 0);
+  if (!total) return null;
+  const byGroup = {};
+  exs.forEach((ex) => {
+    const g = CAT_TO_GROUP[ex.cat];
+    if (g && focusLevelOf(ex, focus) === "specialize") byGroup[g] = (byGroup[g] || 0) + (ex.sets || 0);
+  });
+  const best = Object.keys(byGroup)
+    .filter((g) => byGroup[g] / total >= ORDER_SPECIALIZE_SHARE)
+    .sort((a, b) => byGroup[b] - byGroup[a] || a.localeCompare(b));
+  return best[0] || null;
+}
+
+function orderViolationOf(exs, focus, overrideGroup) {
+  const isRehab = (ex) => REHAB_EXERCISE_IDS.has(ex.id);
+  if (overrideGroup) {
+    const lastG = exs.reduce((m, ex, i) => (CAT_TO_GROUP[ex.cat] === overrideGroup ? i : m), -1);
+    const firstOther = exs.findIndex((ex) => CAT_TO_GROUP[ex.cat] !== overrideGroup && !isRehab(ex));
+    if (firstOther !== -1 && firstOther < lastG) {
+      return `${MUSCLE_GROUPS[overrideGroup].name} is specialized and holds >= 40% of this day's sets, so all of it must come first — "${exs[firstOther].name}" is ordered before "${exs[lastG].name}".`;
+    }
+  }
+  const iso = (ex) => !isCompound(ex) && !isRehab(ex);
+  const lastSpecIso = exs.reduce((m, ex, i) => (iso(ex) && focusLevelOf(ex, focus) === "specialize" ? i : m), -1);
+  const firstNonFocusIso = exs.findIndex((ex) => iso(ex) && ["normal", "maintain"].includes(focusLevelOf(ex, focus)));
+  if (lastSpecIso !== -1 && firstNonFocusIso !== -1 && firstNonFocusIso < lastSpecIso) {
+    return `Specialized isolation must come before non-focus isolation — "${exs[firstNonFocusIso].name}" is ordered before "${exs[lastSpecIso].name}".`;
+  }
+  return null;
+}
+
+function orderDay(entries, ctx) {
+  const focus = (ctx && ctx.focus) || DEFAULT_FOCUS;
+  const sessions = (ctx && ctx.sessions) || [];
+  const exs = entries.map((e) => e.ex);
+  const overrideGroup = specializationOverrideGroup(exs, focus);
+  const regressing = new Map(exs.map((ex) => [ex.id, isRegressing(sessions, ex.id, ctx && ctx.dataQualityConfirmations, ctx && ctx.weights)]));
+  const key = (ex) => [
+    overrideGroup && CAT_TO_GROUP[ex.cat] === overrideGroup ? 0 : 1, // (a)
+    isCompound(ex) ? 0 : 1,                                          // (b)
+    -(LEVEL_RANK[focusLevelOf(ex, focus)] ?? 1),                     // (c)
+    regressing.get(ex.id) ? 0 : 1,                                   // (d)
+  ];
+  const cmp = (a, b) => {
+    const ka = key(a.ex), kb = key(b.ex);
+    for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i];
+    return a.ex.id.localeCompare(b.ex.id);                           // (e)
+  };
+
+  // (f) Rehab pins: generator days only. A pinned row keeps its template
+  // slot index (clamped; collisions slide to the next free position).
+  const templateIds = ctx && ctx.templateDay ? ctx.templateDay.exercises.map((s) => s.id) : null;
+  const pinIdx = (e) => {
+    if (!templateIds || !REHAB_EXERCISE_IDS.has(e.ex.id) || e.ex.swapped) return -1;
+    return templateIds.indexOf(e.slot && e.slot.id);
+  };
+  const pinned = entries.filter((e) => pinIdx(e) !== -1).sort((a, b) => pinIdx(a) - pinIdx(b));
+  const free = entries.filter((e) => pinIdx(e) === -1).sort(cmp);
+  const slots = new Array(entries.length).fill(null);
+  pinned.forEach((e) => {
+    let i = Math.min(pinIdx(e), entries.length - 1);
+    while (slots[i]) i = (i + 1) % entries.length;
+    slots[i] = e;
+  });
+  let fi = 0;
+  for (let i = 0; i < slots.length; i++) if (!slots[i]) slots[i] = free[fi++];
+  const engine = slots;
+
+  // (g) Coach order: permute coach-ordered, non-pinned rows within the
+  // positions they occupy in the engine order.
+  const isCoach = (e) => typeof e.ex.coachOrder === "number" && pinIdx(e) === -1;
+  if (!engine.some(isCoach)) return { list: engine, violation: null };
+  const positions = engine.map((e, i) => (isCoach(e) ? i : -1)).filter((i) => i !== -1);
+  const coachRows = positions.map((i) => engine[i])
+    .sort((a, b) => a.ex.coachOrder - b.ex.coachOrder || a.ex.id.localeCompare(b.ex.id));
+  const coached = [...engine];
+  positions.forEach((pos, k) => { coached[pos] = coachRows[k]; });
+  const violation = orderViolationOf(coached.map((e) => e.ex), focus, overrideGroup);
+  return violation ? { list: engine, violation } : { list: coached, violation: null };
+}
+
+/* Muscle groups that have at least one stored coach prescription on this
+   dayKey. Keyed off the prescription's own exerciseId (stable tag), never
+   its position in the array. */
+function prescribedGroupsForDay(data, dayKey) {
+  const groups = new Set();
+  ((data.plan && data.plan.prescriptions) || []).forEach((p) => {
+    if (p.dayKey !== dayKey) return;
+    const ex = EX_BY_ID[p.exerciseId];
+    const g = ex && CAT_TO_GROUP[ex.cat];
+    if (g) groups.add(g);
+  });
+  return groups;
 }
 
 function resolveDayExercises(day, data) {
@@ -2114,12 +2614,33 @@ function resolveDayExercises(day, data) {
     const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
     const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
     const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
-    splitList.maxSetsNotes = notes;
-    return splitList;
+    // Authored days: the coach's `order` is the coach order (g); no rehab
+    // template pins (no templateDay) — the coach authored the whole day.
+    return finishDayOrder(splitList, notes, { focus: data.focus || DEFAULT_FOCUS, sessions: data.sessions, dataQualityConfirmations: data.dataQualityConfirmations, weights: data.weights });
   }
+  // coach-apply-overhaul P0-1: for a (day, group) the coach has prescribed,
+  // the prescriptions define that group's volume on that day — no bonus
+  // injection and no focus-multiplier uplift on the group's remaining
+  // generator rows. Gate 6 projects the week through this same function,
+  // so render and gate can't disagree about what a prescription nets to.
+  const prescribedGroups = prescribedGroupsForDay(data, day.id);
   const generatorList = [
-    ...day.exercises.map((s) => ({ slot: s, ex: resolveSlot(s, data.swaps, focus) })),
-    ...bonusForDay(day, focus, program).map((b) => ({ slot: b, ex: b })),
+    ...day.exercises.map((s) => {
+      const ex = resolveSlot(s, data.swaps, focus);
+      if (prescribedGroups.has(CAT_TO_GROUP[ex.cat])) {
+        // Uplift only (FIX_SPEC item 1: "adjustSets uplift"): a maintain
+        // group's 0.55x reduction stays — stripping it would RAISE a
+        // maintain group's volume just because one of its rows got a
+        // prescription (seen on real data: Lower legs 10 -> 14).
+        ex.sets = Math.min(ex.sets, ex.baseSets);
+        ex.focusBoost = false;
+        ex.focusSuppressed = true;
+      }
+      return { slot: s, ex };
+    }),
+    ...bonusForDay(day, focus, program)
+      .filter((b) => !prescribedGroups.has(b.bonusGroup))
+      .map((b) => ({ slot: b, ex: b })),
   ];
   // Task 6, Section 6 (pre-decision 6): default render order sorts by
   // emphasis rank DESCENDING — highest-focus group first — reusing
@@ -2135,9 +2656,10 @@ function resolveDayExercises(day, data) {
   // order by their own explicit `order` field instead; a prescription's
   // ADD is still appended after this sort, unchanged from before —
   // prescriptions carry no `order` field of their own to sort by today.
-  const genOrder = generatorList.map((_, i) => i);
-  genOrder.sort((i, j) => trimPriority(generatorList[j].ex, focus) - trimPriority(generatorList[i].ex, focus) || i - j);
-  const list = genOrder.map((i) => generatorList[i]);
+  // (coach-apply-overhaul P1-5: the emphasis-desc genOrder sort that lived
+  // here is replaced by orderDay, run once at the very end over the
+  // complete list — generator, bonus, prescription ADDs and pool spawns.)
+  const list = [...generatorList];
   const prescriptions = ((data.plan && data.plan.prescriptions) || []).filter((p) => p.dayKey === day.id);
   const OVERRIDE_FIELDS = ["sets", "repMin", "repMax", "restSec", "scheme"];
   prescriptions.forEach((p) => {
@@ -2147,6 +2669,7 @@ function resolveDayExercises(day, data) {
     const overrides = {};
     OVERRIDE_FIELDS.forEach((k) => { if (p[k] !== undefined) overrides[k] = p[k]; });
     if (p.load !== undefined) overrides.prescribedLoad = p.load;
+    if (typeof p.order === "number") overrides.coachOrder = p.order; // P1-5 (g)
     if (matchIdx.length === 1) {
       const i = matchIdx[0];
       const mergedEx = { ...list[i].ex, ...overrides, prescribed: true, prescriptionApplied: "replace" };
@@ -2160,7 +2683,7 @@ function resolveDayExercises(day, data) {
         repMin: overrides.repMin ?? base.repMin ?? DEFAULT_REP_RANGE.min,
         repMax: overrides.repMax ?? base.repMax ?? DEFAULT_REP_RANGE.max,
         restSec: overrides.restSec, prescribedLoad: overrides.prescribedLoad,
-        scheme: overrides.scheme,
+        scheme: overrides.scheme, coachOrder: overrides.coachOrder,
         slotId: base.id, swapped: false, focusBoost: false,
         prescribed: true, prescriptionApplied: "add",
       };
@@ -2184,8 +2707,17 @@ function resolveDayExercises(day, data) {
   const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
-  splitList.maxSetsNotes = notes;
-  return splitList;
+  return finishDayOrder(splitList, notes, { focus, sessions: data.sessions, templateDay: day, dataQualityConfirmations: data.dataQualityConfirmations, weights: data.weights });
+}
+
+/* Shared tail of both resolveDayExercises branches: order the complete
+   list once (P1-5), then re-attach the side-channel properties callers
+   read off the returned array. */
+function finishDayOrder(entries, maxSetsNotes, ctx) {
+  const { list, violation } = orderDay(entries, ctx);
+  list.maxSetsNotes = maxSetsNotes;
+  if (violation) list.orderViolation = violation;
+  return list;
 }
 
 /* Working weight = heaviest weight used in the most recent session of a lift */
@@ -2284,6 +2816,7 @@ function recommend(ex, sessions, deload) {
       weight: target,
       tag: "Reduce",
       backoff: target,
+      backoffTop: w, // the "keep w for set 1, then back off" alternative (P2-11 back-off plan)
       note: `Your reps fell from ${first} to ${worst} at ${w} lb — that's a ${Math.round(decay * 100)}% drop, and ${belowMin} set${belowMin > 1 ? "s" : ""} landed under ${ex.repMin}. The right load is one you can hold across all ${ex.sets || live.length} sets. Drop to ${target} lb. (Alternative: keep ${w} lb for set 1, then back off to ${target} for the rest.)`,
     };
   }
@@ -2292,6 +2825,7 @@ function recommend(ex, sessions, deload) {
       weight: w,
       tag: "Back-off sets",
       backoff: stepDown(w, inc),
+      backoffTop: w,
       note: `Only the last set slipped under ${ex.repMin}. Keep ${w} lb while reps are still in range, and drop to ${stepDown(w, inc)} lb on any set that would fall short — back-off loading keeps every set inside the range instead of grinding.`,
     };
   }
@@ -2695,7 +3229,8 @@ function exerciseForRecommend(ex, prescription) {
 function gate3LoadSanity(prescription, ctx) {
   const ex = EX_BY_ID[prescription.exerciseId];
   if (!ex) return { reject: false };
-  const lastW = lastWorkingWeight(ctx.sessions, prescription.exerciseId);
+  const loadHist = ctx.loadSessions || ctx.sessions; // P2-9
+  const lastW = lastWorkingWeight(loadHist, prescription.exerciseId);
   const escalating = ctx.escalatingPatterns && ctx.escalatingPatterns.has(ex.painPattern);
 
   if (prescription.load == null) {
@@ -2704,7 +3239,7 @@ function gate3LoadSanity(prescription, ctx) {
     // would otherwise flow through recommend() later, not just one
     // explicitly prescribed here, or the ratchet has a hole in it.
     if (escalating && lastW != null) {
-      const rec = recommend(exerciseForRecommend(ex, prescription), ctx.sessions, ctx.deloadActive);
+      const rec = recommend(exerciseForRecommend(ex, prescription), loadHist, ctx.deloadActive);
       if (rec.weight > lastW) {
         return {
           reject: false,
@@ -2719,7 +3254,7 @@ function gate3LoadSanity(prescription, ctx) {
   if (lastW == null) return { reject: false }; // no logged history to sanity-check against yet
   const ceiling = escalating ? lastW : lastW * 1.15;
   if (prescription.load > ceiling) {
-    const rec = recommend(exerciseForRecommend(ex, prescription), ctx.sessions, ctx.deloadActive);
+    const rec = recommend(exerciseForRecommend(ex, prescription), loadHist, ctx.deloadActive);
     const fallback = escalating ? Math.min(rec.weight, lastW) : rec.weight;
     return {
       reject: false,
@@ -2880,48 +3415,19 @@ function isPainEscalating(sessions, painPattern, threshold) {
    so `exOf(p)` stands in for `ex` at every call. sessionRules.trimPriority
    is still not read here, same as fitDayToTime — see that function's
    comment. */
+/* coach-apply-overhaul P1-6: no longer a second copy of the trim loop —
+   adapts a prescription list to fitDayToTime's shape and back, so the two
+   can't drift (one implementation, one set of floors). The apply path no
+   longer calls this (Gate 7 now fits each projected FULL day — see
+   applyCoachGates); kept as the prescription-shaped entry point. */
 function gate7DurationTrim(prescriptions, sessionMin, focus, trimPriorityOrder) {
-  const budget = Math.max(20, (sessionMin || 60) - 8) * 60;
-  const items = prescriptions.map((p) => ({ ...p, sets: p.sets || 3 }));
-  const exOf = (p) => EX_BY_ID[p.exerciseId];
-  const shapeOf = (p) => ({ cat: (exOf(p) || {}).cat, sets: p.sets });
-  // Point 4: same drop-time addition as fitDayToTime — a prescription
-  // carries its own scheme/sets directly, so dropExtraSec/trimOneHardSet
-  // work on it unchanged.
-  const dur = (p) => p.sets * (40 + restFor(exOf(p)).sec) + dropExtraSec(p);
-  const total = () => items.reduce((a, p) => a + dur(p), 0);
-  const minSets = (p) => (isCompound(exOf(p)) ? 2 : 1);
-  const floors = groupTrimFloors(items.map(shapeOf), focus, trimPriorityOrder);
-  const groupOf = (p) => CAT_TO_GROUP[(exOf(p) || {}).cat];
-  const groupTotal = (g) => items.reduce((a, p) => a + (groupOf(p) === g ? p.sets : 0), 0);
-  let trimmedCount = 0;
-  const dropped = [];
-  let guard = 200;
-  while (total() > budget && guard-- > 0) {
-    let cands = items.filter((p) => {
-      if (p.sets <= minSets(p)) return false;
-      const g = groupOf(p);
-      return !g || groupTotal(g) > (floors[g] ?? 0);
-    });
-    if (!cands.length) cands = items.filter((p) => p.sets > minSets(p));
-    if (cands.length) {
-      cands.sort((a, b) => trimPriority(shapeOf(a), focus, trimPriorityOrder) - trimPriority(shapeOf(b), focus, trimPriorityOrder) || items.indexOf(b) - items.indexOf(a));
-      const idx = items.indexOf(cands[0]);
-      items[idx] = trimOneHardSet(items[idx]);
-      trimmedCount++;
-      continue;
-    }
-    // Gate 13: maintain protected LAST for a full drop, not first — see
-    // dropTierRank's comment. Must stay identical to fitDayToTime's own
-    // drop-entirely sort (check-trim-priority.js asserts the two agree).
-    const dropCands = items.filter((p) => !isCompound(exOf(p)));
-    if (!dropCands.length) break;
-    dropCands.sort((a, b) => dropTierRank(shapeOf(a), focus) - dropTierRank(shapeOf(b), focus) || items.indexOf(b) - items.indexOf(a));
-    const idx = items.indexOf(dropCands[0]);
-    dropped.push((exOf(items[idx]) || {}).name || items[idx].exerciseId);
-    items.splice(idx, 1);
-  }
-  return { list: items, trimmedCount, dropped };
+  const shaped = prescriptions.map((p, i) => ({ ...(EX_BY_ID[p.exerciseId] || {}), ...p, id: p.exerciseId, sets: p.sets || 3, __rxIdx: i }));
+  const fit = fitDayToTime(shaped, sessionMin, focus, trimPriorityOrder);
+  const list = fit.list.map((ex) => {
+    const p = prescriptions[ex.__rxIdx];
+    return ex.scheme !== undefined ? { ...p, sets: ex.sets, scheme: ex.scheme } : { ...p, sets: ex.sets };
+  });
+  return { list, trimmedCount: fit.trimmed, dropped: fit.dropped, overBudgetMin: fit.overBudgetMin };
 }
 
 /* Gate 8 — deload overrides all prescriptions, unconditionally: ~60% sets
@@ -2945,7 +3451,9 @@ function gate7DurationTrim(prescriptions, sessionMin, focus, trimPriorityOrder) 
    hold RAW values; see scripts/check-prescription-reconciliation.js's
    assertion that a stored prescription's load is never deload-scaled. */
 
-/* Gate 6's default cap, absent a real sessionRules.weeklyGroupSetCaps
+/* NOTE (coach-apply-overhaul P0-1): Gate 6 no longer uses this — see
+   gate6Cap. Only Gate 11 (authored days) still does.
+   Gate 6's default cap, absent a real sessionRules.weeklyGroupSetCaps
    override (Task 2 hasn't wired that up yet). MUSCLE_GROUPS[group].mav can
    be lower than what the CURRENT default program already prescribes for
    that group with zero focus adjustment (legs: mav=20 vs. the balanced
@@ -3049,6 +3557,14 @@ function runPrescriptionGates(prescription, ctx) {
   let value = prescription;
   const notes = [];
 
+  // P2-8 (Sean's change 2): judged on the coach's RAW load, before Gate 3's
+  // +15% clamp can change it — a 4x mismatch usually means the LOG is
+  // wrong (e.g. reverse pec-deck logged 10 vs prescribed 40), which the
+  // clamp alone would quietly paper over. Warning only, never a reject.
+  const rawLoad = prescription.load;
+  const lastLogged = rawLoad != null ? lastWorkingWeight(ctx.loadSessions || ctx.sessions || [], prescription.exerciseId) : null;
+  const loadMismatch = rawLoad != null && lastLogged > 0 && (rawLoad > lastLogged * 2 || rawLoad < lastLogged * 0.5);
+
   const g3 = gate3LoadSanity(value, ctx);
   if (g3.value) value = g3.value;
   if (g3.note) notes.push({ gate: 3, note: g3.note });
@@ -3065,6 +3581,15 @@ function runPrescriptionGates(prescription, ctx) {
   value = clamped.value;
   if (clamped.note) notes.push({ gate: "scheme", note: clamped.note });
 
+  if (loadMismatch) {
+    const name = (EX_BY_ID[prescription.exerciseId] || {}).name || prescription.exerciseId;
+    const ratio = Math.round((rawLoad / lastLogged) * 10) / 10;
+    const applied = value.load != null ? `${value.load} lb` : "engine-recommended";
+    value = { ...value, loadUnverified: true };
+    notes.push({ gate: "load-sanity", rawLoad, appliedLoad: value.load ?? null, lastLogged,
+      note: `"${name}": coach prescribed ${rawLoad} lb — ${ratio}× your last logged ${lastLogged} lb. Unverified: check that log entry. Applied: ${applied}${value.load !== rawLoad ? ` (raw ${rawLoad} lb)` : ""}.` });
+  }
+
   return { accepted: true, value, notes };
 }
 
@@ -3073,11 +3598,22 @@ function runPrescriptionGates(prescription, ctx) {
    survivor set), then 8 (deload, overrides everything that's left). This
    is the one place that knows about a LIST of prescriptions — the gates
    themselves stay single-item and caller-agnostic. */
+/* Gate 6's cap (coach-apply-overhaul P0-1, Sean's change 3): an explicit
+   sessionRules.weeklyGroupSetCaps value, else the group's MAV. Never
+   raised to fit the current baseline — the old max(mav, baseline) let an
+   already-inflated week set its own ceiling. A baseline that already sits
+   over this cap is reported as a warning, not a reason to raise it.
+   (Gate 11 still uses defaultGroupCap; deliberately untouched here.) */
+function gate6Cap(group, ctx) {
+  const explicit = ctx.weeklyGroupSetCaps && ctx.weeklyGroupSetCaps[group];
+  if (explicit != null) return explicit;
+  return (MUSCLE_GROUPS[group] && MUSCLE_GROUPS[group].mav) || null;
+}
+
 function applyGatedPrescriptions(prescriptions, ctx) {
   const rejections = [];
   const notes = [];
-  const runningGroupSets = { ...(ctx.weeklyGroupSets || {}) };
-  const survivors = [];
+  const candidates = [];
   // Within-batch collision guard (Task 2 commit 3): two prescriptions in
   // the SAME paste naming the same (dayKey, exerciseId) pair would each
   // independently subtract the same baseline slot's sets below — first
@@ -3102,54 +3638,91 @@ function applyGatedPrescriptions(prescriptions, ctx) {
       });
       return;
     }
-    const group = CAT_TO_GROUP[ex.cat];
-    const addedSets = result.value.sets || 3;
-    // Reconciliation-aware tally (Task 2 commit 3, closes the legs-cap
-    // headroom gap from DEFERRED-TESTS.md's handoff note): ctx.
-    // currentSlotFor is built from the exact same resolveDayExercises
-    // this prescription will be spliced into at render time — one
-    // predicate answers both "does this replace something" (render) and
-    // "how much do I subtract before adding" (here), so they can't drift
-    // apart. gate1dAmbiguousMatch already rejected the >1-match case
-    // upstream, so this is always 0 (ADD) or 1 (REPLACE) here.
-    const matches = ctx.currentSlotFor ? ctx.currentSlotFor(result.value.dayKey, result.value.exerciseId) : [];
-    const isReplace = matches.length === 1;
-    let current = (group && runningGroupSets[group]) || 0;
-    if (isReplace && group) {
-      current = Math.max(0, current - (matches[0].ex.sets || 0));
-    }
-    const cap = group ? ((ctx.weeklyGroupSetCaps && ctx.weeklyGroupSetCaps[group]) ?? defaultGroupCap(group, ctx.weeklyGroupSets)) : null;
-    if (group && cap != null && current + addedSets > cap) {
-      rejections.push({
-        exerciseId: result.value.exerciseId, gate: 6,
-        reason: `"${ex.name}" would push ${(MUSCLE_GROUPS[group] || {}).name || group} to ${current + addedSets} weekly sets, above the ${cap}-set cap.`,
-      });
-      return;
-    }
-    if (group) runningGroupSets[group] = current + addedSets;
     claimed.set(key, ex.name);
-    (result.notes || []).forEach((n) => notes.push({ exerciseId: result.value.exerciseId, ...n }));
-    notes.push({
-      exerciseId: result.value.exerciseId, gate: "reconcile",
-      note: isReplace ? `Replaces the existing "${ex.name}" on this day.` : `Adds "${ex.name}" as a new exercise on this day.`,
-    });
-    survivors.push(result.value);
+    candidates.push({ value: result.value, ex, group: CAT_TO_GROUP[ex.cat], notes: result.notes || [] });
   });
 
-  const trimmed = gate7DurationTrim(survivors, ctx.sessionMin, ctx.focus, ctx.trimPriorityOrder);
-  if (trimmed.trimmedCount > 0 || trimmed.dropped.length > 0) {
-    notes.push({ gate: 7, note: `Fitted to your ${ctx.sessionMin || 60}-minute session: trimmed ${trimmed.trimmedCount} set${trimmed.trimmedCount !== 1 ? "s" : ""}${trimmed.dropped.length ? `, dropped ${trimmed.dropped.join(", ")}` : ""}.` });
+  // Gate 6 (coach-apply-overhaul P0-1): net the WHOLE batch at once
+  // against the week it would actually produce. ctx.projectWeek renders
+  // every day through resolveDayExercises with these prescriptions stored
+  // — replaced rows replaced, and bonus lifts / focus uplift suppressed
+  // for every prescribed (day, group) — instead of the old per-item
+  // running tally, which added prescriptions on top of a baseline that
+  // still counted the uplift and bonus volume they supersede. Re-applying
+  // an identical plan therefore nets to zero.
+  // A group over its cap rejects every prescription in that group (with
+  // the projected total and the plan's own total in the reason) — there's
+  // no principled single "last one in" to blame. Removing a group's
+  // prescriptions changes the time-fit for the rest of its days, so the
+  // projection is re-run until no further group is over.
+  const before = ctx.weeklyGroupSets || {};
+  let kept = candidates;
+  const overGroups = new Set();
+  if (ctx.projectWeek) {
+    for (let guard = 0; guard < Object.keys(MUSCLE_GROUPS).length + 1; guard++) {
+      const projected = ctx.projectWeek(kept.map((c) => c.value));
+      const touched = new Set(kept.map((c) => c.group).filter(Boolean));
+      const newlyOver = [...touched].filter((g) => {
+        const cap = gate6Cap(g, ctx);
+        return cap != null && (projected[g] || 0) > cap;
+      });
+      if (!newlyOver.length) break;
+      newlyOver.forEach((g) => {
+        overGroups.add(g);
+        const cap = gate6Cap(g, ctx);
+        const gName = (MUSCLE_GROUPS[g] || {}).name || g;
+        const planTotal = kept.filter((c) => c.group === g).reduce((a, c) => a + (c.value.sets || 3), 0);
+        kept.filter((c) => c.group === g).forEach((c) => rejections.push({
+          exerciseId: c.value.exerciseId, gate: 6,
+          reason: `"${c.ex.name}": this plan's ${gName} prescriptions (${planTotal} sets) would put ${gName} at ${projected[g]} weekly sets (currently ${before[g] || 0}), above the ${cap}-set cap.`,
+        }));
+      });
+      kept = kept.filter((c) => !newlyOver.includes(c.group));
+    }
   }
+  // Baseline already over its cap: warn, never raise the cap.
+  Object.keys(MUSCLE_GROUPS).forEach((g) => {
+    const cap = gate6Cap(g, ctx);
+    if (cap != null && (before[g] || 0) > cap && !overGroups.has(g)) {
+      notes.push({ gate: "6-baseline", group: g,
+        note: `${MUSCLE_GROUPS[g].name} is already at ${before[g]} weekly sets, above its ${cap}-set cap, before this plan — the cap is not raised to fit.` });
+    }
+  });
+
+  const survivors = [];
+  kept.forEach((c) => {
+    // ctx.currentSlotFor reads the same resolveDayExercises this
+    // prescription is spliced into at render time — 0 matches = ADD,
+    // 1 = REPLACE (gate1dAmbiguousMatch already rejected >1 upstream).
+    const matches = ctx.currentSlotFor ? ctx.currentSlotFor(c.value.dayKey, c.value.exerciseId) : [];
+    const isReplace = matches.length === 1;
+    c.notes.forEach((n) => notes.push({ exerciseId: c.value.exerciseId, ...n }));
+    notes.push({
+      exerciseId: c.value.exerciseId, gate: "reconcile",
+      note: isReplace ? `Replaces the existing "${c.ex.name}" on this day.` : `Adds "${c.ex.name}" as a new exercise on this day.`,
+    });
+    survivors.push(c.value);
+  });
+
+  // Gate 7 (coach-apply-overhaul P1-6) no longer trims prescriptions here.
+  // Stored prescriptions keep their RAW sets; every rendered day — the
+  // prescriptions together with the rest of that day — is fitted by
+  // fitDayToTime, and applyCoachGates rejects any projected day that
+  // can't fit without breaking a hard floor (Sean's change 5). Trimming
+  // the prescriptions alone, out of context of their day, was the
+  // second, divergent trim this replaces.
 
   // Gate 8: deload no longer mutates what's stored here — see the amended
   // comment above where gate8DeloadOverride used to be. Still worth
   // telling the user it's in effect; the actual scaling happens at render
   // time now (recommend()'s ex.prescribedLoad branch for load, DayPage's
   // isDeload block for sets), uniformly across every rendered entry.
-  const final = trimmed.list;
+  const final = survivors;
   if (ctx.deloadActive) notes.push({ gate: 8, note: "Deload week active — sets and loads will be scaled down wherever this plan renders, regardless of what's prescribed here." });
 
-  return { accepted: final, rejections, notes };
+  // Per-group before -> after, for the apply preview (P0-2).
+  const weeklyGroupSetsAfter = ctx.projectWeek ? ctx.projectWeek(final) : null;
+  return { accepted: final, rejections, notes, weeklyGroupSetsBefore: before, weeklyGroupSetsAfter };
 }
 
 /* Assembles the read-only ctx every gate above operates over. Not itself
@@ -3187,9 +3760,27 @@ function buildGateContext(data, plan) {
     }
     return dayCache[dayKey].filter((entry) => entry.ex.id === exerciseId);
   };
+  // Gate 6's projection: the week as it would render once this plan is
+  // stored. Mirrors what planUpdateFrom persists (template,
+  // sessionMin, sessionRules, focus, and `prescriptions` as a full
+  // snapshot — wholesale replacement, not a merge).
+  const projectWeek = (prescriptions) => weeklySetsByGroup({
+    ...data,
+    focus: (plan && plan.focus) || data.focus,
+    plan: {
+      ...(data.plan || DEFAULT_PLAN),
+      template: (plan && plan.template) || (data.plan && data.plan.template),
+      sessionMin: (plan && plan.sessionMin) || (data.plan && data.plan.sessionMin),
+      sessionRules: (plan && plan.sessionRules) || (data.plan && data.plan.sessionRules),
+      prescriptions,
+    },
+  });
   return {
     injuryProfile,
     sessions: data.sessions || [],
+    // P2-9: load reads (Gate 3, load-sanity) skip unconfirmed assisted
+    // input errors; pain gates keep reading `sessions` (all of them).
+    loadSessions: loadSessions(data),
     weeklyGroupSets: weeklySetsByGroup(data),
     weeklyGroupSetCaps: (plan && plan.sessionRules && plan.sessionRules.weeklyGroupSetCaps) || {},
     // Task 6, Section 6 (pre-decision 4): Gate 7's own trim, wired the
@@ -3206,6 +3797,7 @@ function buildGateContext(data, plan) {
     checkinScopeIds: checkinScoped ? checkInExerciseIds(data) : null,
     programDayIds: new Set(program.map((d) => d.id)),
     currentSlotFor,
+    projectWeek,
     // Task 6, Gates 9-13: the day-gate orchestrator needs the raw program
     // array itself (to find a dayKey's base template day for Gate 12/13's
     // comparisons) and the pre-this-plan `data` (to compute a day's OLD
@@ -3526,6 +4118,76 @@ function pushPlanVersion(data, plan, brief, source, revertedFrom) {
   return [...(data.planVersions || []), entry].slice(-25);
 }
 
+/* Task 6, Section 3: `days` merges per-dayKey rather than wholesale-
+   replacing like `prescriptions` does — an earlier paste's authored day
+   for a dayKey THIS paste doesn't mention stays in effect. (Moved out of
+   CoachCard for coach-apply-overhaul P0-2 so the preview and the persist
+   build the plan through one function.) */
+function mergeAuthoredDays(existingDays, acceptedDays) {
+  if (!acceptedDays || !acceptedDays.length) return existingDays;
+  const byKey = new Map((existingDays || []).map((d) => [d.dayKey, d]));
+  acceptedDays.forEach((d) => byKey.set(d.dayKey, d));
+  return [...byKey.values()];
+}
+
+/* The exact data.plan an applied gated plan persists — shared by
+   CoachCard's persist and buildPlanPreview, so the preview can't show a
+   plan different from the one Apply writes. `prescriptions` is a full
+   snapshot (a paste without them clears stored ones — the preview's
+   before/after makes that visible). */
+function planUpdateFrom(data, gated, today) {
+  return {
+    ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: today,
+    prescriptions: gated.prescriptions || undefined,
+    sessionRules: gated.sessionRules || undefined,
+    days: mergeAuthoredDays(data.plan && data.plan.days, gated.days),
+    splitPattern: gated.splitPattern !== undefined ? gated.splitPattern : (data.plan && data.plan.splitPattern),
+  };
+}
+
+/* coach-apply-overhaul P0-2: atomic apply. Every gate rejection in a
+   paste — prescription or authored day — blocks the WHOLE apply; nothing
+   is written until the user taps Apply on a plan with zero rejections.
+   This builds what the preview shows from the same functions render uses
+   (planUpdateFrom -> resolveDayExercises -> fitDayToTime), so "what you
+   see" and "what Apply writes" are one computation.
+   ok is the only thing confirmPendingPlan trusts — the disabled button
+   is UI, this is the enforcement. */
+function buildPlanPreview(data, gated, today) {
+  const rejections = [
+    ...(gated.prescriptionRejections || []).map((r) => ({ ...r, kind: "prescription" })),
+    ...(gated.dayRejections || []).map((r) => ({ ...r, kind: "day" })),
+    ...(gated.orderRejections || []).map((r) => ({ ...r, kind: "day" })),
+    ...(gated.fitRejections || []).map((r) => ({ ...r, kind: "day" })),
+    ...(gated.nutritionRejections || []).map((r) => ({ ...r, kind: "plan" })),
+  ];
+  const projected = { ...data, focus: gated.focus || data.focus, plan: planUpdateFrom(data, gated, today || todayISO()) };
+  const before = weeklySetsByGroup(data);
+  const after = weeklySetsByGroup(projected);
+  const caps = (gated.sessionRules && gated.sessionRules.weeklyGroupSetCaps) || {};
+  const groups = Object.keys(MUSCLE_GROUPS).map((g) => {
+    const cap = caps[g] != null ? caps[g] : MUSCLE_GROUPS[g].mav;
+    return { group: g, name: MUSCLE_GROUPS[g].name, before: before[g] || 0, after: after[g] || 0, cap, overCap: (after[g] || 0) > cap };
+  });
+  const sessionMin = (projected.plan && projected.plan.sessionMin) || 60;
+  const days = getProgram(projected).map((day) => {
+    const entries = resolveDayExercises(day, projected);
+    const fit = fitDayToTime(entries.map((e) => e.ex), sessionMin, projected.focus, trimPriorityOf(projected));
+    return {
+      dayKey: day.id, name: day.name, minutes: fit.minutes, dropped: fit.dropped, overBudgetMin: fit.overBudgetMin,
+      exercises: fit.list.map((ex) => ({ id: ex.id, name: ex.name, sets: ex.sets, prescribed: !!ex.prescribed, isBonus: !!ex.isBonus })),
+      maxSetsNotes: entries.maxSetsNotes || [],
+    };
+  });
+  const notes = [
+    ...(gated.gates || []).map((g) => ({ gate: "plan", note: g })),
+    ...(gated.prescriptionNotes || []).filter((n) => n.gate !== "reconcile"),
+    ...(gated.dayNotes || []),
+    ...(gated.fitNotes || []),
+  ];
+  return { ok: rejections.length === 0, rejections, groups, days, notes, deloadActive: deloadActive(data) };
+}
+
 
 /* Task 3, logger UI round. Every row this produces gets an EXPLICIT
    segment — "top" for a plain/no-scheme exercise too, not omitted —
@@ -3820,7 +4482,7 @@ function App() {
     <div style={S.app}>
       {tab === "today" && <WorkoutFlow data={data} persist={persist} />}
       {tab === "log" && <Log data={data} persist={persist} loaded={loaded} sbUser={sbUser} syncStatus={syncStatus} onSignedIn={onSignedIn} onSignedOut={onSignedOut} />}
-      {tab === "progress" && <Progress data={data} />}
+      {tab === "progress" && <Progress data={data} persist={persist} />}
       {tab === "insights" && <Insights data={data} persist={persist} />}
       {tab === "fuel" && <Fuel data={data} persist={persist} />}
       {tab === "focus" && <Focus data={data} persist={persist} />}
@@ -3873,6 +4535,7 @@ function PhaseCard({ data, persist }) {
         )}
       </div>
       <div style={{ fontSize: 13, color: "#3A3A3C", marginTop: 8, lineHeight: 1.5 }}>{info.note}</div>
+      {info.stallLine && <div style={{ fontSize: 12, color: C.sub, marginTop: 6, lineHeight: 1.4 }}>{info.stallLine}</div>}
 
       {info.suggestions.map((s, i) => (
         <div key={i} style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.line}` }}>
@@ -4049,6 +4712,16 @@ function DayPage({ day, data, persist, onBack }) {
                 </div>
               </div>
             )}
+            {fit.overBudgetMin > 0 && (
+              <div style={{ ...S.card, background: "#FDECEC", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <Flame size={18} color={C.red} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div style={{ fontSize: 13, color: "#3A3A3C", lineHeight: 1.45 }}>
+                  <b style={{ color: C.red }}>~{fit.overBudgetMin} min over</b> your {(data.plan && data.plan.sessionMin) || 60}-minute session
+                  even after every allowed cut — your specialized muscle's sets and 2-set compound minimums are never cut to make time.
+                  Lengthen the session or lower a focus level in Focus.
+                </div>
+              </div>
+            )}
             {(fit.trimmed > 0 || fit.dropped.length > 0) && (
               <div style={{ ...S.card, background: "#F7F7FA", display: "flex", gap: 10, alignItems: "flex-start" }}>
                 <Flame size={18} color={C.orange} style={{ marginTop: 1, flexShrink: 0 }} />
@@ -4056,7 +4729,7 @@ function DayPage({ day, data, persist, onBack }) {
                   <b>Fitted to ~{fit.minutes} min</b> for your {(data.plan && data.plan.sessionMin) || 60}-minute session:
                   trimmed {fit.trimmed} set{fit.trimmed !== 1 ? "s" : ""}
                   {fit.dropped.length > 0 ? `, skipped ${fit.dropped.join(", ")}` : ""}.
-                  Compounds and focused muscles were protected first. More time = more volume — change it in Focus.
+                  Lowest-priority sets were cut first, from the end of the session; specialized muscles keep every set. More time = more volume — change it in Focus.
                 </div>
               </div>
             )}
@@ -4133,16 +4806,141 @@ function SegmentPicker({ value, onChange }) {
   );
 }
 
+/* ===== Back-off tagging (coach-apply-overhaul P2-10) =====
+   A load drop mid-exercise (30, 30, 25, 25) is either a deliberate
+   back-off/drop or fatigue — and progression reads them very differently
+   (a tagged back-off set is never "under range = too heavy"). Untagged
+   sets lighter than an earlier untagged set are offered for tagging; the
+   user decides, and "just fatigue" leaves them untagged, still readable
+   as fatigue. Never tagged automatically. */
+function untaggedLoadDrops(sets) {
+  const idx = [];
+  let peak = 0;
+  (sets || []).forEach((s, i) => {
+    const w = Number(s.w) || 0;
+    const tagged = s.segment === "backoff" || s.segment === "drop";
+    if (!tagged && peak > 0 && w > 0 && w < peak) idx.push(i);
+    if (!tagged) peak = Math.max(peak, w);
+  });
+  return idx;
+}
+const tagSetsAs = (sets, idxs, segment) => sets.map((s, i) => (idxs.includes(i) ? { ...s, segment } : s));
+
+/* The question itself — shared by the save prompt and the history list. */
+function LoadDropPrompt({ sets, drops, onChoose, compact }) {
+  const heavy = Math.max(...sets.filter((_, i) => !drops.includes(i)).map((s) => Number(s.w) || 0));
+  const lighter = [...new Set(drops.map((i) => Number(sets[i].w)))].join("/");
+  return (
+    <div style={{ background: "#FFF7EC", borderRadius: 10, padding: compact ? 8 : 10, marginTop: 8 }}>
+      <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+        Set{drops.length !== 1 ? "s" : ""} {drops.map((i) => i + 1).join(", ")} {drops.length !== 1 ? "are" : "is"} lighter ({lighter} vs {heavy} lb).
+        Planned back-off / drop, or fatigue?
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+        <button style={S.smallPill()} onClick={() => onChoose("backoff")}>Back-off</button>
+        <button style={S.smallPill()} onClick={() => onChoose("drop")}>Drop set</button>
+        <button style={S.smallPill("#E9E9EB", C.text)} onClick={() => onChoose(null)}>Just fatigue</button>
+      </div>
+    </div>
+  );
+}
+
+/* ===== Back-off suggestions while logging (Sean, 2026-10-25) =====
+   Two one-tap offers, never applied automatically:
+   1. Before you start: when recommend() already proposes back-off loading
+      (rec.backoffTop -> rec.backoff), pre-fill set 1 at the top load and
+      the rest as tagged back-off sets.
+   2. Mid-session: once a working (untagged) set comes in under repMin and
+      sets remain un-logged, offer to back the remaining sets off by
+      stepDown() (~10%, at least one increment) — the same rule recommend()
+      uses — tagged as back-off so progression reads them correctly.
+   Load math is on the EFFECTIVE load; for bodyweight-loaded lifts the
+   back-off is written back in the entry's terms (more assist). */
+function rowLoad(row, bw) {
+  return bw && row.mode !== undefined ? storedSetFromEntry(row, bw).w : Number(row.w) || 0;
+}
+function rowAtLoad(row, load, bw) {
+  if (bw && row.mode !== undefined) return entryRowFromEffective({ ...row, w: load }, load < bw ? "assist" : "added", bw);
+  return { ...row, w: String(load) };
+}
+function liveBackoffSuggestion(rows, ex, bw) {
+  if (!ex || !ex.repMin) return null;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const reps = Number(row.r) || 0;
+    if (!reps || row.segment === "backoff" || row.segment === "drop") continue;
+    if (reps >= ex.repMin) continue;
+    // Only sets still to do AND not already tagged back-off/drop (else the
+    // offer would reappear right after being accepted).
+    const remaining = rows.map((_, k) => k).filter((k) => k > i && !(Number(rows[k].r) > 0)
+      && rows[k].segment !== "backoff" && rows[k].segment !== "drop");
+    const fromLoad = rowLoad(row, bw);
+    if (!remaining.length || !(fromLoad > 0)) return null;
+    return { afterSet: i, remaining, reps, fromLoad, load: stepDown(fromLoad, ex.inc ?? 5) };
+  }
+  return null;
+}
+const applyLiveBackoff = (rows, s, bw) =>
+  rows.map((x, k) => (s.remaining.includes(k) ? { ...rowAtLoad(x, s.load, bw), segment: "backoff" } : x));
+function backoffPlanRows(rows, rec, bw) {
+  return rows.map((x, k) => (k === 0
+    ? { ...rowAtLoad(x, rec.backoffTop, bw), segment: "top" }
+    : { ...rowAtLoad(x, rec.backoff, bw), segment: "backoff" }));
+}
+
+function BackoffSuggestion({ rows, ex, bw, onApply }) {
+  const [dismissed, setDismissed] = useState(null);
+  const s = liveBackoffSuggestion(rows || [], ex, bw);
+  if (!s || dismissed === s.afterSet) return null;
+  const n = s.remaining.map((k) => k + 1);
+  return (
+    <div style={{ background: "#EAF3FF", borderRadius: 10, padding: 10, margin: "4px 0 8px" }}>
+      <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+        Set {s.afterSet + 1} came in at {s.reps} reps, under {ex.repMin}. Back off set{n.length !== 1 ? "s" : ""} {n.join(", ")} to <b>{s.load} lb</b>
+        {bw && rows[s.afterSet].mode !== undefined ? " effective" : ""} (from {s.fromLoad}) to keep {n.length !== 1 ? "them" : "it"} in range?
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+        <button style={S.smallPill()} onClick={() => onApply(applyLiveBackoff(rows, s, bw))}>Back off</button>
+        <button style={S.smallPill("#E9E9EB", C.text)} onClick={() => setDismissed(s.afterSet)}>Keep the load</button>
+      </div>
+    </div>
+  );
+}
+
+/* coach-apply-overhaul P2-9: one set's type picker for a bodyweight-loaded
+   lift (BW − assist / Bodyweight / BW + weight). Switching type keeps the
+   same effective load where it can (e.g. assist 23 at 158 -> BW + weight
+   leaves it blank, since 135 < bodyweight). Shared by ExerciseCard and
+   the Log tab's "Log a lift" form so both store sets identically. */
+function BodyweightModeChips({ row, bw, onChange }) {
+  const current = row.mode || "bw";
+  return (
+    <div style={{ display: "flex", gap: 4, marginBottom: 4, marginLeft: 54 }}>
+      {BW_ENTRY_MODES.map((m) => (
+        <button key={m.key} style={{ ...S.chip(current === m.key), fontSize: 11.5, padding: "3px 8px" }}
+          onClick={() => {
+            const eff = bw && (row.w !== "" || current === "bw") ? storedSetFromEntry(row, bw).w : "";
+            onChange(entryRowFromEffective({ ...row, w: eff }, m.key, bw));
+          }}>{m.label}</button>
+      ))}
+    </div>
+  );
+}
+const bwPlaceholder = (row) => (BW_ENTRY_MODES.find((m) => m.key === (row.mode || "bw")) || {}).placeholder;
+
 function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
-  const rec = recommend(ex, data.sessions, deloadActive(data));
+  const rec = recommend(ex, loadSessions(data), deloadActive(data)); // P2-9: skip unconfirmed input errors
   const rest = restFor(ex);
   const [sets, setSets] = useState(null);
   const [swapMode, setSwapMode] = useState(false);
   const [timer, setTimer] = useState(null);
   const [flash, setFlash] = useState(false);
-  const [assist, setAssist] = useState(true); // for assistable lifts: enter machine assist
   const [pain, setPain] = useState("");
-  const bw = currentBodyweight(data);
+  const [dropPrompt, setDropPrompt] = useState(null); // P2-10: { clean, drops } awaiting an answer
+  // P2-9: bodyweight-loaded lifts pick a mode per set (see BW_ENTRY_MODES)
+  // and need a real weigh-in — no 146 fallback for effective load.
+  const bwLoaded = isBodyweightLoaded(ex);
+  const bw = bodyweightOn(data.weights, todayISO());
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   // Fix 3 — Gate 2, run in WARN mode against the exercise currently
   // rendered (post-swap). Same gate2Injury call the reject path uses; see
@@ -4161,15 +4959,21 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   // same number (point 1 of this round).
   useEffect(() => {
     if (open && sets === null) {
-      setSets(buildSegmentRows(ex, rec));
+      const rows = buildSegmentRows(ex, rec);
+      if (bwLoaded) {
+        const mode = defaultBodyweightMode(ex, data.sessions);
+        setSets(rows.map((row) => entryRowFromEffective(row, mode, bw)));
+      } else {
+        setSets(rows);
+      }
     }
-    if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); }
+    if (!open) { setSets(null); setSwapMode(false); setTimer(null); setPain(""); setDropPrompt(null); }
   }, [open]); // eslint-disable-line
 
   const hasNonTrivialScheme = ex.scheme && ex.scheme.type !== "straight";
 
   const saveSession = () => {
-    const assistMode = ex.assistable && assist;
+    if (bwLoaded && !bw) return; // the form says why (needs a weigh-in)
     // Point 2: each row's segment rides straight through to the stored
     // row. Point 4 (Addition B): the existing r>0 filter already drops
     // any row nobody filled in — a pre-filled drop/backoff segment the
@@ -4177,18 +4981,21 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
     // zero-rep row. That's unchanged; segment tagging doesn't touch it.
     const clean = (sets || [])
       .map((s) => {
-        const raw = Number(s.w) || 0;
-        const r = Number(s.r) || 0;
-        const segment = s.segment || "top";
-        if (assistMode) {
-          // Entered value is machine assistance; store what was actually lifted.
-          const eff = Math.max(1, Math.round(bw - raw));
-          return { w: eff, r, assist: raw, bw, segment };
-        }
-        return { w: raw, r, segment };
+        // P2-9: per-set mode; stores effective load + mode + raw input + bw.
+        if (bwLoaded) return storedSetFromEntry(s, bw);
+        return { w: Number(s.w) || 0, r: Number(s.r) || 0, segment: s.segment || "top" };
       })
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
+    // P2-10: an untagged load drop gets asked about before saving.
+    const drops = untaggedLoadDrops(clean);
+    if (drops.length) { setDropPrompt({ clean, drops }); return; }
+    commitSession(clean, false);
+  };
+
+  // dropTagAnswered: the user already said what a drop in this session
+  // was, so the history list doesn't ask again.
+  const commitSession = (clean, dropTagAnswered) => {
     // Delayed-onset pain (painRetro) is asked for separately, across all lifts,
     // by PendingPainRetroPrompts — not gated on reopening this specific
     // exercise, which on a ~7-day split would close the window long before
@@ -4197,8 +5004,10 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
       id: Date.now(), date: todayISO(), exerciseId: ex.id, sets: clean,
       pain: pain === "" ? null : Math.max(0, Math.min(10, Number(pain) || 0)),
       painRetro: null, painRetroAt: null, painRetroDismissed: false,
+      ...(dropTagAnswered ? { dropTagAnswered: true } : {}),
     };
     persist({ ...data, sessions: [...data.sessions, session] });
+    setDropPrompt(null);
     setFlash(true);
     setTimeout(() => { setFlash(false); onToggle(); }, 900);
   };
@@ -4226,7 +5035,7 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
   const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   const setDelta = (ex.sets || 0) - (ex.baseSets || ex.sets || 0);
   const isBonus = !!slot.isBonus;
-  const lastSess = lastSessionFor(data.sessions || [], ex.id);
+  const lastSess = lastSessionFor(loadSessions(data), ex.id); // P2-9
 
   return (
     <div style={{ ...S.card, borderLeft: done ? `4px solid ${C.green}` : "none" }}>
@@ -4305,36 +5114,37 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                   </div>
                 ))}
               </div>
-              {rec.backoff && rec.backoff !== rec.weight && (
-                <div style={{ fontSize: 12, color: C.blue, marginTop: 8, lineHeight: 1.4 }}>
-                  Back-off option: {rec.weight} lb on set 1, then {rec.backoff} lb to keep every set in range.
+              {rec.backoff && rec.backoffTop && rec.backoff !== rec.backoffTop && (
+                <div style={{ fontSize: 12, color: C.blue, marginTop: 8, lineHeight: 1.4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span>Back-off option: {rec.backoffTop} lb on set 1, then {rec.backoff} lb to keep every set in range.</span>
+                  {sets && sets.length > 1 && (
+                    <button style={S.smallPill()} onClick={() => setSets(backoffPlanRows(sets, rec, bwLoaded ? bw : null))}>Use back-off plan</button>
+                  )}
                 </div>
               )}
             </div>
           )}
 
-          {ex.assistable && (
-            <div style={{ marginBottom: 12 }}>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button style={{ ...S.chip(assist), flex: 1 }} onClick={() => setAssist(true)}>Machine assist</button>
-                <button style={{ ...S.chip(!assist), flex: 1 }} onClick={() => setAssist(false)}>Bodyweight / +weight</button>
-              </div>
-              {assist && (
-                <div style={{ fontSize: 12.5, color: C.sub, marginTop: 8, lineHeight: 1.45 }}>
-                  Enter the <b>assistance</b> the machine gives. It's logged as effective weight
-                  (your bodyweight {Math.round(bw)} lb − assist), so the number climbs as you get stronger.
-                </div>
-              )}
+          {bwLoaded && (
+            <div style={{ fontSize: 12.5, color: C.sub, marginBottom: 10, lineHeight: 1.45 }}>
+              {bw
+                ? <>Pick each set's type: <b>BW − assist</b> (type the machine's assistance), <b>Bodyweight</b>, or <b>BW + weight</b> (type the added load).
+                  It's logged as effective weight from your {Math.round(bw)} lb bodyweight, so the number climbs as you get stronger.</>
+                : <span style={{ color: C.red }}>Log a weigh-in first (Log tab) — this lift is scored from your bodyweight, and the app won't guess it.</span>}
             </div>
           )}
 
           {(sets || []).map((s, i) => (
             <div key={i} style={{ marginBottom: 8 }}>
+              {bwLoaded && (
+                <BodyweightModeChips row={s} bw={bw} onChange={(nr) => setSets(sets.map((x, j) => (j === i ? nr : x)))} />
+              )}
               <div style={S.row}>
                 <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
                 <input
                   style={S.input} type="number" inputMode="decimal"
-                  placeholder={ex.assistable && assist ? "assist lbs" : "lbs"}
+                  disabled={bwLoaded && (s.mode || "bw") === "bw"}
+                  placeholder={bwLoaded ? bwPlaceholder(s) : "lbs"}
                   value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
                 />
                 <input
@@ -4342,13 +5152,21 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                   value={s.r} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, r: e.target.value } : x)))}
                 />
               </div>
-              {hasNonTrivialScheme && (
+              {hasNonTrivialScheme ? (
                 <div style={{ marginTop: 4, marginLeft: 54 }}>
                   <SegmentPicker value={s.segment || "top"} onChange={(seg) => setSets(sets.map((x, j) => (j === i ? { ...x, segment: seg } : x)))} />
+                </div>
+              ) : (s.segment === "backoff" || s.segment === "drop") && (
+                <div style={{ marginTop: 2, marginLeft: 54, fontSize: 11.5, color: C.blue }}>
+                  {s.segment === "backoff" ? "back-off set" : "drop set"} ·{" "}
+                  <button style={{ background: "none", border: "none", color: C.sub, padding: 0, cursor: "pointer", fontSize: 11.5, textDecoration: "underline" }}
+                    onClick={() => setSets(sets.map((x, j) => (j === i ? { ...x, segment: "top" } : x)))}>untag</button>
                 </div>
               )}
             </div>
           ))}
+
+          <BackoffSuggestion rows={sets} ex={ex} bw={bwLoaded ? bw : null} onApply={setSets} />
 
           {injuryProfile.recoveringMode && (
             <div style={{ ...S.row, marginTop: 4, marginBottom: 10 }}>
@@ -4359,10 +5177,12 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
               />
             </div>
           )}
-          {ex.assistable && assist && (sets || []).some((s) => Number(s.w) > 0) && (
+          {bwLoaded && bw && (sets || []).some((s) => Number(s.r) > 0) && (
             <div style={{ fontSize: 12, color: C.blue, marginBottom: 4 }}>
-              Will log: {(sets || []).filter((s) => Number(s.w) > 0 || Number(s.r) > 0).map((s, i) =>
-                `${Math.max(1, Math.round(bw - (Number(s.w) || 0)))}×${Number(s.r) || 0}`).join("  ")} (effective lb)
+              Will log: {(sets || []).filter((s) => Number(s.r) > 0).map((s) => {
+                const st = storedSetFromEntry(s, bw);
+                return `${st.w}×${st.r}`;
+              }).join("  ")} (effective lb)
             </div>
           )}
 
@@ -4374,7 +5194,8 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
                 scheme almost always means. */}
             <button style={S.smallPill()} onClick={() => {
               const prior = sets && sets.length ? sets[sets.length - 1] : null;
-              setSets([...(sets || []), { w: prior ? prior.w : (rec.weight === 0 ? "" : String(rec.weight)), r: "", segment: prior ? (prior.segment || "top") : "top" }]);
+              setSets([...(sets || []), { w: prior ? prior.w : (rec.weight === 0 ? "" : String(rec.weight)), r: "", segment: prior ? (prior.segment || "top") : "top",
+                ...(bwLoaded && prior ? { mode: prior.mode || "bw" } : {}) }]); // P2-9: same set type as the row above
             }}>
               <Plus size={13} /> Add set
             </button>
@@ -4452,12 +5273,18 @@ function ExerciseCard({ slot, ex, data, persist, open, onToggle, done }) {
             </div>
           )}
 
-          <button
-            style={{ ...S.pillBtn(flash ? C.green : C.blue), width: "100%", marginTop: 12 }}
-            onClick={saveSession}
-          >
-            {flash ? "Saved ✓" : "Save session"}
-          </button>
+          {dropPrompt ? (
+            <LoadDropPrompt sets={dropPrompt.clean} drops={dropPrompt.drops}
+              onChoose={(seg) => commitSession(seg ? tagSetsAs(dropPrompt.clean, dropPrompt.drops, seg) : dropPrompt.clean, true)} />
+          ) : (
+            <button
+              style={{ ...S.pillBtn(flash ? C.green : (bwLoaded && !bw) ? "#C7C7CC" : C.blue), width: "100%", marginTop: 12 }}
+              disabled={bwLoaded && !bw}
+              onClick={saveSession}
+            >
+              {flash ? "Saved ✓" : (bwLoaded && !bw) ? "Log a weigh-in first" : "Save session"}
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -5137,13 +5964,22 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
   // which blanks every segment's weight) — this form has never
   // auto-filled a recommended weight the way ExerciseCard does, only the
   // SEGMENT sequence and row count are worth seeding here.
-  const blankRowsFor = (id) => buildSegmentRows(exerciseById(id), { weight: 0 });
+  // P2-9: bodyweight-loaded lifts get per-set types here too, so a pull-up
+  // logged from this form stores exactly what ExerciseCard would.
+  const logBw = bodyweightOn(data.weights, todayISO());
+  const blankRowsFor = (id) => {
+    const rows = buildSegmentRows(exerciseById(id), { weight: 0 });
+    if (!isBodyweightLoaded(id)) return rows;
+    const mode = defaultBodyweightMode(exerciseById(id), data.sessions);
+    return rows.map((r) => ({ ...r, mode, w: "" }));
+  };
 
   const [exId, setExId] = useState(resolvedProgram[0].exercises[0].id);
   const [sets, setSets] = useState(() => blankRowsFor(resolvedProgram[0].exercises[0].id));
   const [bw, setBw] = useState("");
   const [savedFlash, setSavedFlash] = useState("");
   const [pain, setPain] = useState("");
+  const [dropPrompt, setDropPrompt] = useState(null); // P2-10
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   const selectedEx = exerciseById(exId);
   const hasNonTrivialScheme = selectedEx.scheme && selectedEx.scheme.type !== "straight";
@@ -5151,11 +5987,20 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
   const flash = (msg) => { setSavedFlash(msg); setTimeout(() => setSavedFlash(""), 2000); };
 
   const saveSession = () => {
+    const bwLift = isBodyweightLoaded(exId);
+    if (bwLift && !logBw) return; // needs a weigh-in; the form says so
     // Point 2: segment rides through to the stored row here too.
     const clean = sets
-      .map((s) => ({ w: Number(s.w) || 0, r: Number(s.r) || 0, segment: s.segment || "top" }))
+      .map((s) => (bwLift ? storedSetFromEntry(s, logBw) : { w: Number(s.w) || 0, r: Number(s.r) || 0, segment: s.segment || "top" }))
       .filter((s) => s.r > 0);
     if (clean.length === 0) return;
+    // P2-10: ask about an untagged load drop before saving.
+    const drops = untaggedLoadDrops(clean);
+    if (drops.length) { setDropPrompt({ clean, drops }); return; }
+    commitSession(clean, false);
+  };
+
+  const commitSession = (clean, dropTagAnswered) => {
     // Delayed-onset pain (painRetro) is asked for separately, across all lifts —
     // see findAllPendingPainRetros / PendingPainRetroPrompts, rendered on the
     // Workout tab.
@@ -5163,11 +6008,22 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
       id: Date.now(), date: todayISO(), exerciseId: exId, sets: clean,
       pain: pain === "" ? null : Math.max(0, Math.min(10, Number(pain) || 0)),
       painRetro: null, painRetroAt: null, painRetroDismissed: false,
+      ...(dropTagAnswered ? { dropTagAnswered: true } : {}),
     };
     persist({ ...data, sessions: [...data.sessions, session] });
+    setDropPrompt(null);
     setSets(blankRowsFor(exId));
     setPain("");
     flash("Session saved");
+  };
+
+  // P2-10: answer the back-off question for an already-saved session.
+  // Tags only the sets the user confirms; "just fatigue" records the answer
+  // and changes no set.
+  const answerDropTag = (s, seg) => {
+    const drops = untaggedLoadDrops(s.sets);
+    const updated = { ...s, sets: seg ? tagSetsAs(s.sets, drops, seg) : s.sets, dropTagAnswered: true };
+    persist({ ...data, sessions: data.sessions.map((x) => (x.id === s.id ? updated : x)) });
   };
 
   const saveWeight = () => {
@@ -5237,12 +6093,22 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
           )}
         </select>
 
+        {isBodyweightLoaded(exId) && !logBw && (
+          <div style={{ fontSize: 12.5, color: C.red, marginBottom: 8 }}>
+            Log a weigh-in above first — this lift is scored from your bodyweight, and the app won't guess it.
+          </div>
+        )}
         {sets.map((s, i) => (
           <div key={i} style={{ marginBottom: 8 }}>
+            {isBodyweightLoaded(exId) && (
+              <BodyweightModeChips row={s} bw={logBw} onChange={(nr) => setSets(sets.map((x, j) => (j === i ? nr : x)))} />
+            )}
             <div style={S.row}>
               <span style={{ width: 44, color: C.sub, fontSize: 13, fontWeight: 600 }}>Set {i + 1}</span>
               <input
-                style={S.input} type="number" inputMode="decimal" placeholder="lbs"
+                style={S.input} type="number" inputMode="decimal"
+                disabled={isBodyweightLoaded(exId) && (s.mode || "bw") === "bw"}
+                placeholder={isBodyweightLoaded(exId) ? bwPlaceholder(s) : "lbs"}
                 value={s.w} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, w: e.target.value } : x)))}
               />
               <input
@@ -5250,13 +6116,21 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
                 value={s.r} onChange={(e) => setSets(sets.map((x, j) => (j === i ? { ...x, r: e.target.value } : x)))}
               />
             </div>
-            {hasNonTrivialScheme && (
+            {hasNonTrivialScheme ? (
               <div style={{ marginTop: 4, marginLeft: 54 }}>
                 <SegmentPicker value={s.segment || "top"} onChange={(seg) => setSets(sets.map((x, j) => (j === i ? { ...x, segment: seg } : x)))} />
+              </div>
+            ) : (s.segment === "backoff" || s.segment === "drop") && (
+              <div style={{ marginTop: 2, marginLeft: 54, fontSize: 11.5, color: C.blue }}>
+                {s.segment === "backoff" ? "back-off set" : "drop set"} ·{" "}
+                <button style={{ background: "none", border: "none", color: C.sub, padding: 0, cursor: "pointer", fontSize: 11.5, textDecoration: "underline" }}
+                  onClick={() => setSets(sets.map((x, j) => (j === i ? { ...x, segment: "top" } : x)))}>untag</button>
               </div>
             )}
           </div>
         ))}
+
+        <BackoffSuggestion rows={sets} ex={selectedEx} bw={isBodyweightLoaded(exId) ? logBw : null} onApply={setSets} />
 
         {injuryProfile.recoveringMode && (
           <div style={{ ...S.row, marginBottom: 8 }}>
@@ -5273,15 +6147,22 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
             style={S.pillBtn("#E9E9EB", C.text)}
             onClick={() => {
               const prior = sets.length ? sets[sets.length - 1] : null;
-              setSets([...sets, { w: prior ? prior.w : "", r: "", segment: prior ? (prior.segment || "top") : "top" }]);
+              setSets([...sets, { w: prior ? prior.w : "", r: "", segment: prior ? (prior.segment || "top") : "top",
+                ...(isBodyweightLoaded(exId) && prior ? { mode: prior.mode || "bw" } : {}) }]);
             }}
           >
             <Plus size={14} style={{ verticalAlign: -2 }} /> Add set
           </button>
-          <button style={{ ...S.pillBtn(), flex: 1 }} onClick={saveSession}>
-            Save session
-          </button>
+          {!dropPrompt && (
+            <button style={{ ...S.pillBtn(), flex: 1 }} onClick={saveSession}>
+              Save session
+            </button>
+          )}
         </div>
+        {dropPrompt && (
+          <LoadDropPrompt sets={dropPrompt.clean} drops={dropPrompt.drops}
+            onChoose={(seg) => commitSession(seg ? tagSetsAs(dropPrompt.clean, dropPrompt.drops, seg) : dropPrompt.clean, true)} />
+        )}
       </div>
 
       <div style={{ padding: "8px 20px 0", fontWeight: 700, fontSize: 15 }}>Recent sessions</div>
@@ -5292,11 +6173,14 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
       )}
       {recent.map((s) => (
         <div key={s.id} style={{ ...S.card, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div>
+          <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 700, fontSize: 14 }}>{EX_BY_ID[s.exerciseId]?.name || s.exerciseId}</div>
             <div style={{ color: C.sub, fontSize: 13, marginTop: 2 }}>
               {shortDate(s.date)} · {formatSchemeSets(s.sets)}
             </div>
+            {!s.dropTagAnswered && untaggedLoadDrops(s.sets).length > 0 && (
+              <LoadDropPrompt compact sets={s.sets} drops={untaggedLoadDrops(s.sets)} onChoose={(seg) => answerDropTag(s, seg)} />
+            )}
           </div>
           <button
             style={{ background: "transparent", border: "none", cursor: "pointer", color: C.red }}
@@ -5317,20 +6201,54 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
 
 /* ============================ PROGRESS ============================ */
 
-function Progress({ data }) {
+/* coach-apply-overhaul P2-8: one card listing every unconfirmed "possible
+   data error" week. Confirming records data.dataQualityConfirmations[id]
+   so the week counts again; correcting the log (Log tab) removes the flag
+   on its own. Nothing here edits a session. */
+function DataQualityCard({ data, persist }) {
+  const flags = dataQualityFlags(data);
+  if (!flags.length) return null;
+  const confirm = (id) => persist({
+    ...data,
+    dataQualityConfirmations: { ...(data.dataQualityConfirmations || {}), [id]: { confirmedAt: new Date().toISOString() } },
+  });
+  return (
+    <div style={{ ...S.card, background: "#FFF7EC" }}>
+      <div style={{ fontWeight: 700, fontSize: 14, color: C.orange }}>Possible data error{flags.length !== 1 ? "s" : ""}</div>
+      <div style={{ fontSize: 12.5, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
+        A drop of more than 30% within 3 weeks is usually a logging slip, so these weeks are left out of stall and trend
+        decisions until you confirm them — or fix the entry in the Log tab.
+      </div>
+      {flags.map((f) => (
+        <div key={f.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
+          <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+            <b>{(EX_BY_ID[f.exId] || {}).name || f.exId}</b> · {f.kind === "e1rm" ? `week of ${shortDate(f.week)}` : shortDate(f.date)}<br />
+            {f.kind === "e1rm" && <>e1RM {Math.round(f.e1)} vs {Math.round(f.refE1)} on {shortDate(f.refWeek)} (−{f.dropPct}%)</>}
+            {f.kind === "input" && <>Possible input error: {f.reasons.join("; ")}. Was the effective load typed into the assist field?</>}
+            {f.kind === "no-bw" && <>Bodyweight lift with no bodyweight on record — log a weigh-in so its effective load can be computed.</>}
+          </div>
+          {f.kind !== "no-bw" && <button style={S.smallPill()} onClick={() => confirm(f.id)}>It's real</button>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Progress({ data, persist }) {
   const trained = ALL_KNOWN.filter((ex) => data.sessions.some((s) => s.exerciseId === ex.id));
   const [view, setView] = useState("overview");
   const [query, setQuery] = useState("");
   const [exId, setExId] = useState(null);
 
   const rows = useMemo(() => trained.map((ex) => {
-    const series = weeklySeries(data.sessions, ex.id);
+    // P2-9: effective loads for bodyweight lifts; input-error sessions left out.
+    const series = weeklySeries(data.sessions, ex.id, { weights: data.weights, confirmations: data.dataQualityConfirmations });
     const last = series[series.length - 1];
     const best = series.reduce((a, s) => Math.max(a, s.e1), 0);
     const t = trendPct(series);
     const lastDate = data.sessions.filter((s) => s.exerciseId === ex.id).map((s) => s.date).sort().slice(-1)[0];
     return { ex, series, last, best, trend: t, lastDate };
-  }).sort((a, b) => (a.lastDate < b.lastDate ? 1 : -1)), [data.sessions, trained.length]);
+  }).sort((a, b) => (a.lastDate < b.lastDate ? 1 : -1)), [data.sessions, data.weights, data.dataQualityConfirmations, trained.length]);
 
   const matches = query.trim()
     ? rows.filter((r) => r.ex.name.toLowerCase().includes(query.trim().toLowerCase()))
@@ -5392,6 +6310,7 @@ function Progress({ data }) {
         <button style={S.chip(view === "overview")} onClick={() => setView("overview")}>Overview</button>
         <button style={S.chip(view === "charts")} onClick={() => setView("charts")}>Charts</button>
       </div>
+      {persist && <DataQualityCard data={data} persist={persist} />}
 
       {trained.length === 0 && (
         <div style={{ ...S.card, color: C.sub, fontSize: 14 }}>
@@ -5496,11 +6415,19 @@ function Progress({ data }) {
 
 const API_KEY_LS = "recompcoach:apikey";
 
+/* coach-apply-overhaul P3-13: a bodyweight slope needs at least this many
+   weigh-ins; without one, a calorie INCREASE above this is held (the
+   app can't tell whether you're losing too fast, holding, or gaining). */
+const BW_TREND_MIN_WEIGHINS = 4;
+const CALORIE_INCREASE_NEEDS_TREND = 150;
+
 function coachMetrics(data) {
   const sessions = data.sessions || [];
   const trained = ALL_KNOWN.filter((ex) => sessions.some((s) => s.exerciseId === ex.id));
   const lifts = trained.map((ex) => {
-    const series = weeklySeries(sessions, ex.id);
+    // P2-8: trend/stall from the trusted series (possible-data-error weeks
+    // excluded until confirmed); the flags themselves go in dataFlags below.
+    const { series } = trustedSeries(sessions, ex.id, data.dataQualityConfirmations, data.weights);
     const t = trendPct(series);
     const stalled = series.length >= 3 &&
       series[series.length - 1].e1 <= series[series.length - 3].e1 * 1.005;
@@ -5514,7 +6441,7 @@ function coachMetrics(data) {
   });
   const w = [...(data.weights || [])].sort((a, b) => (a.date < b.date ? -1 : 1));
   let bwSlope = null;
-  if (w.length >= 4) {
+  if (w.length >= BW_TREND_MIN_WEIGHINS) {
     const half = Math.floor(w.length / 2);
     const avg = (a) => a.reduce((x, y) => x + y.lbs, 0) / a.length;
     const spanDays = (new Date(w[w.length - 1].date) - new Date(w[0].date)) / 86400000 || 1;
@@ -5525,12 +6452,23 @@ function coachMetrics(data) {
     totalSessions: countTrainingSessions(sessions),
     latestBw: w.length ? w[w.length - 1].lbs : null,
     bwSlopePerWeek: bwSlope,
+    weighIns: w.length, // P3-13: how many weigh-ins the slope (if any) rests on
     stalledLifts: lifts.filter((l) => l.weeksLogged >= 3 && l.stalled).length,
+    // P2-11: what the deload decision actually uses, denominator included.
+    stallCheck: stallSummary(stallScore(data)),
     lifts: lifts.filter((l) => l.weeksLogged >= 1),
     currentPlan: data.plan || null,
     currentFocus: data.focus || null,
     nutritionTarget: computeNutrition(data.nutrition || DEFAULT_NUTRITION, w.length ? w[w.length - 1].lbs : null).target,
     deloadActive: deloadActive(data),
+    // P0-4: the real per-group weekly baseline the coach must plan against.
+    weeklySets: weeklySetsByGroup(data),
+    // P2-8: unconfirmed possible data errors, excluded from trends above.
+    dataFlags: dataQualityFlags(data).map((f) => (f.kind === "e1rm"
+      ? `${f.exId} wk ${f.week}: e1RM ${Math.round(f.e1)} vs ${Math.round(f.refE1)} (-${f.dropPct}%) — possible data error, excluded until confirmed`
+      : f.kind === "input"
+        ? `${f.exId} ${f.date}: ${f.reasons.join("; ")} — possible input error (effective load typed as assist?), excluded until confirmed`
+        : `${f.exId} ${f.date}: bodyweight lift with no bodyweight on record — effective load unknown, excluded`)),
   };
 }
 
@@ -5647,6 +6585,14 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
   gated.focus = f;
   const cd = Number(gated.calorieDelta) || 0;
   gated.calorieDelta = Math.max(-300, Math.min(300, cd));
+  // P3-13: no bodyweight trend -> a calorie increase above +150 is a
+  // rejection (blocks the whole apply, P0-2) with a weigh-in prompt, not a
+  // silent clamp. Decreases and small increases are unaffected.
+  gated.nutritionRejections = [];
+  if (metrics && metrics.bwSlopePerWeek == null && gated.calorieDelta > CALORIE_INCREASE_NEEDS_TREND) {
+    gated.nutritionRejections.push({ gate: "nutrition",
+      reason: `calorieDelta +${gated.calorieDelta} needs a bodyweight trend, and there isn't one yet (${metrics.weighIns ?? 0} weigh-in${metrics.weighIns === 1 ? "" : "s"} logged; a trend needs ${BW_TREND_MIN_WEIGHINS}). Log your weight daily in the Log tab, then re-run the check-in — or ask for +${CALORIE_INCREASE_NEEDS_TREND} or less.` });
+  }
   if (![45, 60, 75].includes(gated.sessionMin)) gated.sessionMin = (metrics.currentPlan && metrics.currentPlan.sessionMin) || 60;
 
   // sessionRules: merge onto whatever was already stored (see
@@ -5671,6 +6617,8 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
     gated.prescriptions = result.accepted;
     gated.prescriptionRejections = result.rejections;
     gated.prescriptionNotes = result.notes;
+    gated.weeklyGroupSetsBefore = result.weeklyGroupSetsBefore;
+    gated.weeklyGroupSetsAfter = result.weeklyGroupSetsAfter;
   }
 
   // Task 6, Section 2: `days` through Gates 9-13. Backward compatible —
@@ -5687,6 +6635,37 @@ function applyCoachGates(rec, metrics, injuryProfile, data) {
     gated.days = result.accepted;
     gated.dayRejections = result.rejections;
     gated.dayNotes = result.notes;
+  }
+
+  // coach-apply-overhaul P1-5 (g): a coach `order` is honored only if the
+  // day it produces still satisfies the order engine's hard rules. Checked
+  // against the plan exactly as it would be stored (planUpdateFrom), so a
+  // rejection here blocks the whole apply (P0-2) — never a silent re-sort.
+  // P1-6 Gate 7 (Sean's change 5), same projected pass: every day must fit
+  // sessionMin with the hard floors intact (specialize groups' sets,
+  // compounds >= 2). A day that can't is a rejection with the overage in
+  // minutes — the apply fails atomically. Trims that DO fit are notes.
+  if (data) {
+    const projected = { ...data, focus: gated.focus, plan: planUpdateFrom(data, gated, todayISO()) };
+    const sessionMin = (projected.plan && projected.plan.sessionMin) || 60;
+    gated.orderRejections = [];
+    gated.fitRejections = [];
+    gated.fitNotes = [];
+    getProgram(projected).forEach((day) => {
+      const list = resolveDayExercises(day, projected);
+      if (list.orderViolation) {
+        gated.orderRejections.push({ gate: "order", dayKey: day.id,
+          reason: `${day.name}: the coach's exercise order can't be used — ${list.orderViolation}` });
+      }
+      const fit = fitDayToTime(list.map((e) => e.ex), sessionMin, projected.focus, trimPriorityOf(projected));
+      if (fit.overBudgetMin > 0) {
+        gated.fitRejections.push({ gate: 7, dayKey: day.id,
+          reason: `${day.name} runs ${fit.overBudgetMin} min over your ${sessionMin}-minute session even after every allowed cut (specialized muscle sets and 2-set compound minimums are protected). Fewer sets, fewer exercises, or a longer session.` });
+      } else if (fit.trimmed > 0 || fit.dropped.length > 0) {
+        gated.fitNotes.push({ gate: 7, dayKey: day.id,
+          note: `${day.name}: fitted to ${sessionMin} min — trimmed ${fit.trimmed} set${fit.trimmed !== 1 ? "s" : ""}${fit.dropped.length ? `, skipped ${fit.dropped.join(", ")}` : ""} (lowest-priority, last-listed first).` });
+      }
+    });
   }
   return gated;
 }
@@ -5730,28 +6709,13 @@ Respond ONLY with JSON, no markdown fences:
    applyPasted/confirmPendingPlan in CoachCard). Rendered whenever
    pendingPlan is non-null; nothing here has a side effect on its own —
    discarding (closing the tab, tapping Discard) leaves data untouched. */
-function PendingPlanDiff({ pendingPlan, onConfirm, onDiscard }) {
-  if (!pendingPlan) return null;
-  const { gated, diff } = pendingPlan;
-  const acceptedCount = (gated.days || []).length;
-  const rejectedCount = (gated.dayRejections || []).length;
+/* coach-apply-overhaul P0-2: authored-day diff, now one section inside
+   PlanPreview (which owns the header, rejections, and Apply/Cancel). */
+function AuthoredDayDiff({ diff }) {
+  if (!diff || !diff.length) return null;
   return (
-    <div style={{ ...S.card, background: "#FFF7EC", marginTop: 10 }}>
-      <div style={{ fontWeight: 700, fontSize: 14, color: C.orange }}>Review before applying</div>
-      <div style={{ fontSize: 12.5, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
-        This reply authors full day{acceptedCount + rejectedCount !== 1 ? "s" : ""} — nothing is saved until you
-        confirm below.
-      </div>
-      {rejectedCount > 0 && (
-        <div style={{ marginTop: 10, background: "#FDECEC", borderRadius: 10, padding: 10 }}>
-          <div style={{ fontWeight: 700, fontSize: 12.5, color: C.red }}>
-            {rejectedCount} day{rejectedCount !== 1 ? "s" : ""} rejected, not applied
-          </div>
-          {gated.dayRejections.map((r, i) => (
-            <div key={i} style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>{r.reason}</div>
-          ))}
-        </div>
-      )}
+    <div>
+      <div style={{ fontWeight: 700, fontSize: 12.5, color: C.sub, marginTop: 12 }}>AUTHORED DAYS — CHANGES</div>
       {diff.map((d) => {
         const empty = !d.diff.added.length && !d.diff.removed.length && !d.diff.changed.length && !d.diff.reordered.length;
         return (
@@ -5781,10 +6745,99 @@ function PendingPlanDiff({ pendingPlan, onConfirm, onDiscard }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/* coach-apply-overhaul P0-2: the single review-and-apply surface for
+   every coach plan (paste or in-app check-in). Shows per-group weekly
+   sets before -> after, each day's final ordered list (exactly what the
+   day will render), every rejection with its gate and reason, and the
+   non-blocking notes. Apply is disabled on any rejection; Cancel writes
+   nothing. Content comes from buildPlanPreview — no logic here. */
+function PlanPreview({ pendingPlan, onConfirm, onDiscard }) {
+  if (!pendingPlan || !pendingPlan.preview) return null;
+  const { preview, diff } = pendingPlan;
+  const nRej = preview.rejections.length;
+  const changed = (g) => g.before !== g.after;
+  return (
+    <div style={{ ...S.card, background: nRej ? "#FDECEC" : "#FFF7EC", marginTop: 10 }}>
+      <div style={{ fontWeight: 700, fontSize: 14, color: nRej ? C.red : C.orange }}>
+        {nRej ? `Nothing will be applied — ${nRej} rejection${nRej !== 1 ? "s" : ""}` : "Review before applying"}
+      </div>
+      <div style={{ fontSize: 12.5, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
+        {nRej
+          ? "A plan applies all-or-nothing. Fix the rejected items (or ask Claude to) and paste again."
+          : "Nothing is saved until you tap Apply. The whole plan applies at once."}
+      </div>
+
+      {nRej > 0 && (
+        <div style={{ marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 12.5, color: C.red }}>Rejected</div>
+          {preview.rejections.map((r, i) => (
+            <div key={i} style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>
+              Gate {r.gate}{r.kind === "day" ? " (day)" : ""} — {r.reason}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
+        <div style={{ fontWeight: 700, fontSize: 12.5, color: C.sub }}>
+          WEEKLY SETS {nRej ? "(accepted part only — not applied)" : "BEFORE → AFTER"}
+        </div>
+        {preview.groups.map((g) => (
+          <div key={g.group} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginTop: 4, fontWeight: changed(g) ? 700 : 400 }}>
+            <span>{g.name}</span>
+            <span style={{ color: g.overCap ? C.red : C.text }}>
+              {g.before} → {g.after}<span style={{ color: C.sub, fontWeight: 400 }}> / cap {g.cap}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {preview.days.map((d) => (
+        <div key={d.dayKey} style={{ marginTop: 8, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700 }}>
+            <span>{d.name}</span>
+            <span style={{ color: d.overBudgetMin ? C.red : C.sub, fontWeight: d.overBudgetMin ? 700 : 400 }}>
+              ~{d.minutes} min{d.overBudgetMin ? ` · ${d.overBudgetMin} min over` : ""}
+            </span>
+          </div>
+          <div style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.5 }}>
+            {d.exercises.map((ex, i) => (
+              <div key={`${ex.id}${i}`}>
+                {i + 1}. {ex.name} — {ex.sets} set{ex.sets !== 1 ? "s" : ""}
+                {ex.prescribed && <span style={{ color: C.blue }}> · coach</span>}
+                {ex.isBonus && <span style={{ color: C.sub }}> · bonus</span>}
+              </div>
+            ))}
+            {d.dropped.length > 0 && <div style={{ color: C.orange }}>Dropped to fit time: {d.dropped.join(", ")}</div>}
+            {d.maxSetsNotes.map((n, i) => (
+              <div key={`ms${i}`} style={{ color: C.orange, marginTop: 2 }}>Per-movement cap: {n.note}</div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      <AuthoredDayDiff diff={diff} />
+
+      {preview.notes.length > 0 && (
+        <div style={{ marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 12.5, color: C.orange }}>Notes</div>
+          {preview.notes.map((n, i) => (
+            <div key={i} style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>{n.note}</div>
+          ))}
+        </div>
+      )}
+      {preview.deloadActive && (
+        <div style={{ fontSize: 12, color: C.sub, marginTop: 8 }}>Deload week active — sets and loads above are scaled down when each day renders.</div>
+      )}
+
       <div style={{ ...S.row, marginTop: 12 }}>
-        <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} onClick={onDiscard}>Discard</button>
-        <button style={{ ...S.pillBtn(C.green), flex: 1 }} disabled={acceptedCount === 0} onClick={onConfirm}>
-          {acceptedCount === 0 ? "Nothing to apply" : "Confirm & apply"}
+        <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} onClick={onDiscard}>Cancel</button>
+        <button style={{ ...S.pillBtn(preview.ok ? C.green : "#C7C7CC"), flex: 1 }} disabled={!preview.ok} onClick={onConfirm}>
+          {preview.ok ? "Apply" : "Can't apply"}
         </button>
       </div>
     </div>
@@ -5917,42 +6970,21 @@ function CoachCard({ data, persist }) {
     window.open(url, "_blank");
   };
 
-  // Task 6, Section 3: `days` merges per-dayKey rather than wholesale-
-  // replacing like `prescriptions` does — an earlier paste's authored day
-  // for a dayKey THIS paste doesn't mention stays in effect. Omission
-  // means no change, same "loud on a real change, silent on omission"
-  // principle sessionRules already follows (mergeSessionRules).
-  const mergeAuthoredDays = (existingDays, acceptedDays) => {
-    if (!acceptedDays || !acceptedDays.length) return existingDays;
-    const byKey = new Map((existingDays || []).map((d) => [d.dayKey, d]));
-    acceptedDays.forEach((d) => byKey.set(d.dayKey, d));
-    return [...byKey.values()];
-  };
-
-  const buildPlanUpdate = (gated) => ({
-    ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: todayISO(),
-    prescriptions: gated.prescriptions || undefined,
-    sessionRules: gated.sessionRules || undefined,
-    days: mergeAuthoredDays(data.plan && data.plan.days, gated.days),
-    splitPattern: gated.splitPattern !== undefined ? gated.splitPattern : (data.plan && data.plan.splitPattern),
-  });
-
-  // Shared by the immediate-apply path (no `days`, behaves exactly as
-  // before Task 6) and confirmPendingPlan (an authored plan, only
-  // reachable after the user has seen the diff and explicitly confirmed
-  // it — see pendingPlan below). Every applied plan gets a new,
-  // immutable planVersions entry regardless of which path it came
-  // through (Section 3: "every applied plan stored as a versioned
-  // record"), citing data.lastBrief as the originating brief.
+  // coach-apply-overhaul P0-2: the ONLY writer of an applied plan, reached
+  // only from confirmPendingPlan after the preview showed zero rejections.
+  // Every applied plan gets a new, immutable planVersions entry, citing
+  // data.lastBrief as the originating brief.
   const persistAppliedPlan = (gated, source) => {
-    const plan = buildPlanUpdate(gated);
+    const plan = planUpdateFrom(data, gated, todayISO());
     persist({
       ...data,
       goalProfile: currentProfile(),
       plan,
       focus: gated.focus,
       coachNote: {
-        assessment: "Applied from pasted Claude plan.", gates: gated.gates, calorieDelta: gated.calorieDelta,
+        assessment: gated.assessment || (source === "llm" ? "Applied from in-app check-in." : "Applied from pasted Claude plan."),
+        pushback: gated.pushback || [], nutritionNote: gated.nutritionNote, nextCheckIn: gated.nextCheckIn,
+        gates: gated.gates, calorieDelta: gated.calorieDelta,
         prescriptionRejections: gated.prescriptionRejections || [], prescriptionNotes: gated.prescriptionNotes || [],
         dayRejections: gated.dayRejections || [], dayNotes: gated.dayNotes || [],
         at: new Date().toISOString(),
@@ -5967,22 +6999,10 @@ function CoachCard({ data, persist }) {
       const raw = extractPlanJson(pasted);
       const metrics = coachMetrics(data);
       const gated = applyCoachGates(raw, metrics, injuryProfile, data);
-      setResult({ ...gated, assessment: gated.assessment || "Plan applied from pasted Claude reply.", pushback: gated.pushback || [], nutritionNote: gated.nutritionNote || "See Claude's reply for the reasoning.", nextCheckIn: gated.nextCheckIn || "Re-run a check-in in 2\u20134 weeks with fresh logs." });
-      if (Array.isArray(raw.days) && raw.days.length) {
-        // Task 6, Section 3: NEVER auto-apply an authored plan -- hold
-        // for explicit confirmation (diff shown below) instead of
-        // persisting immediately. Triggered by the RAW paste attempting
-        // day authorship at all, not just gated.days surviving — even a
-        // plan where every day got rejected must still show the user
-        // why, not silently fall through to the immediate-apply path
-        // below with the rejections unseen. A bare (no-days) paste keeps
-        // the pre-Task-6 immediate-apply behavior, unchanged, below.
-        setPendingPlan({ gated, diff: diffAuthoredPlan(gated.days, data) });
-        setPasted("");
-        return;
-      }
-      persistAppliedPlan(gated, "paste");
-      setApplied(true);
+      setResult({ ...gated, assessment: gated.assessment || "Plan from pasted Claude reply — review below before applying.", pushback: gated.pushback || [], nutritionNote: gated.nutritionNote || "See Claude's reply for the reasoning.", nextCheckIn: gated.nextCheckIn || "Re-run a check-in in 2\u20134 weeks with fresh logs." });
+      // coach-apply-overhaul P0-2: EVERY paste is held for review — no
+      // immediate-apply path remains. Nothing is written until Apply.
+      setPendingPlan({ gated, source: "paste", preview: buildPlanPreview(data, gated, todayISO()), diff: diffAuthoredPlan(gated.days, data) });
       setPasted("");
     } catch (e) {
       setErr("Couldn't parse a plan from that — paste Claude's full reply (it ends with a json block).");
@@ -5990,8 +7010,10 @@ function CoachCard({ data, persist }) {
   };
 
   const confirmPendingPlan = () => {
-    if (!pendingPlan) return;
-    persistAppliedPlan(pendingPlan.gated, "paste");
+    // Enforcement, not just the disabled button: any rejection anywhere
+    // in the plan means nothing is applied.
+    if (!pendingPlan || !pendingPlan.preview || !pendingPlan.preview.ok) return;
+    persistAppliedPlan(pendingPlan.gated, pendingPlan.source || "paste");
     setApplied(true);
     setPendingPlan(null);
   };
@@ -6011,23 +7033,15 @@ function CoachCard({ data, persist }) {
       const raw = await askCoachLLM(key, metrics, profile, injuryProfile);
       const gated = applyCoachGates(raw, metrics, injuryProfile, data);
       setResult(gated);
-      // save the goal profile immediately (plan applies only on user confirmation)
+      // Same review-then-apply path as a paste (P0-2). goalProfile is saved
+      // now; the plan only on Apply. The preview is computed against data
+      // as it stands BEFORE this persist — goalProfile doesn't affect it.
+      setPendingPlan({ gated, source: "llm", preview: buildPlanPreview(data, gated, todayISO()), diff: diffAuthoredPlan(gated.days, data) });
       persist({ ...data, goalProfile: profile });
     } catch (e) {
       setErr(e.message || "Analysis failed — try again.");
     }
     setBusy(false);
-  };
-
-  const applyPlan = () => {
-    if (!result) return;
-    persist({
-      ...data,
-      plan: { ...(data.plan || DEFAULT_PLAN), template: result.template, sessionMin: result.sessionMin, templateSince: todayISO() },
-      focus: result.focus,
-      coachNote: { assessment: result.assessment, pushback: result.pushback, gates: result.gates, calorieDelta: result.calorieDelta, nutritionNote: result.nutritionNote, nextCheckIn: result.nextCheckIn, at: new Date().toISOString() },
-    });
-    setApplied(true);
   };
 
   return (
@@ -6096,6 +7110,13 @@ function CoachCard({ data, persist }) {
               ? "Full mode: complete tagged library and full research corpus — this is large and \"Open in Claude\" will likely fall back to copy-to-clipboard."
               : "Check-in mode: your live program's exercises and the most relevant research only, kept small enough for a one-tap link."}
           </div>
+          {(data.weights || []).length < BW_TREND_MIN_WEIGHINS && (
+            <div style={{ background: "#FFF7EC", borderRadius: 10, padding: 10, marginTop: 10, fontSize: 12.5, lineHeight: 1.45 }}>
+              <b style={{ color: C.orange }}>No bodyweight trend yet</b> — {(data.weights || []).length} weigh-in{(data.weights || []).length !== 1 ? "s" : ""} logged,
+              {" "}{BW_TREND_MIN_WEIGHINS} needed. Weigh in daily (Log tab). Until there's a trend, a coach plan that raises calories by more than
+              +{CALORIE_INCREASE_NEEDS_TREND}/day won't apply.
+            </div>
+          )}
           <textarea
             style={{ ...S.input, minHeight: 60, resize: "vertical", marginTop: 10 }}
             placeholder="Paste Claude's full reply here to apply the plan…"
@@ -6111,7 +7132,7 @@ function CoachCard({ data, persist }) {
         </>
       )}
       {err && <div style={{ color: C.red, fontSize: 13, marginTop: 8, lineHeight: 1.4 }}>{err}</div>}
-      <PendingPlanDiff pendingPlan={pendingPlan} onConfirm={confirmPendingPlan} onDiscard={discardPendingPlan} />
+      <PlanPreview pendingPlan={pendingPlan} onConfirm={confirmPendingPlan} onDiscard={discardPendingPlan} />
 
       {result && (
         <div style={{ marginTop: 14 }}>
@@ -6158,11 +7179,11 @@ function CoachCard({ data, persist }) {
             <b>Nutrition:</b> {result.calorieDelta === 0 ? "hold current target" : `${result.calorieDelta > 0 ? "+" : ""}${result.calorieDelta} kcal/day`} — {result.nutritionNote}
           </div>
           <div style={{ fontSize: 13, marginTop: 6 }}><b>Watch next:</b> {result.nextCheckIn}</div>
-          <button style={{ ...S.pillBtn(applied ? C.green : C.blue), width: "100%", marginTop: 12 }} onClick={applyPlan}>
-            {applied ? "Plan applied ✓" : "Apply this plan"}
-          </button>
+          <div style={{ fontSize: 13, fontWeight: 700, marginTop: 12, color: applied ? C.green : C.sub }}>
+            {applied ? "Plan applied ✓" : pendingPlan ? "Review the preview above — nothing is applied until you tap Apply." : "Not applied."}
+          </div>
           <div style={{ fontSize: 12, color: C.sub, marginTop: 6, lineHeight: 1.4 }}>
-            Applying sets your split, session length, and focus sliders in one tap. Your logs are untouched.
+            Applying sets your split, session length, focus sliders, and prescriptions in one step — all or nothing. Your logs are untouched.
             Calorie changes: adjust manually in Fuel per the note above.
           </div>
         </div>
@@ -6227,10 +7248,10 @@ function Insights({ data, persist }) {
       )}
 
       {trained.map((ex) => {
-        const series = weeklySeries(data.sessions, ex.id);
+        const series = weeklySeries(data.sessions, ex.id, { weights: data.weights, confirmations: data.dataQualityConfirmations });
         const t = trendPct(series);
         const scheme = { repMin: ex.repMin || 8, repMax: ex.repMax || 12 };
-        const rec = recommend({ ...ex, ...scheme }, data.sessions);
+        const rec = recommend({ ...ex, ...scheme }, loadSessions(data));
         return (
           <div key={ex.id} style={S.card}>
             <div style={{ ...S.row, justifyContent: "space-between" }}>

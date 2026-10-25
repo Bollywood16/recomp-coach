@@ -3,3 +3,5 @@
 .env*
 /node_modules/
 recomp-coach-backup-*.json
+# Real user data for local-only replay tests — never committed.
+/scripts/fixtures/local/

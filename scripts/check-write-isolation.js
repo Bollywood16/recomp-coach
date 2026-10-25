@@ -49,6 +49,12 @@ const REVIEWED_READERS = [
   "gate2Injury",
   "gate4PainRule",
   "capAndSplitMovement",
+  // coach-apply-overhaul P0-3 (reviewed: read-only — pass injuryProfile
+  // straight to gate2Injury or read movementConstraints, never assign):
+  "exerciseGateStatus",
+  "gatingAttributes",
+  "formatExerciseLibraryCompact",
+  "programDaysLines",
 ];
 
 // Always checked regardless of its parameter list — the actual parser entry

@@ -1,0 +1,50 @@
+{
+  "app": "recomp-coach",
+  "version": 2,
+  "exportedAt": "2026-10-01T12:00:00.000Z",
+  "_comment": "SYNTHETIC — invented numbers, same shape as a real backup export. Real exports live only in scripts/fixtures/local/ (gitignored). Reproduces the conditions of the rejected coach apply: 11 logged weeks (past the 8-week specialization unlock, so the upperFocus template isn't overridden), upperFocus, arms=specialize, shoulders=emphasize, legs=maintain, csrow->machrow and legpress->goblet swaps, 3 weigh-ins (no bw slope), and two assisted pull-up rows where the effective load was typed into the assist field (2026-09-08, 2026-09-22).",
+  "data": {
+    "sessions": [
+      { "id": 901, "date": "2026-07-14", "exerciseId": "latpd", "sets": [{ "w": 100, "r": 12 }, { "w": 100, "r": 11 }, { "w": 100, "r": 10 }] },
+      { "id": 902, "date": "2026-07-21", "exerciseId": "latpd", "sets": [{ "w": 100, "r": 12 }, { "w": 100, "r": 12 }, { "w": 100, "r": 11 }] },
+      { "id": 903, "date": "2026-07-28", "exerciseId": "latpd", "sets": [{ "w": 105, "r": 11 }, { "w": 105, "r": 10 }, { "w": 105, "r": 10 }] },
+      { "id": 904, "date": "2026-08-04", "exerciseId": "latpd", "sets": [{ "w": 105, "r": 12 }, { "w": 105, "r": 11 }, { "w": 105, "r": 10 }] },
+      { "id": 905, "date": "2026-08-11", "exerciseId": "latpd", "sets": [{ "w": 110, "r": 11 }, { "w": 110, "r": 10 }, { "w": 110, "r": 10 }] },
+      { "id": 906, "date": "2026-08-18", "exerciseId": "latpd", "sets": [{ "w": 110, "r": 12 }, { "w": 110, "r": 11 }, { "w": 110, "r": 10 }] },
+      { "id": 1001, "date": "2026-08-25", "exerciseId": "bench", "sets": [{ "w": 135, "r": 8 }, { "w": 135, "r": 7 }, { "w": 135, "r": 6 }] },
+      { "id": 1002, "date": "2026-08-25", "exerciseId": "machrow", "sets": [{ "w": 120, "r": 10 }, { "w": 120, "r": 10 }, { "w": 120, "r": 9 }] },
+      { "id": 1003, "date": "2026-08-25", "exerciseId": "dbohp", "sets": [{ "w": 35, "r": 10 }, { "w": 35, "r": 9 }, { "w": 35, "r": 8 }] },
+      { "id": 1004, "date": "2026-08-25", "exerciseId": "pullup", "sets": [{ "w": 120, "r": 10, "assist": 40, "bw": 160 }, { "w": 120, "r": 9, "assist": 40, "bw": 160 }] },
+      { "id": 1005, "date": "2026-09-01", "exerciseId": "bench", "sets": [{ "w": 135, "r": 8 }, { "w": 135, "r": 8 }, { "w": 135, "r": 7 }] },
+      { "id": 1006, "date": "2026-09-01", "exerciseId": "machrow", "sets": [{ "w": 115, "r": 10 }, { "w": 115, "r": 9 }, { "w": 115, "r": 8 }] },
+      { "id": 1007, "date": "2026-09-01", "exerciseId": "dbohp", "sets": [{ "w": 35, "r": 10 }, { "w": 35, "r": 10 }, { "w": 35, "r": 9 }] },
+      { "id": 1008, "date": "2026-09-01", "exerciseId": "pullup", "sets": [{ "w": 130, "r": 10, "assist": 30, "bw": 160 }, { "w": 130, "r": 9, "assist": 30, "bw": 160 }] },
+      { "id": 1009, "date": "2026-09-08", "exerciseId": "bench", "sets": [{ "w": 140, "r": 7 }, { "w": 140, "r": 6 }, { "w": 140, "r": 6 }] },
+      { "id": 1010, "date": "2026-09-08", "exerciseId": "machrow", "sets": [{ "w": 110, "r": 10 }, { "w": 110, "r": 9 }, { "w": 110, "r": 8 }] },
+      { "id": 1011, "date": "2026-09-08", "exerciseId": "pullup", "sets": [{ "w": 50, "r": 10, "assist": 110, "bw": 160 }, { "w": 50, "r": 10, "assist": 110, "bw": 160 }] },
+      { "id": 1012, "date": "2026-09-15", "exerciseId": "machrow", "sets": [{ "w": 105, "r": 10 }, { "w": 105, "r": 9 }, { "w": 105, "r": 8 }] },
+      { "id": 1013, "date": "2026-09-15", "exerciseId": "pullup", "sets": [{ "w": 135, "r": 10, "assist": 25, "bw": 160 }, { "w": 135, "r": 8, "assist": 25, "bw": 160 }] },
+      { "id": 1014, "date": "2026-09-22", "exerciseId": "pullup", "sets": [{ "w": 30, "r": 10, "assist": 130, "bw": 158 }, { "w": 30, "r": 9, "assist": 130, "bw": 158 }] },
+      { "id": 1015, "date": "2026-09-22", "exerciseId": "ezcurl", "sets": [{ "w": 45, "r": 12 }, { "w": 45, "r": 10 }, { "w": 45, "r": 9 }] },
+      { "id": 1016, "date": "2026-09-22", "exerciseId": "reardelt", "sets": [{ "w": 10, "r": 15 }, { "w": 10, "r": 15 }] }
+    ],
+    "weights": [
+      { "date": "2026-08-25", "lbs": 160 },
+      { "date": "2026-09-08", "lbs": 159.4 },
+      { "date": "2026-09-22", "lbs": 158 }
+    ],
+    "swaps": { "csrow": "machrow", "legpress": "goblet" },
+    "nutrition": { "age": 30, "sex": "male", "heightIn": 70, "deskJob": true, "steps": 8000, "workouts": 4 },
+    "focus": { "shoulders": "emphasize", "arms": "specialize", "chest": "normal", "back": "normal", "legs": "maintain", "core": "normal" },
+    "plan": {
+      "template": "upperFocus",
+      "sessionMin": 60,
+      "templateSince": "2026-08-25",
+      "sessionRules": { "maxSetsPerMovement": 4, "weeklyGroupSetCaps": { "arms": 28, "shoulders": 20 } }
+    },
+    "phase": null,
+    "injuryProfile": null,
+    "briefTier": "full",
+    "_updatedAt": "2026-09-22T18:00:00.000Z"
+  }
+}

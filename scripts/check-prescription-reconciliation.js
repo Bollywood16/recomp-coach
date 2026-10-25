@@ -165,21 +165,46 @@ const upperA = () => app.PROGRAMS.balanced.find((d) => d.id === "upperA");
   const baseline = app.weeklySetsByGroup(data);
   ok("sanity: legs baseline is 26 as expected by this test's arithmetic", baseline.legs === 26, `got ${baseline.legs}`);
   ok("sanity: legs mav is 20 (baseline already at/above mav)", app.MUSCLE_GROUPS.legs.mav === 20);
-  const ctx = app.buildGateContext(data, {});
+  // coach-apply-overhaul P0-1 (Sean's change 3): the cap is no longer
+  // max(mav, baseline) — it's an explicit weeklyGroupSetCaps value, else
+  // mav. So this test's original "cap 26" is now stated explicitly; the
+  // netting arithmetic it proves (26 - 3 + 1 + 2 = 26) is unchanged.
+  const capped = { sessionRules: { weeklyGroupSetCaps: { legs: 26 } } };
+  const ctx = app.buildGateContext(data, capped);
   const result = app.applyGatedPrescriptions([
     { exerciseId: "legpress", dayKey: "lowerA", sets: 1 },   // REPLACE: 3 -> 1 (-2)
     { exerciseId: "hacksquat", dayKey: "lowerA", sets: 2 },  // ADD: +2
   ], ctx);
-  ok("both accepted (net-neutral volume change should not trip the cap)",
+  ok("both accepted (net-neutral volume change should not trip an explicit 26 cap)",
     result.accepted.length === 2 && result.rejections.length === 0,
+    JSON.stringify(result.rejections));
+  ok("projected legs stays at 26", result.weeklyGroupSetsAfter && result.weeklyGroupSetsAfter.legs === 26,
+    JSON.stringify(result.weeklyGroupSetsAfter));
+}
+// No explicit cap: falls back to mav (20) — NOT raised to the 26 baseline.
+// The same net-neutral change is rejected, and the over-cap baseline is
+// reported as a warning rather than silently becoming the ceiling.
+{
+  const data = baseData({});
+  const ctx = app.buildGateContext(data, {});
+  const result = app.applyGatedPrescriptions([
+    { exerciseId: "legpress", dayKey: "lowerA", sets: 1 },
+    { exerciseId: "hacksquat", dayKey: "lowerA", sets: 2 },
+  ], ctx);
+  ok("no explicit cap: legs prescriptions rejected against mav 20 (cap not raised to baseline)",
+    result.accepted.length === 0 && result.rejections.every((r) => r.gate === 6 && /20-set cap/.test(r.reason)),
     JSON.stringify(result.rejections));
 }
 // Negative control: prove the subtraction is actually doing something —
 // an ADD-only version of the same net change (no replace to offset it)
 // SHOULD be rejected, since it pushes legs to 26 + 2 = 28 > cap 26.
+// 75-minute session (P1-5): at 60 minutes Lower A is already at 56 min,
+// so the add's time cost makes the time-fit trim leg extension 3 -> 1
+// and the FITTED week stays at 26 — that's time-fit, not netting. 75 min
+// gives the add room, which is what this control is about.
 {
   const data = baseData({});
-  const ctx = app.buildGateContext(data, {});
+  const ctx = app.buildGateContext(data, { sessionMin: 75, sessionRules: { weeklyGroupSetCaps: { legs: 26 } } });
   const result = app.applyGatedPrescriptions([
     { exerciseId: "hacksquat", dayKey: "lowerA", sets: 2 }, // pure ADD, no offsetting replace
   ], ctx);

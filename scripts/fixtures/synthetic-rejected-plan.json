@@ -1,0 +1,30 @@
+{
+  "_comment": "SYNTHETIC coach plan modeled on the rejected apply (FIX_SPEC.md Background), goblet already removed. Arms prescriptions total 26 weekly sets and shoulders 16; every arm row on all three upper days is prescribed (pressdn on ufUpperA REPLACES the existing pressdn), plus one ADD (cablecurl). sessionRules repeats the stored caps (arms 28, shoulders 20) so they don't change.",
+  "template": "upperFocus",
+  "focus": { "shoulders": "emphasize", "arms": "specialize", "chest": "normal", "back": "normal", "legs": "maintain", "core": "normal" },
+  "sessionMin": 60,
+  "calorieDelta": 0,
+  "sessionRules": { "maxSetsPerMovement": 4, "weeklyGroupSetCaps": { "arms": 28, "shoulders": 20 } },
+  "prescriptions": [
+    { "exerciseId": "bench",    "dayKey": "ufUpperA", "sets": 3, "repMin": 6,  "repMax": 10 },
+    { "exerciseId": "machrow",  "dayKey": "ufUpperA", "sets": 3, "repMin": 8,  "repMax": 12 },
+    { "exerciseId": "dbohp",    "dayKey": "ufUpperA", "sets": 3, "repMin": 8,  "repMax": 12 },
+    { "exerciseId": "latpd",    "dayKey": "ufUpperA", "sets": 3, "repMin": 10, "repMax": 15 },
+    { "exerciseId": "curl",     "dayKey": "ufUpperA", "sets": 4, "repMin": 10, "repMax": 15 },
+    { "exerciseId": "pressdn",  "dayKey": "ufUpperA", "sets": 4, "repMin": 10, "repMax": 15 },
+
+    { "exerciseId": "ohp",      "dayKey": "ufUpperB", "sets": 3, "repMin": 6,  "repMax": 10 },
+    { "exerciseId": "pullup",   "dayKey": "ufUpperB", "sets": 3, "repMin": 6,  "repMax": 10 },
+    { "exerciseId": "cablerow", "dayKey": "ufUpperB", "sets": 3, "repMin": 10, "repMax": 15 },
+    { "exerciseId": "latraise", "dayKey": "ufUpperB", "sets": 3, "repMin": 12, "repMax": 20 },
+    { "exerciseId": "hammer",   "dayKey": "ufUpperB", "sets": 4, "repMin": 10, "repMax": 15 },
+    { "exerciseId": "cablecurl","dayKey": "ufUpperB", "sets": 3, "repMin": 10, "repMax": 15 },
+
+    { "exerciseId": "machohp",  "dayKey": "ufArms",   "sets": 3, "repMin": 8,  "repMax": 12 },
+    { "exerciseId": "cablelat", "dayKey": "ufArms",   "sets": 2, "repMin": 15, "repMax": 20 },
+    { "exerciseId": "reardelt", "dayKey": "ufArms",   "sets": 2, "repMin": 12, "repMax": 20, "load": 40 },
+    { "exerciseId": "ezcurl",   "dayKey": "ufArms",   "sets": 4, "repMin": 10, "repMax": 15 },
+    { "exerciseId": "skull",    "dayKey": "ufArms",   "sets": 4, "repMin": 10, "repMax": 15 },
+    { "exerciseId": "ohte",     "dayKey": "ufArms",   "sets": 3, "repMin": 10, "repMax": 15 }
+  ]
+}

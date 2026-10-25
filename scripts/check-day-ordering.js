@@ -67,13 +67,20 @@ const baseData = (overrides) => ({
   const firstArmsIdx = list.findIndex((e) => armsIds.includes(e.id));
   const firstShoulderIdx = list.findIndex((e) => shoulderIds.includes(e.id));
   ok("arms (specialize) exercises sequence before shoulders (emphasize) exercises, reversing the template's own declaration order", firstArmsIdx < firstShoulderIdx, JSON.stringify(list.map((e) => e.id)));
-  ok("all 3 arms exercises appear as a contiguous block ahead of all 3 shoulder exercises", list.slice(0, 3).every((e) => armsIds.includes(e.id)), JSON.stringify(list.map((e) => e.id)));
+  // P1-5: the arms block also holds the arms bonus lift(s) and any pool
+  // spawns, tie-broken by exerciseId — so assert the block, not "first 3".
+  const isArms = (e) => ["biceps", "triceps"].includes(e.cat);
+  const isShoulder = (e) => ["vpress", "delts"].includes(e.cat);
+  const lastArms = list.reduce((m, e, i) => (isArms(e) ? i : m), -1);
+  const firstShoulder = list.findIndex(isShoulder);
+  ok("every arms row (template, bonus, spawned) precedes every shoulder row", lastArms < firstShoulder, JSON.stringify(list.map((e) => e.id)));
 
-  // Same-rank tie-break: within arms, ezcurl/skull/ohte should keep their
-  // ORIGINAL relative template order (stable sort) since they're all the
-  // same emphasis rank and none is compound.
+  // Same-rank tie-break: as of coach-apply-overhaul P1-5 (FIX_SPEC 5e) ties
+  // break on the stable exerciseId, never template/array position — so
+  // within arms (all specialize isolation, none regressing) it's
+  // alphabetical by id, not template order.
   const armsOnly = list.filter((e) => armsIds.includes(e.id)).map((e) => e.id);
-  check("same-rank exercises (all of arms) keep their original template order (stable sort)", armsOnly, ["ezcurl", "skull", "ohte"]);
+  check("same-rank exercises (all of arms) tie-break by exerciseId, not template position", armsOnly, ["ezcurl", "ohte", "skull"]);
 }
 
 /* ===== 2. Authored days still order by their own explicit `order` ===== */
@@ -114,8 +121,23 @@ const baseData = (overrides) => ({
   const customEzcurl = customFit.list.find((e) => e.id === "ezcurl");
   const customMachohp = customFit.list.find((e) => e.id === "machohp");
 
-  ok("with a custom trimPriority naming specialize FIRST, the specialize-tier exercise (ezcurl) is cut MORE than under the default order", customEzcurl.sets < defaultEzcurl.sets, JSON.stringify({ default: defaultEzcurl.sets, custom: customEzcurl.sets }));
+  // coach-apply-overhaul P1-6: specialize keeps 100% of its sets as a
+  // HARD floor keyed on the literal level — a custom order naming
+  // specialize first can no longer cut it (same non-customizable design
+  // as Gate 13's maintain protection). The custom order still decides
+  // cuts among the non-floored tiers (see the normal/maintain case below).
+  ok("custom trimPriority naming specialize FIRST still can't cut the specialize lift (hard floor)", customEzcurl.sets === 6 && defaultEzcurl.sets === 6, JSON.stringify({ default: defaultEzcurl.sets, custom: customEzcurl.sets }));
   ok("machohp (compound, protected at floor 2 regardless of tier) is unaffected either way", defaultMachohp.sets >= 2 && customMachohp.sets >= 2);
+  {
+    const f2 = { legs: "maintain", core: "normal" };
+    const items = [{ ...app.EX_BY_ID.legcurl, sets: 8 }, { ...app.EX_BY_ID.cablecrunch, sets: 8 }];
+    const def = app.fitDayToTime(items.map((e) => ({ ...e })), 20, f2);
+    const cus = app.fitDayToTime(items.map((e) => ({ ...e })), 20, f2, ["normal", "maintain", "emphasize", "specialize"]);
+    const s = (fit, id) => fit.list.find((e) => e.id === id).sets;
+    ok("custom order still applies among non-floored tiers: default cuts maintain (legcurl) first, custom naming normal first cuts core first",
+      s(def, "legcurl") < s(def, "cablecrunch") && s(cus, "cablecrunch") < s(cus, "legcurl"),
+      JSON.stringify({ def: def.list.map((e) => `${e.id}:${e.sets}`), cus: cus.list.map((e) => `${e.id}:${e.sets}`) }));
+  }
 
   // Floor coherence: groupTrimFloors under the custom order should give
   // "maintain" (now RANKED LAST in customOrder = position 3, the
