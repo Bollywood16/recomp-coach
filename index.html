@@ -1299,7 +1299,8 @@ function stallScore(data) {
   );
   let eligible = 0, stalled = 0;
   lifts.forEach((ex) => {
-    const series = weeklySeries(data.sessions, ex.id);
+    // P2-8: possible-data-error weeks excluded until confirmed.
+    const { series } = trustedSeries(data.sessions, ex.id, data.dataQualityConfirmations);
     if (series.length < 3) return;
     eligible++;
     const recent = series.slice(-3);
@@ -1922,6 +1923,56 @@ function weeklySeries(sessions, exId) {
   return Object.values(byWeek).sort((a, b) => (a.week < b.week ? -1 : 1));
 }
 
+/* ===== Data-quality flags (coach-apply-overhaul P2-8) =====
+   Warnings, never silent fixes. A weekly e1RM that drops more than 30%
+   below the best of the previous < 3 weeks is far more likely a logging
+   error (wrong field, wrong unit, per-hand vs total) than real strength
+   loss, so it's flagged "possible data error" and EXCLUDED from trend-
+   based decisions (stall count, regressing) until the user confirms it's
+   real (data.dataQualityConfirmations[id]) or corrects the log. The raw
+   series is never altered — charts still show every point. A flagged,
+   unconfirmed point never serves as the reference for a later one. */
+const DATA_ERROR_DROP_PCT = 0.30;
+const DATA_ERROR_WINDOW_DAYS = 21;
+const dataPointId = (exId, week) => `${exId}|${week}`;
+const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+
+function e1rmDataFlags(series, exId, confirmations) {
+  const flags = [];
+  const excluded = new Set();
+  series.forEach((p, i) => {
+    const refs = series.slice(0, i).filter((q) => !excluded.has(q.week) && daysBetween(q.week, p.week) < DATA_ERROR_WINDOW_DAYS);
+    if (!refs.length) return;
+    const ref = refs.reduce((m, q) => (q.e1 > m.e1 ? q : m));
+    if (p.e1 < ref.e1 * (1 - DATA_ERROR_DROP_PCT)) {
+      const id = dataPointId(exId, p.week);
+      const confirmed = !!(confirmations && confirmations[id]);
+      flags.push({ id, exId, week: p.week, e1: p.e1, refWeek: ref.week, refE1: ref.e1,
+        dropPct: Math.round((1 - p.e1 / ref.e1) * 100), confirmed });
+      if (!confirmed) excluded.add(p.week);
+    }
+  });
+  return flags;
+}
+
+/* weeklySeries minus unconfirmed possible-data-error points — the input
+   every trend DECISION reads (stallScore, isRegressing, coachMetrics). */
+function trustedSeries(sessions, exId, confirmations) {
+  const series = weeklySeries(sessions || [], exId);
+  const flags = e1rmDataFlags(series, exId, confirmations);
+  const drop = new Set(flags.filter((f) => !f.confirmed).map((f) => f.week));
+  return { series: series.filter((p) => !drop.has(p.week)), flags };
+}
+
+/* Every unconfirmed flag across trained lifts, newest first (Progress card, brief). */
+function dataQualityFlags(data) {
+  const sessions = data.sessions || [];
+  const ids = [...new Set(sessions.map((s) => s.exerciseId))];
+  return ids.flatMap((id) => trustedSeries(sessions, id, data.dataQualityConfirmations).flags)
+    .filter((f) => !f.confirmed)
+    .sort((a, b) => (a.week < b.week ? 1 : -1));
+}
+
 /* Resolve a program slot through any active swap. The resolved exercise keeps
    the slot's set/rep scheme so the day's structure is preserved. */
 function resolveSlot(slot, swaps, focus) {
@@ -2238,8 +2289,8 @@ const ORDER_SPECIALIZE_SHARE = 0.4;
 const REGRESSING_TREND_PCT = -5;
 const REGRESSING_MIN_WEEKS = 3;
 
-function isRegressing(sessions, exId) {
-  const t = trendPct(weeklySeries(sessions || [], exId));
+function isRegressing(sessions, exId, confirmations) {
+  const t = trendPct(trustedSeries(sessions, exId, confirmations).series); // P2-8
   return !!t && t.weeks >= REGRESSING_MIN_WEEKS && t.pct <= REGRESSING_TREND_PCT;
 }
 
@@ -2284,7 +2335,7 @@ function orderDay(entries, ctx) {
   const sessions = (ctx && ctx.sessions) || [];
   const exs = entries.map((e) => e.ex);
   const overrideGroup = specializationOverrideGroup(exs, focus);
-  const regressing = new Map(exs.map((ex) => [ex.id, isRegressing(sessions, ex.id)]));
+  const regressing = new Map(exs.map((ex) => [ex.id, isRegressing(sessions, ex.id, ctx && ctx.dataQualityConfirmations)]));
   const key = (ex) => [
     overrideGroup && CAT_TO_GROUP[ex.cat] === overrideGroup ? 0 : 1, // (a)
     isCompound(ex) ? 0 : 1,                                          // (b)
@@ -2365,7 +2416,7 @@ function resolveDayExercises(day, data) {
     const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
     // Authored days: the coach's `order` is the coach order (g); no rehab
     // template pins (no templateDay) — the coach authored the whole day.
-    return finishDayOrder(splitList, notes, { focus: data.focus || DEFAULT_FOCUS, sessions: data.sessions });
+    return finishDayOrder(splitList, notes, { focus: data.focus || DEFAULT_FOCUS, sessions: data.sessions, dataQualityConfirmations: data.dataQualityConfirmations });
   }
   // coach-apply-overhaul P0-1: for a (day, group) the coach has prescribed,
   // the prescriptions define that group's volume on that day — no bonus
@@ -2456,7 +2507,7 @@ function resolveDayExercises(day, data) {
   const cap = (data.plan && data.plan.sessionRules && data.plan.sessionRules.maxSetsPerMovement) ?? DEFAULT_MAX_SETS_PER_MOVEMENT;
   const injuryProfile = data.injuryProfile || DEFAULT_INJURY_PROFILE;
   const { list: splitList, notes } = capAndSplitMovement(list, cap, injuryProfile);
-  return finishDayOrder(splitList, notes, { focus, sessions: data.sessions, templateDay: day });
+  return finishDayOrder(splitList, notes, { focus, sessions: data.sessions, templateDay: day, dataQualityConfirmations: data.dataQualityConfirmations });
 }
 
 /* Shared tail of both resolveDayExercises branches: order the complete
@@ -3303,6 +3354,14 @@ function runPrescriptionGates(prescription, ctx) {
   let value = prescription;
   const notes = [];
 
+  // P2-8 (Sean's change 2): judged on the coach's RAW load, before Gate 3's
+  // +15% clamp can change it — a 4x mismatch usually means the LOG is
+  // wrong (e.g. reverse pec-deck logged 10 vs prescribed 40), which the
+  // clamp alone would quietly paper over. Warning only, never a reject.
+  const rawLoad = prescription.load;
+  const lastLogged = rawLoad != null ? lastWorkingWeight(ctx.sessions || [], prescription.exerciseId) : null;
+  const loadMismatch = rawLoad != null && lastLogged > 0 && (rawLoad > lastLogged * 2 || rawLoad < lastLogged * 0.5);
+
   const g3 = gate3LoadSanity(value, ctx);
   if (g3.value) value = g3.value;
   if (g3.note) notes.push({ gate: 3, note: g3.note });
@@ -3318,6 +3377,15 @@ function runPrescriptionGates(prescription, ctx) {
   const clamped = clampSchemeToTopLoad(value);
   value = clamped.value;
   if (clamped.note) notes.push({ gate: "scheme", note: clamped.note });
+
+  if (loadMismatch) {
+    const name = (EX_BY_ID[prescription.exerciseId] || {}).name || prescription.exerciseId;
+    const ratio = Math.round((rawLoad / lastLogged) * 10) / 10;
+    const applied = value.load != null ? `${value.load} lb` : "engine-recommended";
+    value = { ...value, loadUnverified: true };
+    notes.push({ gate: "load-sanity", rawLoad, appliedLoad: value.load ?? null, lastLogged,
+      note: `"${name}": coach prescribed ${rawLoad} lb — ${ratio}× your last logged ${lastLogged} lb. Unverified: check that log entry. Applied: ${applied}${value.load !== rawLoad ? ` (raw ${rawLoad} lb)` : ""}.` });
+  }
 
   return { accepted: true, value, notes };
 }
@@ -4207,7 +4275,7 @@ function App() {
     <div style={S.app}>
       {tab === "today" && <WorkoutFlow data={data} persist={persist} />}
       {tab === "log" && <Log data={data} persist={persist} loaded={loaded} sbUser={sbUser} syncStatus={syncStatus} onSignedIn={onSignedIn} onSignedOut={onSignedOut} />}
-      {tab === "progress" && <Progress data={data} />}
+      {tab === "progress" && <Progress data={data} persist={persist} />}
       {tab === "insights" && <Insights data={data} persist={persist} />}
       {tab === "fuel" && <Fuel data={data} persist={persist} />}
       {tab === "focus" && <Focus data={data} persist={persist} />}
@@ -5714,7 +5782,38 @@ function Log({ data, persist, loaded, sbUser, syncStatus, onSignedIn, onSignedOu
 
 /* ============================ PROGRESS ============================ */
 
-function Progress({ data }) {
+/* coach-apply-overhaul P2-8: one card listing every unconfirmed "possible
+   data error" week. Confirming records data.dataQualityConfirmations[id]
+   so the week counts again; correcting the log (Log tab) removes the flag
+   on its own. Nothing here edits a session. */
+function DataQualityCard({ data, persist }) {
+  const flags = dataQualityFlags(data);
+  if (!flags.length) return null;
+  const confirm = (id) => persist({
+    ...data,
+    dataQualityConfirmations: { ...(data.dataQualityConfirmations || {}), [id]: { confirmedAt: new Date().toISOString() } },
+  });
+  return (
+    <div style={{ ...S.card, background: "#FFF7EC" }}>
+      <div style={{ fontWeight: 700, fontSize: 14, color: C.orange }}>Possible data error{flags.length !== 1 ? "s" : ""}</div>
+      <div style={{ fontSize: 12.5, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
+        A drop of more than 30% within 3 weeks is usually a logging slip, so these weeks are left out of stall and trend
+        decisions until you confirm them — or fix the entry in the Log tab.
+      </div>
+      {flags.map((f) => (
+        <div key={f.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
+          <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+            <b>{(EX_BY_ID[f.exId] || {}).name || f.exId}</b> · week of {shortDate(f.week)}<br />
+            e1RM {Math.round(f.e1)} vs {Math.round(f.refE1)} on {shortDate(f.refWeek)} (−{f.dropPct}%)
+          </div>
+          <button style={S.smallPill()} onClick={() => confirm(f.id)}>It's real</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Progress({ data, persist }) {
   const trained = ALL_KNOWN.filter((ex) => data.sessions.some((s) => s.exerciseId === ex.id));
   const [view, setView] = useState("overview");
   const [query, setQuery] = useState("");
@@ -5789,6 +5888,7 @@ function Progress({ data }) {
         <button style={S.chip(view === "overview")} onClick={() => setView("overview")}>Overview</button>
         <button style={S.chip(view === "charts")} onClick={() => setView("charts")}>Charts</button>
       </div>
+      {persist && <DataQualityCard data={data} persist={persist} />}
 
       {trained.length === 0 && (
         <div style={{ ...S.card, color: C.sub, fontSize: 14 }}>
@@ -5897,7 +5997,9 @@ function coachMetrics(data) {
   const sessions = data.sessions || [];
   const trained = ALL_KNOWN.filter((ex) => sessions.some((s) => s.exerciseId === ex.id));
   const lifts = trained.map((ex) => {
-    const series = weeklySeries(sessions, ex.id);
+    // P2-8: trend/stall from the trusted series (possible-data-error weeks
+    // excluded until confirmed); the flags themselves go in dataFlags below.
+    const { series } = trustedSeries(sessions, ex.id, data.dataQualityConfirmations);
     const t = trendPct(series);
     const stalled = series.length >= 3 &&
       series[series.length - 1].e1 <= series[series.length - 3].e1 * 1.005;
@@ -5930,6 +6032,8 @@ function coachMetrics(data) {
     deloadActive: deloadActive(data),
     // P0-4: the real per-group weekly baseline the coach must plan against.
     weeklySets: weeklySetsByGroup(data),
+    // P2-8: unconfirmed possible data errors, excluded from trends above.
+    dataFlags: dataQualityFlags(data).map((f) => `${f.exId} wk ${f.week}: e1RM ${Math.round(f.e1)} vs ${Math.round(f.refE1)} (-${f.dropPct}%) — possible data error, excluded until confirmed`),
   };
 }
 

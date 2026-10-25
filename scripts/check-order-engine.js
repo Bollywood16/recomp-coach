@@ -67,8 +67,12 @@ ok("bench is not regressing", !app.isRegressing(data.sessions, "bench"));
     list.slice(firstIso).every((e) => !["vpress", "hpress", "hpull", "vpull"].includes(e.ex.cat)), ids(list).join(" "));
   ok("Upper B: arms isolation (specialize) before shoulder isolation (emphasize)",
     pos(list, "hammer") < pos(list, "latraise"), ids(list).join(" "));
-  ok("Upper B: regressing pull-up first among the normal back/chest compounds",
-    pos(list, "pullup") < pos(list, "cablerow") && pos(list, "pullup") < pos(list, "incdb"), ids(list).join(" "));
+  // P2-8: the fixture's pull-up only "regressed" because of its two
+  // mistyped assisted rows; those weeks are possible-data-errors now, so
+  // the pull-up is NOT regressing and the normal compounds tie-break by id.
+  ok("Upper B: pull-up not regressing once its data-error weeks are excluded", !app.isRegressing(data.sessions, "pullup", {}));
+  ok("Upper B: normal back/chest compounds then tie-break by exerciseId (cablerow, incdb, pullup)",
+    pos(list, "cablerow") < pos(list, "incdb") && pos(list, "incdb") < pos(list, "pullup"), ids(list).join(" "));
 }
 
 /* (e) Determinism: no tie depends on insertion order. */

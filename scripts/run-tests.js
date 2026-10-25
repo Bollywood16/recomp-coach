@@ -53,6 +53,7 @@ const SCRIPTS = [
   "check-order-engine.js",
   "check-time-fit.js",
   "check-max-sets-apply.js",
+  "check-data-quality-flags.js",
 ];
 
 const ASSERTION_RE = /(\d+)\s+assertions/;
