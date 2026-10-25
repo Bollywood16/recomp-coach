@@ -48,6 +48,7 @@ const SCRIPTS = [
   "check-day-ordering.js",
   "check-coach-brief-contract.js",
   "check-coach-apply-replay.js",
+  "check-atomic-apply.js",
 ];
 
 const ASSERTION_RE = /(\d+)\s+assertions/;

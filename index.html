@@ -3287,7 +3287,7 @@ function buildGateContext(data, plan) {
     return dayCache[dayKey].filter((entry) => entry.ex.id === exerciseId);
   };
   // Gate 6's projection: the week as it would render once this plan is
-  // stored. Mirrors what CoachCard's buildPlanUpdate persists (template,
+  // stored. Mirrors what planUpdateFrom persists (template,
   // sessionMin, sessionRules, focus, and `prescriptions` as a full
   // snapshot — wholesale replacement, not a merge).
   const projectWeek = (prescriptions) => weeklySetsByGroup({
@@ -3639,6 +3639,72 @@ function pushPlanVersion(data, plan, brief, source, revertedFrom) {
   const entry = { id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, at: new Date().toISOString(), brief: brief || null, plan, source: source || "paste" };
   if (revertedFrom) entry.revertedFrom = revertedFrom;
   return [...(data.planVersions || []), entry].slice(-25);
+}
+
+/* Task 6, Section 3: `days` merges per-dayKey rather than wholesale-
+   replacing like `prescriptions` does — an earlier paste's authored day
+   for a dayKey THIS paste doesn't mention stays in effect. (Moved out of
+   CoachCard for coach-apply-overhaul P0-2 so the preview and the persist
+   build the plan through one function.) */
+function mergeAuthoredDays(existingDays, acceptedDays) {
+  if (!acceptedDays || !acceptedDays.length) return existingDays;
+  const byKey = new Map((existingDays || []).map((d) => [d.dayKey, d]));
+  acceptedDays.forEach((d) => byKey.set(d.dayKey, d));
+  return [...byKey.values()];
+}
+
+/* The exact data.plan an applied gated plan persists — shared by
+   CoachCard's persist and buildPlanPreview, so the preview can't show a
+   plan different from the one Apply writes. `prescriptions` is a full
+   snapshot (a paste without them clears stored ones — the preview's
+   before/after makes that visible). */
+function planUpdateFrom(data, gated, today) {
+  return {
+    ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: today,
+    prescriptions: gated.prescriptions || undefined,
+    sessionRules: gated.sessionRules || undefined,
+    days: mergeAuthoredDays(data.plan && data.plan.days, gated.days),
+    splitPattern: gated.splitPattern !== undefined ? gated.splitPattern : (data.plan && data.plan.splitPattern),
+  };
+}
+
+/* coach-apply-overhaul P0-2: atomic apply. Every gate rejection in a
+   paste — prescription or authored day — blocks the WHOLE apply; nothing
+   is written until the user taps Apply on a plan with zero rejections.
+   This builds what the preview shows from the same functions render uses
+   (planUpdateFrom -> resolveDayExercises -> fitDayToTime), so "what you
+   see" and "what Apply writes" are one computation.
+   ok is the only thing confirmPendingPlan trusts — the disabled button
+   is UI, this is the enforcement. */
+function buildPlanPreview(data, gated, today) {
+  const rejections = [
+    ...(gated.prescriptionRejections || []).map((r) => ({ ...r, kind: "prescription" })),
+    ...(gated.dayRejections || []).map((r) => ({ ...r, kind: "day" })),
+  ];
+  const projected = { ...data, focus: gated.focus || data.focus, plan: planUpdateFrom(data, gated, today || todayISO()) };
+  const before = weeklySetsByGroup(data);
+  const after = weeklySetsByGroup(projected);
+  const caps = (gated.sessionRules && gated.sessionRules.weeklyGroupSetCaps) || {};
+  const groups = Object.keys(MUSCLE_GROUPS).map((g) => {
+    const cap = caps[g] != null ? caps[g] : MUSCLE_GROUPS[g].mav;
+    return { group: g, name: MUSCLE_GROUPS[g].name, before: before[g] || 0, after: after[g] || 0, cap, overCap: (after[g] || 0) > cap };
+  });
+  const sessionMin = (projected.plan && projected.plan.sessionMin) || 60;
+  const days = getProgram(projected).map((day) => {
+    const entries = resolveDayExercises(day, projected);
+    const fit = fitDayToTime(entries.map((e) => e.ex), sessionMin, projected.focus, trimPriorityOf(projected));
+    return {
+      dayKey: day.id, name: day.name, minutes: fit.minutes, dropped: fit.dropped,
+      exercises: fit.list.map((ex) => ({ id: ex.id, name: ex.name, sets: ex.sets, prescribed: !!ex.prescribed, isBonus: !!ex.isBonus })),
+      maxSetsNotes: entries.maxSetsNotes || [],
+    };
+  });
+  const notes = [
+    ...(gated.gates || []).map((g) => ({ gate: "plan", note: g })),
+    ...(gated.prescriptionNotes || []).filter((n) => n.gate !== "reconcile"),
+    ...(gated.dayNotes || []),
+  ];
+  return { ok: rejections.length === 0, rejections, groups, days, notes, deloadActive: deloadActive(data) };
 }
 
 
@@ -5847,28 +5913,13 @@ Respond ONLY with JSON, no markdown fences:
    applyPasted/confirmPendingPlan in CoachCard). Rendered whenever
    pendingPlan is non-null; nothing here has a side effect on its own —
    discarding (closing the tab, tapping Discard) leaves data untouched. */
-function PendingPlanDiff({ pendingPlan, onConfirm, onDiscard }) {
-  if (!pendingPlan) return null;
-  const { gated, diff } = pendingPlan;
-  const acceptedCount = (gated.days || []).length;
-  const rejectedCount = (gated.dayRejections || []).length;
+/* coach-apply-overhaul P0-2: authored-day diff, now one section inside
+   PlanPreview (which owns the header, rejections, and Apply/Cancel). */
+function AuthoredDayDiff({ diff }) {
+  if (!diff || !diff.length) return null;
   return (
-    <div style={{ ...S.card, background: "#FFF7EC", marginTop: 10 }}>
-      <div style={{ fontWeight: 700, fontSize: 14, color: C.orange }}>Review before applying</div>
-      <div style={{ fontSize: 12.5, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
-        This reply authors full day{acceptedCount + rejectedCount !== 1 ? "s" : ""} — nothing is saved until you
-        confirm below.
-      </div>
-      {rejectedCount > 0 && (
-        <div style={{ marginTop: 10, background: "#FDECEC", borderRadius: 10, padding: 10 }}>
-          <div style={{ fontWeight: 700, fontSize: 12.5, color: C.red }}>
-            {rejectedCount} day{rejectedCount !== 1 ? "s" : ""} rejected, not applied
-          </div>
-          {gated.dayRejections.map((r, i) => (
-            <div key={i} style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>{r.reason}</div>
-          ))}
-        </div>
-      )}
+    <div>
+      <div style={{ fontWeight: 700, fontSize: 12.5, color: C.sub, marginTop: 12 }}>AUTHORED DAYS — CHANGES</div>
       {diff.map((d) => {
         const empty = !d.diff.added.length && !d.diff.removed.length && !d.diff.changed.length && !d.diff.reordered.length;
         return (
@@ -5898,10 +5949,93 @@ function PendingPlanDiff({ pendingPlan, onConfirm, onDiscard }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/* coach-apply-overhaul P0-2: the single review-and-apply surface for
+   every coach plan (paste or in-app check-in). Shows per-group weekly
+   sets before -> after, each day's final ordered list (exactly what the
+   day will render), every rejection with its gate and reason, and the
+   non-blocking notes. Apply is disabled on any rejection; Cancel writes
+   nothing. Content comes from buildPlanPreview — no logic here. */
+function PlanPreview({ pendingPlan, onConfirm, onDiscard }) {
+  if (!pendingPlan || !pendingPlan.preview) return null;
+  const { preview, diff } = pendingPlan;
+  const nRej = preview.rejections.length;
+  const changed = (g) => g.before !== g.after;
+  return (
+    <div style={{ ...S.card, background: nRej ? "#FDECEC" : "#FFF7EC", marginTop: 10 }}>
+      <div style={{ fontWeight: 700, fontSize: 14, color: nRej ? C.red : C.orange }}>
+        {nRej ? `Nothing will be applied — ${nRej} rejection${nRej !== 1 ? "s" : ""}` : "Review before applying"}
+      </div>
+      <div style={{ fontSize: 12.5, color: C.sub, marginTop: 4, lineHeight: 1.4 }}>
+        {nRej
+          ? "A plan applies all-or-nothing. Fix the rejected items (or ask Claude to) and paste again."
+          : "Nothing is saved until you tap Apply. The whole plan applies at once."}
+      </div>
+
+      {nRej > 0 && (
+        <div style={{ marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 12.5, color: C.red }}>Rejected</div>
+          {preview.rejections.map((r, i) => (
+            <div key={i} style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>
+              Gate {r.gate}{r.kind === "day" ? " (day)" : ""} — {r.reason}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
+        <div style={{ fontWeight: 700, fontSize: 12.5, color: C.sub }}>
+          WEEKLY SETS {nRej ? "(accepted part only — not applied)" : "BEFORE → AFTER"}
+        </div>
+        {preview.groups.map((g) => (
+          <div key={g.group} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginTop: 4, fontWeight: changed(g) ? 700 : 400 }}>
+            <span>{g.name}</span>
+            <span style={{ color: g.overCap ? C.red : C.text }}>
+              {g.before} → {g.after}<span style={{ color: C.sub, fontWeight: 400 }}> / cap {g.cap}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {preview.days.map((d) => (
+        <div key={d.dayKey} style={{ marginTop: 8, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700 }}>
+            <span>{d.name}</span><span style={{ color: C.sub, fontWeight: 400 }}>~{d.minutes} min</span>
+          </div>
+          <div style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.5 }}>
+            {d.exercises.map((ex, i) => (
+              <div key={`${ex.id}${i}`}>
+                {i + 1}. {ex.name} — {ex.sets} set{ex.sets !== 1 ? "s" : ""}
+                {ex.prescribed && <span style={{ color: C.blue }}> · coach</span>}
+                {ex.isBonus && <span style={{ color: C.sub }}> · bonus</span>}
+              </div>
+            ))}
+            {d.dropped.length > 0 && <div style={{ color: C.orange }}>Dropped to fit time: {d.dropped.join(", ")}</div>}
+          </div>
+        </div>
+      ))}
+
+      <AuthoredDayDiff diff={diff} />
+
+      {preview.notes.length > 0 && (
+        <div style={{ marginTop: 10, background: "#fff", borderRadius: 10, padding: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 12.5, color: C.orange }}>Notes</div>
+          {preview.notes.map((n, i) => (
+            <div key={i} style={{ fontSize: 12, color: "#3A3A3C", marginTop: 4, lineHeight: 1.4 }}>{n.note}</div>
+          ))}
+        </div>
+      )}
+      {preview.deloadActive && (
+        <div style={{ fontSize: 12, color: C.sub, marginTop: 8 }}>Deload week active — sets and loads above are scaled down when each day renders.</div>
+      )}
+
       <div style={{ ...S.row, marginTop: 12 }}>
-        <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} onClick={onDiscard}>Discard</button>
-        <button style={{ ...S.pillBtn(C.green), flex: 1 }} disabled={acceptedCount === 0} onClick={onConfirm}>
-          {acceptedCount === 0 ? "Nothing to apply" : "Confirm & apply"}
+        <button style={{ ...S.pillBtn("#E9E9EB", C.text), flex: 1 }} onClick={onDiscard}>Cancel</button>
+        <button style={{ ...S.pillBtn(preview.ok ? C.green : "#C7C7CC"), flex: 1 }} disabled={!preview.ok} onClick={onConfirm}>
+          {preview.ok ? "Apply" : "Can't apply"}
         </button>
       </div>
     </div>
@@ -6034,42 +6168,21 @@ function CoachCard({ data, persist }) {
     window.open(url, "_blank");
   };
 
-  // Task 6, Section 3: `days` merges per-dayKey rather than wholesale-
-  // replacing like `prescriptions` does — an earlier paste's authored day
-  // for a dayKey THIS paste doesn't mention stays in effect. Omission
-  // means no change, same "loud on a real change, silent on omission"
-  // principle sessionRules already follows (mergeSessionRules).
-  const mergeAuthoredDays = (existingDays, acceptedDays) => {
-    if (!acceptedDays || !acceptedDays.length) return existingDays;
-    const byKey = new Map((existingDays || []).map((d) => [d.dayKey, d]));
-    acceptedDays.forEach((d) => byKey.set(d.dayKey, d));
-    return [...byKey.values()];
-  };
-
-  const buildPlanUpdate = (gated) => ({
-    ...(data.plan || DEFAULT_PLAN), template: gated.template, sessionMin: gated.sessionMin, templateSince: todayISO(),
-    prescriptions: gated.prescriptions || undefined,
-    sessionRules: gated.sessionRules || undefined,
-    days: mergeAuthoredDays(data.plan && data.plan.days, gated.days),
-    splitPattern: gated.splitPattern !== undefined ? gated.splitPattern : (data.plan && data.plan.splitPattern),
-  });
-
-  // Shared by the immediate-apply path (no `days`, behaves exactly as
-  // before Task 6) and confirmPendingPlan (an authored plan, only
-  // reachable after the user has seen the diff and explicitly confirmed
-  // it — see pendingPlan below). Every applied plan gets a new,
-  // immutable planVersions entry regardless of which path it came
-  // through (Section 3: "every applied plan stored as a versioned
-  // record"), citing data.lastBrief as the originating brief.
+  // coach-apply-overhaul P0-2: the ONLY writer of an applied plan, reached
+  // only from confirmPendingPlan after the preview showed zero rejections.
+  // Every applied plan gets a new, immutable planVersions entry, citing
+  // data.lastBrief as the originating brief.
   const persistAppliedPlan = (gated, source) => {
-    const plan = buildPlanUpdate(gated);
+    const plan = planUpdateFrom(data, gated, todayISO());
     persist({
       ...data,
       goalProfile: currentProfile(),
       plan,
       focus: gated.focus,
       coachNote: {
-        assessment: "Applied from pasted Claude plan.", gates: gated.gates, calorieDelta: gated.calorieDelta,
+        assessment: gated.assessment || (source === "llm" ? "Applied from in-app check-in." : "Applied from pasted Claude plan."),
+        pushback: gated.pushback || [], nutritionNote: gated.nutritionNote, nextCheckIn: gated.nextCheckIn,
+        gates: gated.gates, calorieDelta: gated.calorieDelta,
         prescriptionRejections: gated.prescriptionRejections || [], prescriptionNotes: gated.prescriptionNotes || [],
         dayRejections: gated.dayRejections || [], dayNotes: gated.dayNotes || [],
         at: new Date().toISOString(),
@@ -6084,22 +6197,10 @@ function CoachCard({ data, persist }) {
       const raw = extractPlanJson(pasted);
       const metrics = coachMetrics(data);
       const gated = applyCoachGates(raw, metrics, injuryProfile, data);
-      setResult({ ...gated, assessment: gated.assessment || "Plan applied from pasted Claude reply.", pushback: gated.pushback || [], nutritionNote: gated.nutritionNote || "See Claude's reply for the reasoning.", nextCheckIn: gated.nextCheckIn || "Re-run a check-in in 2\u20134 weeks with fresh logs." });
-      if (Array.isArray(raw.days) && raw.days.length) {
-        // Task 6, Section 3: NEVER auto-apply an authored plan -- hold
-        // for explicit confirmation (diff shown below) instead of
-        // persisting immediately. Triggered by the RAW paste attempting
-        // day authorship at all, not just gated.days surviving — even a
-        // plan where every day got rejected must still show the user
-        // why, not silently fall through to the immediate-apply path
-        // below with the rejections unseen. A bare (no-days) paste keeps
-        // the pre-Task-6 immediate-apply behavior, unchanged, below.
-        setPendingPlan({ gated, diff: diffAuthoredPlan(gated.days, data) });
-        setPasted("");
-        return;
-      }
-      persistAppliedPlan(gated, "paste");
-      setApplied(true);
+      setResult({ ...gated, assessment: gated.assessment || "Plan from pasted Claude reply — review below before applying.", pushback: gated.pushback || [], nutritionNote: gated.nutritionNote || "See Claude's reply for the reasoning.", nextCheckIn: gated.nextCheckIn || "Re-run a check-in in 2\u20134 weeks with fresh logs." });
+      // coach-apply-overhaul P0-2: EVERY paste is held for review — no
+      // immediate-apply path remains. Nothing is written until Apply.
+      setPendingPlan({ gated, source: "paste", preview: buildPlanPreview(data, gated, todayISO()), diff: diffAuthoredPlan(gated.days, data) });
       setPasted("");
     } catch (e) {
       setErr("Couldn't parse a plan from that — paste Claude's full reply (it ends with a json block).");
@@ -6107,8 +6208,10 @@ function CoachCard({ data, persist }) {
   };
 
   const confirmPendingPlan = () => {
-    if (!pendingPlan) return;
-    persistAppliedPlan(pendingPlan.gated, "paste");
+    // Enforcement, not just the disabled button: any rejection anywhere
+    // in the plan means nothing is applied.
+    if (!pendingPlan || !pendingPlan.preview || !pendingPlan.preview.ok) return;
+    persistAppliedPlan(pendingPlan.gated, pendingPlan.source || "paste");
     setApplied(true);
     setPendingPlan(null);
   };
@@ -6128,23 +6231,15 @@ function CoachCard({ data, persist }) {
       const raw = await askCoachLLM(key, metrics, profile, injuryProfile);
       const gated = applyCoachGates(raw, metrics, injuryProfile, data);
       setResult(gated);
-      // save the goal profile immediately (plan applies only on user confirmation)
+      // Same review-then-apply path as a paste (P0-2). goalProfile is saved
+      // now; the plan only on Apply. The preview is computed against data
+      // as it stands BEFORE this persist — goalProfile doesn't affect it.
+      setPendingPlan({ gated, source: "llm", preview: buildPlanPreview(data, gated, todayISO()), diff: diffAuthoredPlan(gated.days, data) });
       persist({ ...data, goalProfile: profile });
     } catch (e) {
       setErr(e.message || "Analysis failed — try again.");
     }
     setBusy(false);
-  };
-
-  const applyPlan = () => {
-    if (!result) return;
-    persist({
-      ...data,
-      plan: { ...(data.plan || DEFAULT_PLAN), template: result.template, sessionMin: result.sessionMin, templateSince: todayISO() },
-      focus: result.focus,
-      coachNote: { assessment: result.assessment, pushback: result.pushback, gates: result.gates, calorieDelta: result.calorieDelta, nutritionNote: result.nutritionNote, nextCheckIn: result.nextCheckIn, at: new Date().toISOString() },
-    });
-    setApplied(true);
   };
 
   return (
@@ -6228,7 +6323,7 @@ function CoachCard({ data, persist }) {
         </>
       )}
       {err && <div style={{ color: C.red, fontSize: 13, marginTop: 8, lineHeight: 1.4 }}>{err}</div>}
-      <PendingPlanDiff pendingPlan={pendingPlan} onConfirm={confirmPendingPlan} onDiscard={discardPendingPlan} />
+      <PlanPreview pendingPlan={pendingPlan} onConfirm={confirmPendingPlan} onDiscard={discardPendingPlan} />
 
       {result && (
         <div style={{ marginTop: 14 }}>
@@ -6275,11 +6370,11 @@ function CoachCard({ data, persist }) {
             <b>Nutrition:</b> {result.calorieDelta === 0 ? "hold current target" : `${result.calorieDelta > 0 ? "+" : ""}${result.calorieDelta} kcal/day`} — {result.nutritionNote}
           </div>
           <div style={{ fontSize: 13, marginTop: 6 }}><b>Watch next:</b> {result.nextCheckIn}</div>
-          <button style={{ ...S.pillBtn(applied ? C.green : C.blue), width: "100%", marginTop: 12 }} onClick={applyPlan}>
-            {applied ? "Plan applied ✓" : "Apply this plan"}
-          </button>
+          <div style={{ fontSize: 13, fontWeight: 700, marginTop: 12, color: applied ? C.green : C.sub }}>
+            {applied ? "Plan applied ✓" : pendingPlan ? "Review the preview above — nothing is applied until you tap Apply." : "Not applied."}
+          </div>
           <div style={{ fontSize: 12, color: C.sub, marginTop: 6, lineHeight: 1.4 }}>
-            Applying sets your split, session length, and focus sliders in one tap. Your logs are untouched.
+            Applying sets your split, session length, focus sliders, and prescriptions in one step — all or nothing. Your logs are untouched.
             Calorie changes: adjust manually in Fuel per the note above.
           </div>
         </div>
